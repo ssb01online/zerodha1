@@ -1,0 +1,26 @@
+[project]
+name = "kitetools"
+version = "0.1.0"
+description = "Read-only Kite Connect tools: portfolio snapshots, trade history, historical candles"
+readme = "README.md"
+authors = [
+    { name = "Sujit", email = "ssb01online@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "kiteconnect>=5.2.2",
+    "truststore>=0.10.5",
+]
+
+[project.scripts]
+kitetools = "kitetools.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+docs = [
+    "html2text>=2025.4.15",
+    "httpx>=0.28.1",
+]

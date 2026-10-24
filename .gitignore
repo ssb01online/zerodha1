@@ -1,0 +1,13 @@
+# Credentials and session tokens
+.env/
+*.token.json
+
+# Downloaded market/portfolio data
+data/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
