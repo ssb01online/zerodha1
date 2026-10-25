@@ -51,10 +51,10 @@ def _mf_row(m: MfHolding) -> dict[str, Any]:
 
 
 def _position_row(p: Position) -> dict[str, Any]:
-    return {
-        **asdict(p),
-        "is_open": p.quantity != 0,
-    }
+    row = asdict(p)
+    row["expiry"] = iso(p.expiry)
+    row["is_open"] = p.quantity != 0
+    return row
 
 
 def _book_totals(

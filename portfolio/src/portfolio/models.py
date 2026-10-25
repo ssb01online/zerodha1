@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from .fetch import RawPayload
 
@@ -71,6 +71,8 @@ class Position:
     day_sell_quantity: int = 0
     day_sell_price: float = 0.0
     day_sell_value: float = 0.0
+    expiry: date | None = None
+    instrument_type: str | None = None
 
 
 @dataclass(frozen=True)

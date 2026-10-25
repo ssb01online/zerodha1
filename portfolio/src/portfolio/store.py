@@ -22,7 +22,7 @@ from .fetch import RawPayload
 from .models import Holding, MfHolding, PortfolioView, Position
 from .normalize import to_view
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_DB_PATH = DATA_DIR / "portfolio.duckdb"
 
 
@@ -58,6 +58,27 @@ def connect(db_path: Path | None = None, *, read_only: bool = False) -> duckdb.D
     return duckdb.connect(str(path), read_only=read_only)
 
 
+def _migrate_schema(con: duckdb.DuckDBPyConnection, stored: int) -> None:
+    if stored == SCHEMA_VERSION:
+        return
+    if stored == 1 and SCHEMA_VERSION == 2:
+        con.execute(
+            "ALTER TABLE snapshot_positions ADD COLUMN IF NOT EXISTS expiry VARCHAR"
+        )
+        con.execute(
+            "ALTER TABLE snapshot_positions ADD COLUMN IF NOT EXISTS instrument_type VARCHAR"
+        )
+        con.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            [str(SCHEMA_VERSION)],
+        )
+        return
+    raise RuntimeError(
+        f"portfolio.duckdb schema_version={stored}, code expects {SCHEMA_VERSION}. "
+        "Bump SCHEMA_VERSION and migrate, or delete the DB to rebuild."
+    )
+
+
 def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(
         """
@@ -74,12 +95,7 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             [str(SCHEMA_VERSION)],
         )
     else:
-        stored = int(row[0])
-        if stored != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"portfolio.duckdb schema_version={stored}, code expects {SCHEMA_VERSION}. "
-                "Bump SCHEMA_VERSION and migrate, or delete the DB to rebuild."
-            )
+        _migrate_schema(con, int(row[0]))
 
     # observed_at stored as ISO-8601 text (avoids DuckDB timestamptz → pytz dependency).
     con.execute(
@@ -177,7 +193,9 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             day_buy_value DOUBLE,
             day_sell_quantity BIGINT,
             day_sell_price DOUBLE,
-            day_sell_value DOUBLE
+            day_sell_value DOUBLE,
+            expiry VARCHAR,
+            instrument_type VARCHAR
         )
         """
     )
@@ -355,7 +373,7 @@ def _insert_positions(
             """
             INSERT INTO snapshot_positions VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             [
@@ -389,6 +407,8 @@ def _insert_positions(
                 p.day_sell_quantity,
                 p.day_sell_price,
                 p.day_sell_value,
+                p.expiry.isoformat() if p.expiry else None,
+                p.instrument_type,
             ],
         )
 

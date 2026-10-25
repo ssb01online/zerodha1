@@ -10,13 +10,14 @@ import copy
 import json
 import sys
 import tempfile
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from kitetools.auth import IST
 from kitetools.config import DATA_DIR
 
 from . import fingerprint as fp
+from . import instruments
 from . import store
 from .fetch import RawPayload, load_from_sample
 from .normalize import to_view
@@ -54,7 +55,12 @@ def _mutate_raw(raw: RawPayload) -> RawPayload:
 def test_normalize_latest() -> None:
     folder = latest_sample_dir()
     raw = load_from_sample(folder)
-    view = to_view(raw)
+    # Force empty lookup so offline runs never hit Kite / on-disk instruments cache.
+    instruments.set_lookup_override({})
+    try:
+        view = to_view(raw)
+    finally:
+        instruments.clear_lookup_override()
     _assert(len(view.holdings) == 28, f"expected 28 holdings, got {len(view.holdings)}")
     _assert(
         len(view.positions_net) == 14,
@@ -72,7 +78,134 @@ def test_normalize_latest() -> None:
     hdfc = [h for h in view.holdings if h.tradingsymbol == "HDFCBANK"]
     _assert(len(hdfc) == 1, "HDFCBANK missing from sample")
     _assert(hdfc[0].owned_quantity == 470, f"HDFCBANK owned={hdfc[0].owned_quantity}")
+    for p in view.positions_net:
+        _assert(p.expiry is None, f"empty override should leave expiry null: {p.tradingsymbol}")
+        _assert(
+            p.instrument_type is None,
+            f"empty override should leave instrument_type null: {p.tradingsymbol}",
+        )
     print("  ok normalize_latest")
+
+
+def _instrument_type_from_symbol(symbol: str) -> str:
+    if symbol.endswith("CE"):
+        return "CE"
+    if symbol.endswith("PE"):
+        return "PE"
+    if symbol.endswith("FUT"):
+        return "FUT"
+    return "EQ"
+
+
+def test_position_enrichment() -> None:
+    raw = load_from_sample(latest_sample_dir())
+    stub: dict[int, instruments.InstrumentMeta] = {}
+    for row in raw.positions.get("net") or []:
+        token = int(row["instrument_token"])
+        symbol = str(row["tradingsymbol"])
+        if str(row.get("segment") or "") == "FO" or str(row.get("exchange") or "") == "NFO":
+            stub[token] = instruments.InstrumentMeta(
+                expiry=date(2026, 11, 3),
+                instrument_type=_instrument_type_from_symbol(symbol),
+            )
+        else:
+            stub[token] = instruments.InstrumentMeta(expiry=None, instrument_type="EQ")
+
+    instruments.set_lookup_override(stub)
+    try:
+        view = to_view(raw)
+        fo = [
+            p
+            for p in view.positions_net
+            if p.segment == "FO" or p.exchange == "NFO"
+        ]
+        _assert(len(fo) >= 1, "expected F&O rows in sample")
+        for p in fo:
+            _assert(p.expiry == date(2026, 11, 3), f"{p.tradingsymbol} expiry={p.expiry}")
+            _assert(
+                p.instrument_type in ("CE", "PE", "FUT"),
+                f"{p.tradingsymbol} instrument_type={p.instrument_type}",
+            )
+        from . import serialize
+
+        payload = serialize.portfolio_payload(view, source="live")
+        row0 = payload["positions"]["net"][0]
+        _assert(row0.get("expiry") == "2026-11-03", f"serialized expiry={row0.get('expiry')}")
+        _assert(
+            isinstance(row0.get("instrument_type"), str),
+            f"instrument_type={row0.get('instrument_type')}",
+        )
+    finally:
+        instruments.clear_lookup_override()
+    print("  ok position_enrichment")
+
+
+def test_schema_migrate_v1_to_v2() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "v1.duckdb"
+        con = store.connect(db_path)
+        try:
+            con.execute(
+                """
+                CREATE TABLE meta (
+                    key VARCHAR PRIMARY KEY,
+                    value VARCHAR NOT NULL
+                )
+                """
+            )
+            con.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '1')"
+            )
+            con.execute(
+                """
+                CREATE TABLE snapshot_positions (
+                    snapshot_id BIGINT NOT NULL,
+                    kind VARCHAR NOT NULL,
+                    exchange VARCHAR,
+                    tradingsymbol VARCHAR,
+                    instrument_token BIGINT,
+                    product VARCHAR,
+                    segment VARCHAR,
+                    quantity BIGINT,
+                    overnight_quantity BIGINT,
+                    multiplier BIGINT,
+                    average_price DOUBLE,
+                    last_price DOUBLE,
+                    close_price DOUBLE,
+                    value DOUBLE,
+                    pnl DOUBLE,
+                    m2m DOUBLE,
+                    realised DOUBLE,
+                    unrealised DOUBLE,
+                    buy_quantity BIGINT,
+                    buy_price DOUBLE,
+                    buy_value DOUBLE,
+                    sell_quantity BIGINT,
+                    sell_price DOUBLE,
+                    sell_value DOUBLE,
+                    day_buy_quantity BIGINT,
+                    day_buy_price DOUBLE,
+                    day_buy_value DOUBLE,
+                    day_sell_quantity BIGINT,
+                    day_sell_price DOUBLE,
+                    day_sell_value DOUBLE
+                )
+                """
+            )
+            store.ensure_schema(con)
+            ver = con.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            _assert(ver is not None and int(ver[0]) == 2, f"schema_version={ver}")
+            cols = {
+                str(r[1])
+                for r in con.execute("PRAGMA table_info('snapshot_positions')").fetchall()
+            }
+            _assert("expiry" in cols, f"missing expiry in {cols}")
+            _assert("instrument_type" in cols, f"missing instrument_type in {cols}")
+        finally:
+            con.close()
+    print("  ok schema_migrate_v1_to_v2")
 
 
 def test_fingerprint_stable_across_samples() -> None:
@@ -493,6 +626,8 @@ def main() -> int:
     print(f"portfolio.selftest  samples={SAMPLES_DIR}  data={DATA_DIR}")
     tests = [
         test_normalize_latest,
+        test_position_enrichment,
+        test_schema_migrate_v1_to_v2,
         test_fingerprint_stable_across_samples,
         test_price_change_ignored_qty_change_triggers,
         test_zero_positions_excluded_and_cnc_merge,

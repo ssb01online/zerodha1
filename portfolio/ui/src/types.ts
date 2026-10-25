@@ -89,6 +89,8 @@ export interface PositionRow {
   day_sell_quantity: number;
   day_sell_price: number;
   day_sell_value: number;
+  expiry: string | null;
+  instrument_type: string | null;
   is_open: boolean;
 }
 

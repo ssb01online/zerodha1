@@ -39,6 +39,7 @@ APIs: `holdings()`, `positions()` → `{net, day}`, `mf_holdings()`. No historic
 - F&O overnight stays in `positions` (product `NRML`), never moves to holdings. Sample: 14 NFO/NRML rows, all with `overnight_quantity == quantity` (signed; shorts negative), `multiplier=1`.
 - Equity delivery taken today would appear as CNC in positions and move to holdings after settlement — none in this sample (`day` empty; weekend).
 - Key derivatives / MIS by `exchange:tradingsymbol` (add `:product` if the same symbol appears under more than one product).
+- `positions()` has no `expiry`. Enrich from the daily instruments cache (`data/instruments/cache.json`, IST calendar day via `kite.instruments()`). Normalized / API rows add nullable `expiry` (`YYYY-MM-DD`) and `instrument_type` (`EQ`/`FUT`/`CE`/`PE`/…). Snapshot reads rebuild via `to_view(raw)` and re-join today’s master — contracts rolled off the dump may show `expiry: null` on old snapshots until a later phase reads denormalized `snapshot_positions` columns only.
 
 ### Mutual funds (`mf_holdings`)
 - Empty on this account (0 rows). Treat key as `isin:folio`, units rounded to 3 decimals, until a non-empty sample revises it.
@@ -61,7 +62,7 @@ Notes:
 ## Snapshots (Phase 1)
 
 - Formula lives only in `portfolio.fingerprint` (keys prefixed `EQ:` / `POS:` / `MF:`).
-- DuckDB path: `data/portfolio.duckdb` (gitignored via `data/`). Schema version `1` in `meta.schema_version`.
+- DuckDB path: `data/portfolio.duckdb` (gitignored via `data/`). Schema version `2` in `meta.schema_version` (v1→v2 soft-migrates `snapshot_positions` with `expiry` / `instrument_type`).
 - Tables: `snapshots` (incl. ISO `observed_at`, `raw_json`, `fingerprint_hash`), `snapshot_composition`, `snapshot_holdings`, `snapshot_mf_holdings`, `snapshot_positions`.
 - Capture writes **only** when the fingerprint hash differs from the latest snapshot. Prices at capture are stored as metadata, never as a trigger.
 - Single-writer assumption: only one process should write the DB. Concurrent DuckDB writers fail on Windows file locks.

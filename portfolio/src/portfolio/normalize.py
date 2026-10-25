@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
+from . import instruments
 from .fetch import RawPayload
 from .models import Holding, MfHolding, PortfolioView, Position
+
+InstrumentLookup = Callable[[int], instruments.InstrumentMeta | None]
 
 
 def _int(value: Any) -> int:
@@ -64,11 +67,13 @@ def _mf_holding(row: dict[str, Any]) -> MfHolding:
     )
 
 
-def _position(row: dict[str, Any]) -> Position:
+def _position(row: dict[str, Any], lookup: InstrumentLookup) -> Position:
+    token = _int(row.get("instrument_token"))
+    meta = lookup(token) if token else None
     return Position(
         exchange=_str(row.get("exchange")),
         tradingsymbol=_str(row.get("tradingsymbol")),
-        instrument_token=_int(row.get("instrument_token")),
+        instrument_token=token,
         product=_str(row.get("product")),
         segment=_str(row.get("segment")),
         quantity=_int(row.get("quantity")),
@@ -94,10 +99,17 @@ def _position(row: dict[str, Any]) -> Position:
         day_sell_quantity=_int(row.get("day_sell_quantity")),
         day_sell_price=_float(row.get("day_sell_price")),
         day_sell_value=_float(row.get("day_sell_value")),
+        expiry=meta.expiry if meta else None,
+        instrument_type=meta.instrument_type if meta else None,
     )
 
 
-def to_view(raw: RawPayload) -> PortfolioView:
+def to_view(
+    raw: RawPayload,
+    *,
+    lookup: InstrumentLookup | None = None,
+) -> PortfolioView:
+    resolve = lookup if lookup is not None else instruments.get_meta
     positions = raw.positions or {}
     net = positions.get("net") or []
     day = positions.get("day") or []
@@ -105,7 +117,7 @@ def to_view(raw: RawPayload) -> PortfolioView:
         fetched_at=raw.fetched_at,
         holdings=tuple(_holding(r) for r in (raw.holdings or [])),
         mf_holdings=tuple(_mf_holding(r) for r in (raw.mf_holdings or [])),
-        positions_net=tuple(_position(r) for r in net),
-        positions_day=tuple(_position(r) for r in day),
+        positions_net=tuple(_position(r, resolve) for r in net),
+        positions_day=tuple(_position(r, resolve) for r in day),
         raw=raw,
     )
