@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from . import instruments
+import instruments
+from instruments import InstrumentMeta
+
 from .fetch import RawPayload
 from .models import Holding, MfHolding, PortfolioView, Position
 
-InstrumentLookup = Callable[[int], instruments.InstrumentMeta | None]
+InstrumentLookup = Callable[[int], InstrumentMeta | None]
 
 
 def _int(value: Any) -> int:

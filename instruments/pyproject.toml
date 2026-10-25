@@ -1,0 +1,15 @@
+[project]
+name = "instruments"
+version = "0.1.0"
+description = "Daily Kite instruments cache (NSE/BSE/NFO) and token lookup"
+requires-python = ">=3.13"
+dependencies = [
+    "kitetools",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+kitetools = { workspace = true }

@@ -4,6 +4,7 @@ requires-python = ">=3.13"
 
 [manifest]
 members = [
+    "instruments",
     "kitetools",
     "portfolio",
 ]
@@ -467,6 +468,17 @@ wheels = [
 ]
 
 [[package]]
+name = "instruments"
+version = "0.1.0"
+source = { editable = "instruments" }
+dependencies = [
+    { name = "kitetools" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "kitetools", editable = "." }]
+
+[[package]]
 name = "kiteconnect"
 version = "5.2.2"
 source = { registry = "https://pypi.org/simple" }
@@ -540,6 +552,7 @@ dependencies = [
     { name = "duckdb" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "instruments" },
     { name = "kitetools" },
     { name = "uvicorn" },
 ]
@@ -549,6 +562,7 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.1.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.0" },
+    { name = "instruments", editable = "instruments" },
     { name = "kitetools", editable = "." },
     { name = "uvicorn", specifier = ">=0.32.0" },
 ]

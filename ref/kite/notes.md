@@ -39,7 +39,7 @@ APIs: `holdings()`, `positions()` → `{net, day}`, `mf_holdings()`. No historic
 - F&O overnight stays in `positions` (product `NRML`), never moves to holdings. Sample: 14 NFO/NRML rows, all with `overnight_quantity == quantity` (signed; shorts negative), `multiplier=1`.
 - Equity delivery taken today would appear as CNC in positions and move to holdings after settlement — none in this sample (`day` empty; weekend).
 - Key derivatives / MIS by `exchange:tradingsymbol` (add `:product` if the same symbol appears under more than one product).
-- `positions()` has no `expiry`. Enrich from the daily instruments cache (`data/instruments/cache.json`, IST calendar day via `kite.instruments()`). Normalized / API rows add nullable `expiry` (`YYYY-MM-DD`) and `instrument_type` (`EQ`/`FUT`/`CE`/`PE`/…). Snapshot reads rebuild via `to_view(raw)` and re-join today’s master — contracts rolled off the dump may show `expiry: null` on old snapshots until a later phase reads denormalized `snapshot_positions` columns only.
+- `positions()` has no `expiry`. Enrich from the shared `instruments` workspace package (full daily dump at `data/instruments/master.json`, IST calendar day via `kite.instruments()`, scoped to NSE/BSE/NFO). Portfolio uses slim `get_meta(token)` → `{expiry, instrument_type}`. Normalized / API rows add nullable `expiry` (`YYYY-MM-DD`) and `instrument_type` (`EQ`/`FUT`/`CE`/`PE`/…). Snapshot reads rebuild via `to_view(raw)` and re-join today’s master — contracts rolled off the dump may show `expiry: null` on old snapshots until a later phase reads denormalized `snapshot_positions` columns only.
 
 ### Mutual funds (`mf_holdings`)
 - Empty on this account (0 rows). Treat key as `isin:folio`, units rounded to 3 decimals, until a non-empty sample revises it.

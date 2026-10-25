@@ -7,6 +7,7 @@ dependencies = [
     "duckdb>=1.1.0",
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
+    "instruments",
     "kitetools",
     "uvicorn>=0.32.0",
 ]
@@ -19,4 +20,5 @@ requires = ["uv_build>=0.13.5,<0.14.0"]
 build-backend = "uv_build"
 
 [tool.uv.sources]
+instruments = { workspace = true }
 kitetools = { workspace = true }

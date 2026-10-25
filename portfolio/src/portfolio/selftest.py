@@ -13,11 +13,12 @@ import tempfile
 from datetime import date, datetime
 from pathlib import Path
 
+import instruments
+from instruments import InstrumentMeta
 from kitetools.auth import IST
 from kitetools.config import DATA_DIR
 
 from . import fingerprint as fp
-from . import instruments
 from . import store
 from .fetch import RawPayload, load_from_sample
 from .normalize import to_view
@@ -99,17 +100,17 @@ def _instrument_type_from_symbol(symbol: str) -> str:
 
 def test_position_enrichment() -> None:
     raw = load_from_sample(latest_sample_dir())
-    stub: dict[int, instruments.InstrumentMeta] = {}
+    stub: dict[int, InstrumentMeta] = {}
     for row in raw.positions.get("net") or []:
         token = int(row["instrument_token"])
         symbol = str(row["tradingsymbol"])
         if str(row.get("segment") or "") == "FO" or str(row.get("exchange") or "") == "NFO":
-            stub[token] = instruments.InstrumentMeta(
+            stub[token] = InstrumentMeta(
                 expiry=date(2026, 11, 3),
                 instrument_type=_instrument_type_from_symbol(symbol),
             )
         else:
-            stub[token] = instruments.InstrumentMeta(expiry=None, instrument_type="EQ")
+            stub[token] = InstrumentMeta(expiry=None, instrument_type="EQ")
 
     instruments.set_lookup_override(stub)
     try:

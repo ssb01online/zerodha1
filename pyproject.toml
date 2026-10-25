@@ -26,4 +26,4 @@ docs = [
 ]
 
 [tool.uv.workspace]
-members = ["portfolio"]
+members = ["portfolio", "instruments"]
