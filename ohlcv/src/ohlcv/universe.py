@@ -103,7 +103,7 @@ def _series_fetch_incomplete(
     fetch_states: dict[int, FetchState],
     expiry: date,
 ) -> bool:
-    """True if any contract is missing fetch_state, not done, or watermark before session end."""
+    """True if any contract is missing fetch_state, not done/gave_up, or watermark before session end."""
     session_end = _expiry_session_end(expiry)
     # Compare naive vs aware carefully: catalog may store naive timestamps.
     session_end_naive = session_end.replace(tzinfo=None)
@@ -113,6 +113,8 @@ def _series_fetch_incomplete(
         if state is None:
             return True
         assert isinstance(state, FetchState)
+        if state.status == "gave_up":
+            continue
         if state.status != "done":
             return True
         if state.fetched_to is None:

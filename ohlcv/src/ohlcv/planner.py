@@ -115,6 +115,8 @@ def contract_pending_requests(
     end: datetime | None = None,
 ) -> int:
     end = end if end is not None else fetch_end(now)
+    if state is not None and state.status == "gave_up":
+        return 0
     if state is not None and state.status == "done":
         fetched = state.fetched_to
         if fetched is not None and _as_aware_ist(fetched) >= end:

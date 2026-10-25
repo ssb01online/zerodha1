@@ -121,17 +121,21 @@ Always `import kitetools` (or `from kitetools...`) before other HTTPS clients so
 
 ## OHLCV package (NFO candles)
 
-Workspace member for F&O price/volume download planning and (later) Parquet storage. After `uv sync --all-packages`:
+Workspace member for F&O quote snapshots and minute candle downloads. After `uv sync --all-packages`:
 
 ```powershell
 uv run ohlcv sync          # archive instruments master + upsert NFO contracts into catalog
-uv run ohlcv rank          # rank underlyings by nearest-FUT day traded value (needs login)
+uv run ohlcv rank          # rank underlyings (final quote snapshot, else FUT day)
 uv run ohlcv queue         # print expiry-first download queue with request estimates
-uv run ohlcv queue --expiry 20261027 --limit 20
+uv run ohlcv daily         # end-of-day quote() snapshot (after 15:40 IST on a session day)
+uv run ohlcv fetch --dry-run
+uv run ohlcv fetch --max-series 1          # smoke: one series
+uv run ohlcv fetch --expiry 20261027       # one expiry, all underlyings
+uv run ohlcv fetch --max-minutes 30        # time-budgeted; resumes next run
 uv run python -m ohlcv.selftest
 ```
 
-Data lives under gitignored `data/ohlcv/nfo/` (`catalog.duckdb`) and `data/instruments/archive/`. Minute candle downloads are Phase 3. Notes: `ref/kite/notes.md` (OHLCV Phase 1).
+Data under gitignored `data/ohlcv/nfo/`: `catalog.duckdb`, `daily/yyyymmdd.parquet`, `minute/<UL>/yyyymmdd.parquet`. Notes: `ref/kite/notes.md` (OHLCV Phases 0–3). Close notebooks holding the catalog or series files before a fetch (Windows locks).
 
 ---
 

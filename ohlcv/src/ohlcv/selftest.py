@@ -1,4 +1,4 @@
-"""Offline self-tests for ohlcv Phases 1–2. No Kite login required.
+"""Offline self-tests for ohlcv Phases 1–3. No Kite login required.
 
 Run: uv run python -m ohlcv.selftest
 """
@@ -6,12 +6,16 @@ Run: uv run python -m ohlcv.selftest
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+from unittest import mock
+
+import duckdb
 
 from instruments.cache import clear_rows_override, set_rows_override
 from instruments.models import Instrument
@@ -20,6 +24,7 @@ from kitetools import auth
 
 from . import archive as archive_mod
 from . import catalog
+from . import fetch as fetch_mod
 from . import planner
 from . import rank as rank_mod
 from . import read as read_mod
@@ -31,7 +36,7 @@ from .client import (
     RetryExhausted,
     SessionExpired,
 )
-from .paths import sanitize_underlying, ymd
+from .paths import sanitize_underlying, series_path, ymd
 
 
 class Failure(Exception):
@@ -850,6 +855,552 @@ def test_snapshot_missing_keys_and_rank() -> None:
             con.close()
 
 
+def _synth_candles(
+    token: int,
+    from_date: Any,
+    to_date: Any,
+    *,
+    n: int = 3,
+    price: float = 100.0,
+) -> list[dict[str, Any]]:
+    """Synthetic minute bars at 09:15.. of the from_date day."""
+    if isinstance(from_date, datetime):
+        day = from_date.date() if from_date.tzinfo is None else from_date.astimezone(auth.IST).date()
+    elif isinstance(from_date, date):
+        day = from_date
+    else:
+        day = date.fromisoformat(str(from_date)[:10])
+    out: list[dict[str, Any]] = []
+    for i in range(n):
+        ts = datetime(day.year, day.month, day.day, 9, 15 + i, tzinfo=auth.IST)
+        out.append(
+            {
+                "date": ts,
+                "open": price,
+                "high": price + 1,
+                "low": price - 1,
+                "close": price + 0.5,
+                "volume": 10 + i,
+                "oi": 1000 + i,
+            }
+        )
+    return out
+
+
+def _make_client(handler: Callable[..., Any]) -> tuple[KiteClient, FakeKite, FakeClock]:
+    kite = FakeKite(handler)
+    clock = FakeClock()
+    client = KiteClient(kite, hist_interval=0.0, quote_interval=0.0, clock=clock, rng=random.Random(0))
+    return client, kite, clock
+
+
+def _seed_series_contracts(
+    con: Any,
+    *,
+    underlying: str,
+    expiry: date,
+    tokens: list[int],
+    seen_on: date,
+) -> universe.Series:
+    rows = [
+        catalog.ContractRow(
+            token=t,
+            underlying=underlying,
+            expiry=expiry,
+            tradingsymbol=f"{underlying}{t}",
+            instrument_type="CE" if i else "FUT",
+            strike=float(i * 100),
+            lot_size=50,
+            first_seen=seen_on,
+            last_seen=seen_on,
+        )
+        for i, t in enumerate(tokens)
+    ]
+    catalog.upsert_contracts(con, rows, seen_on=seen_on)
+    return universe.Series(underlying, expiry, tuple(rows))
+
+
+def _write_final_snapshot(
+    con: Any,
+    trade_date: date,
+    rows: list[dict[str, Any]],
+    dest_dir: Path,
+) -> None:
+    """Write a minimal daily parquet + catalog row for skip-rule tests."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    path = dest_dir / f"{ymd(trade_date)}.parquet"
+    # Reuse snapshot writer via CSV→parquet path by calling internal helper pieces.
+    staging = dest_dir / "_staging"
+    snapshot._write_parquet(rows, path, staging_dir=staging)  # noqa: SLF001
+    catalog.record_snapshot(
+        con,
+        catalog.DailySnapshotMeta(
+            trade_date=trade_date,
+            status="final",
+            taken_at=datetime(trade_date.year, trade_date.month, trade_date.day, 16, 0),
+            contracts=len(rows),
+            traded_contracts=sum(1 for r in rows if r.get("traded")),
+            missing=0,
+            total_volume=sum(int(r.get("volume") or 0) for r in rows),
+            path=str(path),
+        ),
+    )
+
+
+def _snap_row(
+    token: int,
+    underlying: str,
+    expiry: date,
+    trade_date: date,
+    *,
+    volume: int,
+) -> dict[str, Any]:
+    return {
+        "trade_date": trade_date.isoformat(),
+        "token": token,
+        "underlying": underlying,
+        "expiry": expiry.isoformat(),
+        "tradingsymbol": f"{underlying}{token}",
+        "instrument_type": "FUT",
+        "strike": 0.0,
+        "lot_size": 50,
+        "open": 100.0 if volume else None,
+        "high": 110.0 if volume else None,
+        "low": 90.0 if volume else None,
+        "close": 105.0,
+        "prev_close": 104.0,
+        "volume": volume,
+        "average_price": 105.0 if volume else 0.0,
+        "traded_value": float(volume) * 105.0,
+        "traded": volume > 0,
+        "oi": 1.0,
+        "oi_day_high": 1.0,
+        "oi_day_low": 1.0,
+        "buy_quantity": 0,
+        "sell_quantity": 0,
+        "last_trade_time": f"{trade_date.isoformat()}T15:29:00+05:30",
+    }
+
+
+def test_fetch_backfill_and_rerun() -> None:
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        return _synth_candles(token, from_date, to_date, n=5, price=float(token))
+
+    client, kite, _clock = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db = root / "c.duckdb"
+        minute_dir = root / "minute"
+        staging = root / "staging"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="NIFTY", expiry=expiry, tokens=[10, 11], seen_on=now.date()
+            )
+            states: dict[int, catalog.FetchState] = {}
+            result = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                states,
+                now=now,
+                minute_dir=minute_dir,
+                staging_dir=staging,
+            )
+            _assert(not result.locked, "not locked")
+            _assert(result.fetched == 2, f"fetched={result.fetched}")
+            _assert(result.path is not None and result.path.is_file(), "parquet written")
+            _assert(kite.calls == 2, f"hist calls={kite.calls}")
+
+            # Sorted, deduped content
+            dcon = duckdb.connect()
+            try:
+                rows = dcon.execute(
+                    "SELECT token, COUNT(*) FROM read_parquet(?) GROUP BY 1 ORDER BY 1",
+                    [str(result.path)],
+                ).fetchall()
+            finally:
+                dcon.close()
+            _assert(rows == [(10, 5), (11, 5)], f"rows={rows}")
+
+            st10 = catalog.get_fetch_state(con, 10, "minute")
+            _assert(st10 is not None and st10.status == "done", f"status={st10}")
+            _assert(st10.fetched_to is not None, "watermark set")
+
+            # Rerun → 0 historical calls
+            calls_before = kite.calls
+            result2 = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                states,
+                now=now,
+                minute_dir=minute_dir,
+                staging_dir=staging,
+            )
+            _assert(kite.calls == calls_before, "rerun makes 0 hist calls")
+            _assert(result2.fetched == 0, "nothing fetched on rerun")
+            _assert(result2.skipped == 2, f"skipped={result2.skipped}")
+        finally:
+            con.close()
+
+
+def test_fetch_partial_rollback_and_dedupe() -> None:
+    expiry = date(2026, 10, 27)
+    # Wednesday — must be a weekday so skip-rule weekdays are non-empty.
+    intraday = datetime(2026, 10, 21, 12, 0, 0, tzinfo=auth.IST)
+    after = datetime(2026, 10, 21, 18, 0, 0, tzinfo=auth.IST)
+    call_n = {"n": 0}
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        call_n["n"] += 1
+        # Put bars on the to_date session day so intraday + after-hours overlap.
+        n = 2 if call_n["n"] == 1 else 4
+        return _synth_candles(token, to_date, to_date, n=n, price=50.0)
+
+    client, kite, _ = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="RELIANCE", expiry=expiry, tokens=[20], seen_on=intraday.date()
+            )
+            states: dict[int, catalog.FetchState] = {}
+            r1 = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                states,
+                now=intraday,
+                minute_dir=root / "minute",
+                staging_dir=root / "staging",
+            )
+            st = catalog.get_fetch_state(con, 20, "minute")
+            _assert(st is not None and st.status == "partial", f"partial status={st}")
+            _assert(r1.rows == 2, f"rows1={r1.rows}")
+
+            r2 = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                states,
+                now=after,
+                minute_dir=root / "minute",
+                staging_dir=root / "staging",
+            )
+            st2 = catalog.get_fetch_state(con, 20, "minute")
+            _assert(st2 is not None and st2.status == "done", f"done status={st2}")
+            dcon = duckdb.connect()
+            try:
+                n = dcon.execute(
+                    "SELECT COUNT(*) FROM read_parquet(?)", [str(r2.path)]
+                ).fetchone()[0]
+                dup = dcon.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT token, ts, COUNT(*) c FROM read_parquet(?)
+                        GROUP BY 1, 2 HAVING COUNT(*) > 1
+                    )
+                    """,
+                    [str(r2.path)],
+                ).fetchone()[0]
+            finally:
+                dcon.close()
+            _assert(n == 4, f"deduped rows={n}")
+            _assert(dup == 0, "no duplicate (token,ts)")
+            _assert(kite.calls == 2, f"calls={kite.calls}")
+        finally:
+            con.close()
+
+
+def test_fetch_skip_untraded_and_missing_snapshot() -> None:
+    # Friday evening — window weekdays are Thu 22 + Fri 23.
+    now = datetime(2026, 10, 23, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+    watermark = datetime(2026, 10, 21, 15, 40, 0)  # end of Wednesday
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        return _synth_candles(token, from_date, to_date, n=1)
+
+    client, kite, _ = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        daily_dir = root / "daily"
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="INFY", expiry=expiry, tokens=[30, 31], seen_on=now.date()
+            )
+            for t in (30, 31):
+                catalog.upsert_fetch_state(
+                    con,
+                    catalog.FetchState(
+                        token=t,
+                        interval="minute",
+                        fetched_to=watermark,
+                        status="pending",
+                        rows_total=1,
+                        attempts=1,
+                        last_error=None,
+                        updated_at=watermark,
+                    ),
+                )
+            states = catalog.list_fetch_states(con, interval="minute", tokens=[30, 31])
+
+            for day, vols in (
+                (date(2026, 10, 22), {30: 0, 31: 100}),
+                (date(2026, 10, 23), {30: 0, 31: 50}),
+            ):
+                rows = [
+                    _snap_row(30, "INFY", expiry, day, volume=vols[30]),
+                    _snap_row(31, "INFY", expiry, day, volume=vols[31]),
+                ]
+                _write_final_snapshot(con, day, rows, daily_dir)
+
+            with mock.patch.object(
+                fetch_mod,
+                "untraded_tokens",
+                side_effect=lambda d, **kw: snapshot.untraded_tokens(d, dest_dir=daily_dir),
+            ):
+                r = fetch_mod.process_series(
+                    client,
+                    con,
+                    series,
+                    states,
+                    now=now,
+                    minute_dir=root / "minute",
+                    staging_dir=root / "staging",
+                )
+            # Token 30 untraded every weekday → skip; 31 traded → fetch
+            _assert(r.skipped == 1, f"skipped={r.skipped}")
+            _assert(r.fetched == 1, f"fetched={r.fetched}")
+            _assert(kite.calls == 1, f"calls={kite.calls}")
+            st30 = catalog.get_fetch_state(con, 30, "minute")
+            _assert(st30 is not None and st30.status == "done", "30 advanced without fetch")
+
+            # Missing Friday snapshot → must fetch (leave only Thu 22)
+            catalog.upsert_fetch_state(
+                con,
+                catalog.FetchState(
+                    token=30,
+                    interval="minute",
+                    fetched_to=watermark,
+                    status="pending",
+                    rows_total=1,
+                    attempts=1,
+                    last_error=None,
+                    updated_at=watermark,
+                ),
+            )
+            con.execute("DELETE FROM daily_snapshots WHERE trade_date = ?", [date(2026, 10, 23)])
+            (daily_dir / "20261023.parquet").unlink()
+            states = catalog.list_fetch_states(con, interval="minute", tokens=[30, 31])
+            kite.calls = 0
+            with mock.patch.object(
+                fetch_mod,
+                "untraded_tokens",
+                side_effect=lambda d, **kw: snapshot.untraded_tokens(d, dest_dir=daily_dir),
+            ):
+                r2 = fetch_mod.process_series(
+                    client,
+                    con,
+                    series,
+                    states,
+                    now=now,
+                    minute_dir=root / "minute",
+                    staging_dir=root / "staging",
+                )
+            _assert(r2.fetched >= 1, f"missing snap forces fetch fetched={r2.fetched}")
+            _assert(kite.calls >= 1, "hist called when snapshot missing")
+        finally:
+            con.close()
+
+
+def test_fetch_session_expired_mid_series() -> None:
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+    seen = {"n": 0}
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise TokenException("token invalid")
+        return _synth_candles(token, from_date, to_date, n=2)
+
+    client, _, _ = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="NIFTY", expiry=expiry, tokens=[40, 41, 42], seen_on=now.date()
+            )
+            states: dict[int, catalog.FetchState] = {}
+            try:
+                fetch_mod.process_series(
+                    client,
+                    con,
+                    series,
+                    states,
+                    now=now,
+                    minute_dir=root / "minute",
+                    staging_dir=root / "staging",
+                )
+                raise Failure("expected SessionExpired")
+            except SessionExpired as exc:
+                attached = getattr(exc, "result", None)
+                _assert(attached is not None, "result attached")
+                _assert(attached.fetched == 1, f"fetched before expire={attached.fetched}")
+                st40 = catalog.get_fetch_state(con, 40, "minute")
+                st41 = catalog.get_fetch_state(con, 41, "minute")
+                st42 = catalog.get_fetch_state(con, 42, "minute")
+                _assert(st40 is not None and st40.status == "done", "token 40 committed")
+                _assert(st41 is None, "token 41 not committed")
+                _assert(st42 is None, "token 42 not committed")
+                path = series_path(root / "minute", "NIFTY", expiry)
+                _assert(path.is_file(), "partial file written")
+                dcon = duckdb.connect()
+                try:
+                    tokens = [
+                        r[0]
+                        for r in dcon.execute(
+                            "SELECT DISTINCT token FROM read_parquet(?) ORDER BY 1",
+                            [str(path)],
+                        ).fetchall()
+                    ]
+                finally:
+                    dcon.close()
+                _assert(tokens == [40], f"only committed token in file: {tokens}")
+        finally:
+            con.close()
+
+
+def test_fetch_lock_leaves_state_uncommitted() -> None:
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        return _synth_candles(token, from_date, to_date, n=2)
+
+    client, _, _ = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="NIFTY", expiry=expiry, tokens=[50], seen_on=now.date()
+            )
+            states: dict[int, catalog.FetchState] = {}
+            real_replace = os.replace
+
+            def boom(src: Any, dst: Any) -> None:
+                if str(dst).endswith(".parquet") and "minute" in str(dst).replace("\\", "/"):
+                    raise PermissionError("locked")
+                return real_replace(src, dst)
+
+            with mock.patch.object(fetch_mod.os, "replace", side_effect=boom):
+                result = fetch_mod.process_series(
+                    client,
+                    con,
+                    series,
+                    states,
+                    now=now,
+                    minute_dir=root / "minute",
+                    staging_dir=root / "staging",
+                )
+            _assert(result.locked, "marked locked")
+            _assert(catalog.get_fetch_state(con, 50, "minute") is None, "state not committed")
+            dest = series_path(root / "minute", "NIFTY", expiry)
+            _assert(not dest.is_file(), "dest not replaced")
+        finally:
+            con.close()
+
+
+def test_fetch_gave_up_expired_contract() -> None:
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 20)  # expired
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        raise InputException("invalid token")
+
+    client, _, _ = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="OLD", expiry=expiry, tokens=[60], seen_on=date(2026, 10, 20)
+            )
+            states: dict[int, catalog.FetchState] = {}
+            for _ in range(3):
+                fetch_mod.process_series(
+                    client,
+                    con,
+                    series,
+                    states,
+                    now=now,
+                    minute_dir=root / "minute",
+                    staging_dir=root / "staging",
+                )
+            st = catalog.get_fetch_state(con, 60, "minute")
+            _assert(st is not None and st.status == "gave_up", f"gave_up status={st}")
+            _assert(st.attempts >= 3, f"attempts={st.attempts}")
+            _assert(planner.contract_pending_requests(st, now=now) == 0, "0 pending")
+            # select_series should not keep unfinished expired with gave_up
+            selected = universe.select_series(con, today=now.date())
+            keys = {(s.underlying, s.expiry) for s in selected}
+            _assert(("OLD", expiry) not in keys, "gave_up series not unfinished")
+        finally:
+            con.close()
+
+
+def test_fetch_max_series() -> None:
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        return _synth_candles(token, from_date, to_date, n=1)
+
+    client, kite, _ = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            s1 = _seed_series_contracts(
+                con, underlying="AAA", expiry=date(2026, 10, 27), tokens=[70], seen_on=now.date()
+            )
+            s2 = _seed_series_contracts(
+                con, underlying="BBB", expiry=date(2026, 10, 27), tokens=[71], seen_on=now.date()
+            )
+            states: dict[int, catalog.FetchState] = {}
+            run = fetch_mod.run_fetch(
+                client,
+                con,
+                [s1, s2],
+                states,
+                now=now,
+                max_series=1,
+                minute_dir=root / "minute",
+                staging_dir=root / "staging",
+            )
+            _assert(len(run.results) == 1, f"results={len(run.results)}")
+            _assert(run.results[0].underlying == "AAA", "first series only")
+            _assert(kite.calls == 1, f"calls={kite.calls}")
+            _assert(catalog.get_fetch_state(con, 71, "minute") is None, "second not fetched")
+        finally:
+            con.close()
+
+
 def main() -> None:
     tests = [
         test_paths,
@@ -867,6 +1418,13 @@ def main() -> None:
         test_snapshot_happy_path_and_fields,
         test_snapshot_rejects_weekend_and_batch_failure,
         test_snapshot_missing_keys_and_rank,
+        test_fetch_backfill_and_rerun,
+        test_fetch_partial_rollback_and_dedupe,
+        test_fetch_skip_untraded_and_missing_snapshot,
+        test_fetch_session_expired_mid_series,
+        test_fetch_lock_leaves_state_uncommitted,
+        test_fetch_gave_up_expired_contract,
+        test_fetch_max_series,
     ]
     failed = 0
     for fn in tests:

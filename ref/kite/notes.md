@@ -63,6 +63,7 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 | `uv run ohlcv queue [--expiry] [--underlying] [--limit]` | only if sync must refresh master | Print series queue: expiry asc, traded_value desc, unranked last; request/time estimates |
 | `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
 | `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | Phase 2 end-of-day quote snapshot |
+| `uv run ohlcv fetch [--expiry] [--underlying] [--max-series] [--max-minutes] [--dry-run]` | yes (except `--dry-run`) | Phase 3 minute candle download |
 
 ### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=2)
 Tables: `meta`, `contracts`, `fetch_state` (watermarks; Phase 3 writes), `underlying_rank`, `runs`, `daily_snapshots`.
@@ -109,6 +110,46 @@ Activity: `volume`, `average_price`, `traded_value` (`volume * average_price`), 
 | `uv run ohlcv daily --show [yyyymmdd]` | Offline summary of an existing snapshot (default: latest) |
 
 Trade date = date of the latest `last_trade_time` in the response (must equal IST run date). Close notebooks that hold `catalog.duckdb` before running.
+
+## OHLCV Phase 3 (minute fetch)
+
+Incremental minute candles with OI, one Parquet file per `(underlying, expiry)` series.
+
+### Command
+```powershell
+uv run ohlcv fetch [--expiry yyyymmdd] [--underlying NIFTY] [--max-series N] [--max-minutes M] [--dry-run]
+```
+- Queue order: expiry ascending, then traded-value rank (from Phase 2 snapshot / FUT day fallback).
+- Finishes one series before starting the next. `--dry-run` prints adjusted request estimates including untraded skips.
+- Close notebooks that hold `catalog.duckdb` **or** a series parquet before running (Windows file locks).
+
+### Layout
+- File: `data/ohlcv/nfo/minute/<UNDERLYING>/yyyymmdd.parquet` (expiry in the name; atomic rewrite via `_staging/`).
+- Columns: `underlying`, `expiry`, `token`, `tradingsymbol`, `instrument_type`, `strike`, `lot_size`, `ts`, `open`, `high`, `low`, `close`, `volume`, `oi`.
+- `ts` is naive IST. Rows sorted by `(token, ts)`. Contract columns compress well under that order.
+- Default backfill window = 60 inclusive calendar days → **1** historical request per contract (Phase 0 chunk size).
+
+### `fetch_state` status
+| Status | Meaning |
+| --- | --- |
+| `done` | Watermark at/after session end (or before open); next run is a no-op until new session data is due |
+| `partial` | Fetched during market hours; next run rolls back to 09:15 IST that day and refreshes |
+| `error` | Request rejected / retries exhausted; watermark unchanged; `attempts` incremented |
+| `gave_up` | Expired contract failed 3 times — treated as finished so the series drops off the unfinished queue |
+
+Watermark `fetched_to` is the **requested** end (not last candle); sparse contracts often have no bar at the last minute.
+
+### Skip rule (no historical call)
+Only when a watermark already exists **and** every remaining weekday in the window has a `daily_snapshots` row with `status=final` listing the token as untraded (`volume=0`). Initial backfill (no `fetch_state`) always fetches. Weekend-only windows do not auto-skip.
+
+### Interrupts / locks
+- Ctrl+C, `--max-minutes`, `--max-series`: finish the current contract, merge + commit that series, then stop.
+- Session expired (HTTP 403 / `TokenException`): commit fetched contracts in the current series, then exit with `uv run kitetools login`.
+- 5 consecutive `RetryExhausted` across contracts: commit and abort (likely network down).
+- If `os.replace` hits `PermissionError` (file open elsewhere), `fetch_state` is **not** committed; one retry at end of run after 5s; otherwise re-run later (merge is idempotent).
+
+### Offline check
+`uv run python -m ohlcv.selftest` (includes Phase 3 fake-kite tests).
 
 ## Portfolio data (verified 2026-10-25 sample `data/samples/20261025-121155`)
 APIs: `holdings()`, `positions()` → `{net, day}`, `mf_holdings()`. No historical portfolio or demat txn API.

@@ -356,6 +356,49 @@ def get_fetch_state(
     )
 
 
+def upsert_fetch_state(
+    con: duckdb.DuckDBPyConnection,
+    state: FetchState,
+) -> None:
+    """Insert or replace one fetch_state row."""
+    con.execute(
+        """
+        INSERT INTO fetch_state (
+            token, interval, fetched_to, status, rows_total, attempts, last_error, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (token, interval) DO UPDATE SET
+            fetched_to = excluded.fetched_to,
+            status = excluded.status,
+            rows_total = excluded.rows_total,
+            attempts = excluded.attempts,
+            last_error = excluded.last_error,
+            updated_at = excluded.updated_at
+        """,
+        [
+            state.token,
+            state.interval,
+            state.fetched_to,
+            state.status,
+            state.rows_total,
+            state.attempts,
+            state.last_error,
+            state.updated_at,
+        ],
+    )
+
+
+def upsert_fetch_states(
+    con: duckdb.DuckDBPyConnection,
+    states: Iterable[FetchState],
+) -> int:
+    """Upsert many fetch_state rows. Returns count written."""
+    count = 0
+    for state in states:
+        upsert_fetch_state(con, state)
+        count += 1
+    return count
+
+
 def list_fetch_states(
     con: duckdb.DuckDBPyConnection,
     *,
