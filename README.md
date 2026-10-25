@@ -116,3 +116,16 @@ print(kite.holdings())
 ```
 
 Always `import kitetools` (or `from kitetools...`) before other HTTPS clients so SSL works on this machine.
+
+---
+
+## Portfolio samples (`portfolio` package)
+
+Workspace member for portfolio capture (snapshots/UI come later). After `uv sync --all-packages`:
+
+```powershell
+uv run portfolio sample      # fetch holdings + positions + mf_holdings → data/samples/<IST timestamp>/
+uv run portfolio summarize   # field/qty report for the latest sample (or pass a folder name)
+```
+
+Requires a valid session (`uv run kitetools login`). Samples stay under gitignored `data/`. Verified quantity rules live in `ref/kite/notes.md`.

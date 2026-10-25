@@ -23,3 +23,37 @@
 - Instrument master only lists live contracts; F&O tokens change every expiry. Cache `instruments()` daily to keep tokens for expired contracts.
 - `continuous=1` works only for NFO/MCX futures and returns day candles only.
 - Max date range per request per interval is not in the docs; confirm before designing the chunked downloader.
+
+## Portfolio data (verified 2026-10-25 sample `data/samples/20261025-121155`)
+APIs: `holdings()`, `positions()` → `{net, day}`, `mf_holdings()`. No historical portfolio or demat txn API.
+
+### Holdings (equity CNC demat)
+- Fields seen: standard docs fields plus `las_quantity`, `authorisation`, nested `mtf.{quantity,used_quantity,average_price,value,initial_margin}`.
+- Identity verified on this account: `quantity + t1_quantity + collateral_quantity == opening_quantity` (28/28). Also `quantity == realised_quantity`.
+- Pledged stock still counts as owned: several rows had `quantity=0` with `collateral_quantity == opening_quantity` (e.g. fully pledged HDFCBANK, RELIANCE). Fingerprint **must** include collateral or those disappear.
+- `quantity + t1_quantity == opening_quantity` alone fails when collateral is non-zero.
+- No multi-exchange duplicate ISINs in this sample; still key equity by **ISIN** (symbols/exchanges can rename or dual-list).
+- `t1_quantity` / `used_quantity` / `mtf.quantity` / `short_quantity` / `las_quantity` were all zero in this off-market sample — re-check on a delivery buy/sell day.
+
+### Positions
+- F&O overnight stays in `positions` (product `NRML`), never moves to holdings. Sample: 14 NFO/NRML rows, all with `overnight_quantity == quantity` (signed; shorts negative), `multiplier=1`.
+- Equity delivery taken today would appear as CNC in positions and move to holdings after settlement — none in this sample (`day` empty; weekend).
+- Key derivatives / MIS by `exchange:tradingsymbol` (add `:product` if the same symbol appears under more than one product).
+
+### Mutual funds (`mf_holdings`)
+- Empty on this account (0 rows). Treat key as `isin:folio`, units rounded to 3 decimals, until a non-empty sample revises it.
+
+### Snapshot fingerprint (frozen for Phase 1)
+Trigger a new snapshot only when this composition map changes (price-only changes do not count). Drop entries whose quantity is 0 after aggregation.
+
+| Book | Key | Quantity |
+| --- | --- | --- |
+| Equity holdings | `isin` | `quantity + t1_quantity + collateral_quantity` |
+| Equity CNC in positions.net | map onto same `isin` when known, else `exchange:tradingsymbol:CNC` | net `quantity` (signed) |
+| F&O / MIS positions.net | `exchange:tradingsymbol:product` | net `quantity` (signed) |
+| MF holdings | `isin:folio` | `round(quantity, 3)` |
+
+Notes:
+- `opening_quantity` equals owned qty at day open but does not move with same-day buys/sells; use the sum above for live fingerprints.
+- `used_quantity` is not added back (docs: sold from net holding; appears already reflected in `quantity` when non-zero — confirm on a sell day).
+- Snapshot `observed_at` = fetch time; `effective_date` of the true trade stays null until tradebook reconstruction.
