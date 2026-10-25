@@ -37,6 +37,7 @@ from .client import (
     SessionExpired,
 )
 from .paths import sanitize_underlying, series_path, ymd
+from .progress import InterruptController, setup_run_logging
 
 
 class Failure(Exception):
@@ -1401,6 +1402,106 @@ def test_fetch_max_series() -> None:
             con.close()
 
 
+def test_setup_run_logging_writes_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "run.log"
+        out = setup_run_logging("fetch", log_file=path)
+        _assert(out == path, "returns path")
+        log = __import__("logging").getLogger("ohlcv")
+        log.info("hello-from-test")
+        for h in list(log.handlers):
+            h.flush()
+            h.close()
+        log.handlers.clear()
+        text = path.read_text(encoding="utf-8")
+        _assert("hello-from-test" in text, f"log contents={text!r}")
+        _assert("log_file=" in text, "startup line")
+
+
+def test_interrupt_soft_then_force() -> None:
+    ctrl = InterruptController()
+    announced: list[str] = []
+    ctrl.install(on_soft_stop=lambda: announced.append("soft"))
+    try:
+        ctrl._handle(2, None)  # noqa: SLF001 — first Ctrl-C
+        _assert(ctrl.soft_stop, "soft_stop set")
+        _assert(ctrl.should_stop() == "keyboard interrupt", "should_stop")
+        _assert(announced == ["soft"], f"announced={announced}")
+        raised = False
+        try:
+            ctrl._handle(2, None)  # noqa: SLF001 — second Ctrl-C
+        except SystemExit as exc:
+            raised = True
+            _assert(exc.code == 130, f"code={exc.code}")
+        _assert(raised, "second Ctrl-C exits")
+    finally:
+        ctrl.restore()
+
+
+def test_fetch_soft_interrupt_commits_and_stops() -> None:
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        return _synth_candles(token, from_date, to_date, n=1)
+
+    client, kite, _ = _make_client(handler)
+    interrupt = InterruptController()
+    seen: list[int] = []
+
+    def on_contract(p: Any) -> None:
+        seen.append(p.contract_index)
+        # Soft-stop after first contract of first series.
+        if len(seen) == 1:
+            interrupt.soft_stop = True
+            interrupt.reason = "keyboard interrupt"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            s1 = _seed_series_contracts(
+                con,
+                underlying="AAA",
+                expiry=date(2026, 10, 27),
+                tokens=[80, 81],
+                seen_on=now.date(),
+            )
+            s2 = _seed_series_contracts(
+                con,
+                underlying="BBB",
+                expiry=date(2026, 10, 27),
+                tokens=[82],
+                seen_on=now.date(),
+            )
+            states: dict[int, catalog.FetchState] = {}
+            run = fetch_mod.run_fetch(
+                client,
+                con,
+                [s1, s2],
+                states,
+                now=now,
+                minute_dir=root / "minute",
+                staging_dir=root / "staging",
+                on_contract=on_contract,
+                interrupt=interrupt,
+            )
+            _assert(run.stopped_reason == "keyboard interrupt", f"stopped={run.stopped_reason}")
+            _assert(len(run.results) == 1, f"results={len(run.results)}")
+            _assert(run.results[0].fetched == 1, f"fetched={run.results[0].fetched}")
+            _assert(run.results[0].stop_reason == "keyboard interrupt", "series stop")
+            st80 = catalog.get_fetch_state(con, 80, "minute")
+            st81 = catalog.get_fetch_state(con, 81, "minute")
+            st82 = catalog.get_fetch_state(con, 82, "minute")
+            _assert(st80 is not None and st80.status == "done", f"st80={st80}")
+            _assert(st81 is None, "second contract of series1 not fetched")
+            _assert(st82 is None, "series2 not started")
+            dest = series_path(root / "minute", "AAA", date(2026, 10, 27))
+            _assert(dest.is_file(), "series parquet committed")
+        finally:
+            con.close()
+
+
 def main() -> None:
     tests = [
         test_paths,
@@ -1425,6 +1526,9 @@ def main() -> None:
         test_fetch_lock_leaves_state_uncommitted,
         test_fetch_gave_up_expired_contract,
         test_fetch_max_series,
+        test_setup_run_logging_writes_file,
+        test_interrupt_soft_then_force,
+        test_fetch_soft_interrupt_commits_and_stops,
     ]
     failed = 0
     for fn in tests:

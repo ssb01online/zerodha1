@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import duckdb
 
@@ -270,10 +270,22 @@ def _write_parquet(
 def fetch_quotes(
     client: KiteClient,
     contracts: Sequence[ContractRow],
+    *,
+    should_stop: Callable[[], str | None] | None = None,
+    on_batch: Callable[[int, int, int, int], None] | None = None,
 ) -> tuple[dict[int, dict[str, Any]], int]:
-    """Return (token -> quote, missing_count). Aborts on RetryExhausted."""
+    """Return (token -> quote, missing_count). Aborts on RetryExhausted.
+
+    ``on_batch(batch_index, batch_total, contracts_done, contracts_total)`` is optional.
+    """
     by_token: dict[int, dict[str, Any]] = {}
-    for i in range(0, len(contracts), QUOTE_BATCH_SIZE):
+    total = len(contracts)
+    batch_total = (total + QUOTE_BATCH_SIZE - 1) // QUOTE_BATCH_SIZE if total else 0
+    for batch_i, i in enumerate(range(0, total, QUOTE_BATCH_SIZE), start=1):
+        if should_stop is not None:
+            reason = should_stop()
+            if reason is not None:
+                raise SnapshotRejected(f"stopped: {reason}")
         batch = contracts[i : i + QUOTE_BATCH_SIZE]
         keys = [f"NFO:{c.tradingsymbol}" for c in batch]
         data = client.quote(keys)
@@ -282,6 +294,8 @@ def fetch_quotes(
             if token is None:
                 continue
             by_token[int(token)] = q
+        if on_batch is not None:
+            on_batch(batch_i, batch_total, min(i + len(batch), total), total)
     missing = sum(1 for c in contracts if c.token not in by_token)
     return by_token, missing
 
@@ -294,6 +308,8 @@ def take_snapshot(
     run_date: date | None = None,
     dest_dir: Path | None = None,
     staging_dir: Path | None = None,
+    should_stop: Callable[[], str | None] | None = None,
+    on_batch: Callable[[int, int, int, int], None] | None = None,
 ) -> SnapshotResult:
     """Fetch quotes, validate session, write daily/yyyymmdd.parquet."""
     if not contracts:
@@ -307,7 +323,12 @@ def take_snapshot(
     run_date = run_date if run_date is not None else now.date()
     dest_dir = dest_dir if dest_dir is not None else DAILY_DIR
 
-    by_token, missing = fetch_quotes(client, contracts)
+    by_token, missing = fetch_quotes(
+        client,
+        contracts,
+        should_stop=should_stop,
+        on_batch=on_batch,
+    )
     trade_date = _infer_trade_date(by_token)
     if trade_date is None:
         raise SnapshotRejected(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import os
-import signal
 import sys
 import tempfile
 import time
@@ -38,6 +37,7 @@ from .paths import (
     series_path,
     ymd,
 )
+from .progress import ContractProgress, InterruptController
 from .snapshot import untraded_tokens
 from .universe import SESSION_END, Series
 
@@ -603,6 +603,9 @@ def process_series(
     staging_dir: Path = STAGING_DIR,
     untraded_cache: dict[date, set[int] | None] | None = None,
     should_stop: Callable[[], str | None] | None = None,
+    on_contract: Callable[[ContractProgress], None] | None = None,
+    series_index: int = 1,
+    series_total: int = 1,
 ) -> SeriesResult:
     """Fetch all contracts in one series; merge + commit. Raises SessionExpired after commit attempt."""
     t0 = time.monotonic()
@@ -621,10 +624,11 @@ def process_series(
     interrupt_reason: str | None = None
     session_exc: SessionExpired | None = None
     abort_exc: FetchAborted | None = None
+    contract_total = len(series.contracts)
 
     fh, writer = _open_spool(spool_path)
     try:
-        for contract in series.contracts:
+        for idx, contract in enumerate(series.contracts, start=1):
             if should_stop is not None:
                 reason = should_stop()
                 if reason is not None:
@@ -647,6 +651,27 @@ def process_series(
                 break
             fh.flush()
             outcomes.append(outcome)
+            if on_contract is not None:
+                on_contract(
+                    ContractProgress(
+                        series_index=series_index,
+                        series_total=series_total,
+                        underlying=series.underlying,
+                        expiry=series.expiry,
+                        contract_index=idx,
+                        contract_total=contract_total,
+                        fetched=sum(1 for o in outcomes if o.fetched),
+                        skipped=sum(1 for o in outcomes if o.skipped),
+                        errors=sum(1 for o in outcomes if o.status == "error"),
+                        gave_up=sum(1 for o in outcomes if o.status == "gave_up"),
+                        rows=sum(o.rows for o in outcomes),
+                        requests=client.counters.requests,
+                        retries=client.counters.retries,
+                        elapsed_s=time.monotonic() - t0,
+                        tradingsymbol=contract.tradingsymbol,
+                        last_status=outcome.status,
+                    )
+                )
             if outcome.status == "error" and outcome.last_error and "retries exhausted" in (outcome.last_error or ""):
                 consecutive_retry_fails += 1
                 if consecutive_retry_fails >= CONSECUTIVE_RETRY_ABORT:
@@ -789,18 +814,17 @@ def run_fetch(
     minute_dir: Path = MINUTE_DIR,
     staging_dir: Path = STAGING_DIR,
     on_series: Callable[[int, int, SeriesResult], None] | None = None,
+    on_contract: Callable[[ContractProgress], None] | None = None,
+    on_series_start: Callable[[int, int, Series], None] | None = None,
+    interrupt: InterruptController | None = None,
 ) -> FetchRunResult:
     """Process queue series in order. Handles Ctrl+C, budgets, lock retries."""
     now = now if now is not None else datetime.now(auth.IST)
     now = _as_aware_ist(now)
-    stop_reason: list[str | None] = [None]
-    interrupted = {"flag": False}
-
-    def _handle_sigint(signum: int, frame: Any) -> None:
-        interrupted["flag"] = True
-        stop_reason[0] = "keyboard interrupt"
-
-    prev_handler = signal.signal(signal.SIGINT, _handle_sigint)
+    own_interrupt = interrupt is None
+    ctrl = interrupt if interrupt is not None else InterruptController()
+    if own_interrupt:
+        ctrl.install()
     deadline = None if max_minutes is None else time.monotonic() + max_minutes * 60.0
     untraded_cache: dict[date, set[int] | None] = {}
     results: list[SeriesResult] = []
@@ -811,8 +835,9 @@ def run_fetch(
     total = len(series_list)
 
     def should_stop() -> str | None:
-        if interrupted["flag"]:
-            return stop_reason[0] or "keyboard interrupt"
+        reason = ctrl.should_stop()
+        if reason is not None:
+            return reason
         if deadline is not None and time.monotonic() >= deadline:
             return f"max-minutes budget ({max_minutes})"
         return None
@@ -823,6 +848,8 @@ def run_fetch(
             if should_stop() is not None:
                 stopped = should_stop()
                 break
+            if on_series_start is not None:
+                on_series_start(idx, total, series)
             try:
                 result = process_series(
                     client,
@@ -834,6 +861,9 @@ def run_fetch(
                     staging_dir=staging_dir,
                     untraded_cache=untraded_cache,
                     should_stop=should_stop,
+                    on_contract=on_contract,
+                    series_index=idx,
+                    series_total=total,
                 )
             except SessionExpired as exc:
                 attached = getattr(exc, "result", None)
@@ -874,7 +904,8 @@ def run_fetch(
                 stopped = should_stop()
                 break
     finally:
-        signal.signal(signal.SIGINT, prev_handler)
+        if own_interrupt:
+            ctrl.restore()
 
     # Retry locked series once after a short sleep.
     still_locked: list[tuple[str, date]] = []

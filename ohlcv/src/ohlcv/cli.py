@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+import time
 from collections import defaultdict
 from datetime import date, datetime
+from pathlib import Path
 
 from kiteconnect.exceptions import TokenException
 
@@ -23,6 +26,13 @@ def _parse_ymd(text: str) -> date:
     if len(text) == 8 and text.isdigit():
         return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
     return date.fromisoformat(text)
+
+
+def _optional_log_path(args: argparse.Namespace) -> Path | None:
+    raw = getattr(args, "log_file", None)
+    if not raw:
+        return None
+    return Path(raw)
 
 
 def cmd_probe(args: argparse.Namespace) -> None:
@@ -220,24 +230,31 @@ def cmd_daily(args: argparse.Namespace) -> None:
     from . import snapshot
     from .client import KiteClient, RetryExhausted, SessionExpired
     from .paths import CATALOG_PATH, DAILY_DIR
+    from .progress import InterruptController, ProgressReporter, setup_run_logging
 
     if args.show is not None:
         _cmd_daily_show(args)
         return
 
+    log_path = setup_run_logging("daily", log_file=_optional_log_path(args))
+    reporter = ProgressReporter(logger=logging.getLogger("ohlcv"))
+    interrupt = InterruptController()
+    interrupt.install(on_soft_stop=reporter.soft_stop_announced)
     started = datetime.now(auth.IST)
+    t0 = time.monotonic()
+    con = None
     try:
-        con = catalog.connect()
-    except catalog.CatalogLocked as exc:
-        raise SystemExit(str(exc)) from exc
+        try:
+            con = catalog.connect()
+        except catalog.CatalogLocked as exc:
+            raise SystemExit(str(exc)) from exc
 
-    client = None
-    try:
+        client = None
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "daily", started_at=started.replace(tzinfo=None))
         try:
             count, archive_path = _run_sync(con)
-            print(f"Synced {count} NFO contracts (archive {archive_path})")
+            reporter.note(f"Synced {count} NFO contracts (archive {archive_path})")
             contracts = snapshot.live_contracts(con)
             dry = snapshot.estimate_dry_run(contracts)
             if args.dry_run:
@@ -252,6 +269,7 @@ def cmd_daily(args: argparse.Namespace) -> None:
                     f"~{dry.estimated_seconds / 60:.1f} min"
                 )
                 print(f"Catalog: {CATALOG_PATH}")
+                print(f"Log: {log_path}")
                 return
 
             try:
@@ -267,7 +285,24 @@ def cmd_daily(args: argparse.Namespace) -> None:
                 _login_exit(exc)
 
             client = KiteClient(kite)
-            result = snapshot.take_snapshot(client, contracts)
+
+            def _on_batch(bi: int, bt: int, done: int, total: int) -> None:
+                reporter.batch(
+                    batch_index=bi,
+                    batch_total=bt,
+                    contracts_done=done,
+                    contracts_total=total,
+                    requests=client.counters.requests,
+                    elapsed_s=time.monotonic() - t0,
+                )
+
+            result = snapshot.take_snapshot(
+                client,
+                contracts,
+                should_stop=interrupt.should_stop,
+                on_batch=_on_batch,
+            )
+            reporter.clear_heartbeat()
             catalog.record_snapshot(
                 con,
                 catalog.DailySnapshotMeta(
@@ -352,8 +387,11 @@ def cmd_daily(args: argparse.Namespace) -> None:
         _print_ranks(con)
         print(f"Daily dir: {DAILY_DIR}")
         print(f"Catalog: {CATALOG_PATH}")
+        print(f"Log: {log_path}")
     finally:
-        con.close()
+        interrupt.restore()
+        if con is not None:
+            con.close()
 
 
 def _cmd_daily_show(args: argparse.Namespace) -> None:
@@ -426,16 +464,23 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     from . import universe
     from .client import KiteClient, SessionExpired
     from .paths import CATALOG_PATH, MINUTE_DIR, ymd as paths_ymd
+    from .progress import InterruptController, ProgressReporter, setup_run_logging
+
+    log_path = setup_run_logging("fetch", log_file=_optional_log_path(args))
+    reporter = ProgressReporter(logger=logging.getLogger("ohlcv"))
+    interrupt = InterruptController()
+    interrupt.install(on_soft_stop=reporter.soft_stop_announced)
 
     started = datetime.now(auth.IST)
     expiry_filter = _parse_ymd(args.expiry) if args.expiry else None
+    con = None
     try:
-        con = catalog.connect()
-    except catalog.CatalogLocked as exc:
-        raise SystemExit(str(exc)) from exc
+        try:
+            con = catalog.connect()
+        except catalog.CatalogLocked as exc:
+            raise SystemExit(str(exc)) from exc
 
-    client = None
-    try:
+        client = None
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "fetch", started_at=started.replace(tzinfo=None))
         try:
@@ -459,7 +504,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             )
             raise SystemExit(str(exc)) from exc
 
-        print(f"Synced {count} NFO contracts (archive {archive_path})")
+        reporter.note(f"Synced {count} NFO contracts (archive {archive_path})")
         series = universe.select_series(con)
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
@@ -521,6 +566,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 f"(~{total_skip} untraded skips), ~{total_sec / 60:.1f} min"
             )
             print(f"Catalog: {CATALOG_PATH}")
+            print(f"Log: {log_path}")
             return
 
         try:
@@ -536,15 +582,35 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             _login_exit(exc)
 
         client = KiteClient(kite)
+        contracts_total = sum(len(s.contracts) for s in queue_series)
+        reporter.set_totals(contracts_total=contracts_total)
+        reporter.note(
+            f"Fetch queue: {len(queue_series)} series, {contracts_total} contracts"
+        )
 
-        def _progress(idx: int, total: int, result: fetch_mod.SeriesResult) -> None:
-            flag = " LOCKED" if result.locked else ""
-            print(
-                f"[{idx}/{total}] {paths_ymd(result.expiry)} {result.underlying} "
-                f"{result.contracts} contracts fetched={result.fetched} "
-                f"skipped={result.skipped} rows={result.rows:,} "
-                f"{result.elapsed_s:.1f}s{flag}",
-                file=sys.stderr,
+        def _on_series_start(idx: int, total: int, s: universe.Series) -> None:
+            reporter.series_start(
+                series_index=idx,
+                series_total=total,
+                underlying=s.underlying,
+                expiry=s.expiry,
+                contracts=len(s.contracts),
+            )
+
+        def _on_series(idx: int, total: int, result: fetch_mod.SeriesResult) -> None:
+            reporter.series_done(
+                series_index=idx,
+                series_total=total,
+                underlying=result.underlying,
+                expiry=result.expiry,
+                contracts=result.contracts,
+                fetched=result.fetched,
+                skipped=result.skipped,
+                errors=result.errors,
+                rows=result.rows,
+                elapsed_s=result.elapsed_s,
+                locked=result.locked,
+                stop_reason=result.stop_reason,
             )
 
         try:
@@ -556,7 +622,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 now=now,
                 max_series=args.max_series,
                 max_minutes=args.max_minutes,
-                on_series=_progress,
+                on_series=_on_series,
+                on_contract=reporter.contract,
+                on_series_start=_on_series_start,
+                interrupt=interrupt,
             )
         except SessionExpired as exc:
             catalog.finish_run(
@@ -596,6 +665,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             note=" ".join(note_parts),
         )
 
+        reporter.clear_heartbeat()
         print()
         print(
             f"Done: {run.series_done} series, fetched={run.contracts_fetched}, "
@@ -610,8 +680,11 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             print(f"Stopped: {run.stopped_reason}")
         print(f"Minute dir: {MINUTE_DIR}")
         print(f"Catalog: {CATALOG_PATH}")
+        print(f"Log: {log_path}")
     finally:
-        con.close()
+        interrupt.restore()
+        if con is not None:
+            con.close()
 
 
 def cmd_queue(args: argparse.Namespace) -> None:
@@ -798,6 +871,12 @@ def main() -> None:
         metavar="YYYYMMDD",
         help="Show an existing snapshot (default: latest). Offline; no quote() calls.",
     )
+    p_daily.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Write run log to PATH (default: data/ohlcv/nfo/logs/daily_YYYYMMDD_HHMMSS.log).",
+    )
     p_daily.set_defaults(func=cmd_daily)
 
     p_fetch = sub.add_parser(
@@ -830,6 +909,12 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Print queue and skip estimates without calling historical_data().",
+    )
+    p_fetch.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Write run log to PATH (default: data/ohlcv/nfo/logs/fetch_YYYYMMDD_HHMMSS.log).",
     )
     p_fetch.set_defaults(func=cmd_fetch)
 

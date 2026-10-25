@@ -13,6 +13,7 @@ DAILY_DIR = OHLCV_DIR / "daily"
 DAY_DIR = OHLCV_DIR / "day"
 MINUTE_DIR = OHLCV_DIR / "minute"
 STAGING_DIR = OHLCV_DIR / "_staging"
+LOGS_DIR = OHLCV_DIR / "logs"
 CATALOG_PATH = OHLCV_DIR / "catalog.duckdb"
 ARCHIVE_DIR = DATA_DIR / "instruments" / "archive"
 
