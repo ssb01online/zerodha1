@@ -472,11 +472,15 @@ name = "instruments"
 version = "0.1.0"
 source = { editable = "instruments" }
 dependencies = [
+    { name = "fastapi" },
     { name = "kitetools" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "kitetools", editable = "." }]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "kitetools", editable = "." },
+]
 
 [[package]]
 name = "kiteconnect"

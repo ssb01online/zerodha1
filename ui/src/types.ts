@@ -175,10 +175,79 @@ export interface Health {
   ok: boolean;
   session: HealthSession;
   db: HealthDb;
+  ui_dist_exists?: boolean;
+  instruments_as_of?: string | null;
 }
 
 export interface ApiErrorBody {
   error: string;
   message: string;
   steps?: string[];
+}
+
+/** Full row from the daily instruments dump. */
+export interface InstrumentRow {
+  instrument_token: number;
+  exchange_token: number;
+  tradingsymbol: string;
+  name: string;
+  last_price: number;
+  expiry: string | null;
+  strike: number;
+  tick_size: number;
+  lot_size: number;
+  instrument_type: string;
+  segment: string;
+  exchange: string;
+}
+
+export interface InstrumentsMeta {
+  as_of_date: string | null;
+  total: number;
+  by_exchange: Record<string, number>;
+  by_instrument_type: Record<string, number>;
+  scope_exchanges: string[];
+  data_note: string;
+}
+
+export interface InstrumentsSearchResult {
+  as_of_date: string | null;
+  total: number;
+  limit: number;
+  offset: number;
+  items: InstrumentRow[];
+}
+
+export interface NfoUnderlying {
+  name: string;
+  fut_count: number;
+  ce_count: number;
+  pe_count: number;
+  total: number;
+}
+
+export interface NfoUnderlyingsResult {
+  as_of_date: string | null;
+  total: number;
+  items: NfoUnderlying[];
+}
+
+export interface NfoExpiriesResult {
+  underlying: string;
+  as_of_date: string | null;
+  expiries: string[];
+}
+
+export interface OptionChainStrike {
+  strike: number;
+  ce?: InstrumentRow;
+  pe?: InstrumentRow;
+}
+
+export interface OptionChainResult {
+  underlying: string;
+  expiry: string;
+  as_of_date: string | null;
+  fut: InstrumentRow | null;
+  strikes: OptionChainStrike[];
 }

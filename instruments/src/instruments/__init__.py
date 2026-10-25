@@ -1,19 +1,24 @@
-"""Daily Kite instruments cache (NSE/BSE/NFO) and slim token lookup for portfolio.
+"""Daily Kite instruments cache (NSE/BSE/NFO), token lookup, and browser query API.
 
-TODO (Phase 2+): browser UI/API, option chains, live quotes, MF/CDS/MCX/BFO,
-NSE/BSE scrip pairing.
+TODO (future): live quotes, MF/CDS/MCX/BFO, NSE/BSE scrip pairing.
 """
 
 import kitetools  # noqa: F401 — inject system SSL trust before any HTTPS
 
+from .api import router as api_router
 from .cache import (
     MASTER_PATH,
     clear_lookup_override,
+    clear_rows_override,
     ensure_cache,
+    get_as_of,
     get_by_token,
     get_meta,
+    instrument_to_json,
     iter_instruments,
+    peek_as_of,
     set_lookup_override,
+    set_rows_override,
 )
 from .models import Instrument, InstrumentMeta
 from .scope import IN_SCOPE_EXCHANGES
@@ -23,10 +28,16 @@ __all__ = [
     "MASTER_PATH",
     "Instrument",
     "InstrumentMeta",
+    "api_router",
     "clear_lookup_override",
+    "clear_rows_override",
     "ensure_cache",
+    "get_as_of",
     "get_by_token",
     "get_meta",
+    "instrument_to_json",
     "iter_instruments",
+    "peek_as_of",
     "set_lookup_override",
+    "set_rows_override",
 ]

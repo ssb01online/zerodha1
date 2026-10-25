@@ -1,6 +1,6 @@
 """Exchange scope for the instruments cache.
 
-In scope (Phase 1): NSE and BSE equity, NFO futures/options.
+In scope: NSE and BSE equity, NFO futures/options.
 
 TODO (future):
 - Mutual funds via kite.mf_instruments()
@@ -8,6 +8,7 @@ TODO (future):
 - MCX (commodities)
 - BFO (BSE F&O)
 - NSE/BSE same-scrip pairing for the browser UI
+- Live quotes / LTP enrichment for the browser
 """
 
 from __future__ import annotations

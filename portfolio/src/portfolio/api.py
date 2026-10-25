@@ -11,6 +11,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from kiteconnect.exceptions import KiteException
 
+from instruments import api_router as instruments_router
+from instruments import peek_as_of as instruments_peek_as_of
+
 from .fetch import TokenInvalid, fetch_live
 from .service import (
     DEFAULT_LIVE_TTL,
@@ -67,6 +70,7 @@ def create_app(
     app.state.service = service
     app.state.ui_dist = dist
     app.state.ui_dist_exists = ui_dist_exists
+    app.include_router(instruments_router)
 
     @app.exception_handler(TokenInvalid)
     async def token_invalid_handler(_request: Request, exc: TokenInvalid) -> JSONResponse:
@@ -120,6 +124,8 @@ def create_app(
         body = service.health()
         body["ui_dist_exists"] = ui_dist_exists
         body["ui_dist"] = str(dist)
+        as_of = instruments_peek_as_of()
+        body["instruments_as_of"] = as_of.isoformat() if as_of else None
         return body
 
     @app.get("/api/portfolio/live")

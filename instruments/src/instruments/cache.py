@@ -30,6 +30,11 @@ _memory_as_of: date | None = None
 _next_refresh_attempt: float = 0.0
 # When set (including {}), get_meta uses only this map — no file/Kite. None = normal cache.
 _override: dict[int, InstrumentMeta] | None = None
+# When set (including []), full-row APIs / query use only these rows — no file/Kite.
+_rows_override: list[Instrument] | None = None
+_rows_override_by_token: dict[int, Instrument] | None = None
+# Bumped on every memory load or rows override change so query indexes can invalidate.
+_load_generation: int = 0
 
 
 def set_lookup_override(mapping: dict[int, InstrumentMeta] | None) -> None:
@@ -40,6 +45,21 @@ def set_lookup_override(mapping: dict[int, InstrumentMeta] | None) -> None:
 
 def clear_lookup_override() -> None:
     set_lookup_override(None)
+
+
+def set_rows_override(rows: list[Instrument] | None) -> None:
+    """Test hook: force full-row reads and query to use ``rows`` (empty → no instruments)."""
+    global _rows_override, _rows_override_by_token, _load_generation
+    _rows_override = rows
+    if rows is None:
+        _rows_override_by_token = None
+    else:
+        _rows_override_by_token = {r.instrument_token: r for r in rows}
+    _load_generation += 1
+
+
+def clear_rows_override() -> None:
+    set_rows_override(None)
 
 
 def _today_ist() -> date:
@@ -122,7 +142,8 @@ def _index_rows(rows: list[Instrument]) -> tuple[dict[int, Instrument], dict[int
     return by_token, meta
 
 
-def _instrument_to_json(inst: Instrument) -> dict[str, Any]:
+def instrument_to_json(inst: Instrument) -> dict[str, Any]:
+    """Serialize a full instrument row for cache/API payloads."""
     return {
         "instrument_token": inst.instrument_token,
         "exchange_token": inst.exchange_token,
@@ -168,7 +189,7 @@ def _save_file(path: Path, as_of: date, rows: list[Instrument]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "as_of_date": as_of.isoformat(),
-        "rows": [_instrument_to_json(inst) for inst in rows],
+        "rows": [instrument_to_json(inst) for inst in rows],
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     # Drop legacy slim cache after a successful full write.
@@ -186,12 +207,13 @@ def _fetch_from_kite() -> list[Instrument]:
 
 
 def _set_memory(as_of: date, rows: list[Instrument]) -> None:
-    global _rows, _by_token, _meta_by_token, _memory_as_of
+    global _rows, _by_token, _meta_by_token, _memory_as_of, _load_generation
     by_token, meta = _index_rows(rows)
     _rows = rows
     _by_token = by_token
     _meta_by_token = meta
     _memory_as_of = as_of
+    _load_generation += 1
 
 
 def _ensure_loaded() -> dict[int, InstrumentMeta]:
@@ -242,7 +264,32 @@ def _ensure_loaded() -> dict[int, InstrumentMeta]:
 
 def ensure_cache() -> None:
     """Load or refresh today's cache (no-op if already current in memory)."""
+    if _rows_override is not None:
+        return
     _ensure_loaded()
+
+
+def peek_as_of() -> date | None:
+    """In-memory as_of without loading/refreshing the cache (None if not loaded yet)."""
+    if _rows_override is not None:
+        return None
+    return _memory_as_of
+
+
+def get_as_of() -> date | None:
+    """IST calendar date the in-memory master was loaded for, or None if empty/override."""
+    if _rows_override is not None:
+        return None
+    ensure_cache()
+    return _memory_as_of
+
+
+def get_load_generation() -> int:
+    """Monotonic counter; query indexes rebuild when this changes."""
+    if _rows_override is not None:
+        return _load_generation
+    ensure_cache()
+    return _load_generation
 
 
 def get_meta(token: int) -> InstrumentMeta | None:
@@ -251,6 +298,10 @@ def get_meta(token: int) -> InstrumentMeta | None:
         return _override.get(token)
     if token == 0:
         return None
+    if _rows_override is not None:
+        assert _rows_override_by_token is not None
+        inst = _rows_override_by_token.get(token)
+        return inst.meta() if inst is not None else None
     mapping = _ensure_loaded()
     return mapping.get(token)
 
@@ -259,6 +310,9 @@ def get_by_token(token: int) -> Instrument | None:
     """Return the full instrument row for ``token``, or None."""
     if token == 0:
         return None
+    if _rows_override is not None:
+        assert _rows_override_by_token is not None
+        return _rows_override_by_token.get(token)
     _ensure_loaded()
     assert _by_token is not None
     return _by_token.get(token)
@@ -266,6 +320,9 @@ def get_by_token(token: int) -> Instrument | None:
 
 def iter_instruments() -> Iterator[Instrument]:
     """Iterate all cached in-scope instruments (loads/refreshes as needed)."""
+    if _rows_override is not None:
+        yield from _rows_override
+        return
     _ensure_loaded()
     assert _rows is not None
     yield from _rows
@@ -274,9 +331,15 @@ def iter_instruments() -> Iterator[Instrument]:
 __all__ = [
     "MASTER_PATH",
     "clear_lookup_override",
+    "clear_rows_override",
     "ensure_cache",
+    "get_as_of",
     "get_by_token",
+    "get_load_generation",
     "get_meta",
+    "instrument_to_json",
     "iter_instruments",
+    "peek_as_of",
     "set_lookup_override",
+    "set_rows_override",
 ]

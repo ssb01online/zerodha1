@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Daily Kite instruments cache (NSE/BSE/NFO) and token lookup"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.115.0",
     "kitetools",
 ]
 

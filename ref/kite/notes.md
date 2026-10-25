@@ -71,11 +71,20 @@ Notes:
 
 ## API (Phase 2)
 
-- Serve: `uv run portfolio serve` → `http://127.0.0.1:8765` (bind loopback only).
-- Endpoints: `GET /api/health`, `GET /api/portfolio/live?refresh=`, `POST /api/portfolio/capture`, `GET /api/portfolio/snapshots`, `GET /api/portfolio/snapshots/{id}`.
+- Serve: `uv run portfolio serve` → `http://127.0.0.1:8765` (bind loopback only). One port for portfolio + instruments.
+- Portfolio endpoints: `GET /api/health`, `GET /api/portfolio/live?refresh=`, `POST /api/portfolio/capture`, `GET /api/portfolio/snapshots`, `GET /api/portfolio/snapshots/{id}`.
+- Instruments endpoints (router from workspace package `instruments`, dump-only): 
+  - `GET /api/instruments/meta`
+  - `GET /api/instruments/search?q=&exchange=&instrument_type=&limit=&offset=`
+  - `GET /api/instruments/by-token/{token}`
+  - `GET /api/instruments/nfo/underlyings?q=&limit=`
+  - `GET /api/instruments/nfo/expiries?underlying=`
+  - `GET /api/instruments/nfo/chain?underlying=&expiry=`
+- `/api/health` may include `instruments_as_of` when the master cache is already loaded in-process (does not trigger a refresh).
 - Live Kite responses are cached ~10s (errors never cached). Capture prefers the fresh cache so UI auto-capture after live does not double-fetch.
 - API opens DuckDB per call under a process lock (releases the file between requests so CLI reads can still work). Prefer capturing via the API while `serve` is running.
 - Token missing/expired → HTTP 401 `{error: token_invalid, message, steps}` with `uv run kitetools login` instructions. CORS allows Vite `http://127.0.0.1:5173` / `localhost:5173` only.
+- Instruments self-test (offline): `uv run python -m instruments.selftest`.
 
 ## API and UI (Phase 3)
 
@@ -101,7 +110,8 @@ npm run dev
 - Capture soft-fails in the status bar (`db_busy`, etc.) without hiding portfolio data.
 - 401 → token panel with the server's `steps` (run `uv run kitetools login`).
 - Snapshots list `/snapshots`; detail `/snapshots/:id` shows as-of banner + same tables + composition keys.
-- `localStorage`: `portfolio_ui_theme_v1` (`dark`|`light`), `portfolio_ui_tab_v1` (`holdings`|`mf`|`positions`), `portfolio_ui_pos_filters_v1` (`{ kind: all|equity|fo, expiryKey: all|unknown|YYYY-MM-DD }` — Positions toolbar kind/expiry filters).
+- Instruments browser: `/instruments` (Equity | NFO tabs), `/instruments/nfo/:underlying?expiry=`, `/instruments/token/:token`. Token always shown/copyable. `last_price` is dump as-of, not live.
+- `localStorage`: `portfolio_ui_theme_v1` (`dark`|`light`), `portfolio_ui_tab_v1` (`holdings`|`mf`|`positions`), `portfolio_ui_pos_filters_v1` (`{ kind: all|equity|fo, expiryKey: all|unknown|YYYY-MM-DD }` — Positions toolbar kind/expiry filters), `instruments_ui_tab_v1` (`equity`|`nfo`), column prefs `instruments_ui_cols_equity_v1` / `instruments_ui_cols_nfo_v1` / `instruments_ui_cols_chain_v1`.
 - Build check: `cd ui; $env:NODE_OPTIONS="--use-system-ca"; npm run build`.
 
 ## UI polish and SPA mount (Phase 4)
@@ -110,4 +120,10 @@ npm run dev
   - `portfolio_ui_cols_holdings_v1`, `portfolio_ui_cols_mf_v1`, `portfolio_ui_cols_positions_v1` (`{ hidden: string[] }`).
   - Identity columns (`symbol` / `fund`) are locked and cannot be hidden.
 - Single-process: after `npm run build`, `uv run portfolio serve` mounts `ui/dist` (`/assets` + SPA fallback to `index.html`). `/api/health` reports `ui_dist_exists`. If dist is missing, `/` returns a JSON hint (API-only).
-- Open `http://127.0.0.1:8765/portfolio` (no Vite required when dist is present).
+- Open `http://127.0.0.1:8765/portfolio` or `/instruments` (no Vite required when dist is present).
+
+## Instruments browser (Phase 2 app)
+
+- Shared SPA + single `portfolio serve` port; domain code in workspace package `instruments` (`cache`, `query`, `api` router).
+- Scope: NSE/BSE equity + NFO. NFO underlying key = dump `name`.
+- TODOs (not in this phase): live LTP/OI quotes, MF (`mf_instruments`), CDS, MCX, BFO, NSE/BSE same-scrip pairing, renaming serve to a generic app name.

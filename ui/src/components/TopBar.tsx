@@ -44,20 +44,26 @@ export default function TopBar() {
   return (
     <header className="topbar">
       <NavLink to="/portfolio" className="topbar-brand">
-        Portfolio
+        Kite tools
       </NavLink>
       <nav className="topbar-nav">
         <NavLink
           to="/portfolio"
           className={({ isActive }) => (isActive ? "active" : undefined)}
         >
-          Live
+          Portfolio
         </NavLink>
         <NavLink
           to="/snapshots"
           className={({ isActive }) => (isActive ? "active" : undefined)}
         >
           Snapshots
+        </NavLink>
+        <NavLink
+          to="/instruments"
+          className={({ isActive }) => (isActive ? "active" : undefined)}
+        >
+          Instruments
         </NavLink>
       </nav>
       <div className="topbar-meta">
