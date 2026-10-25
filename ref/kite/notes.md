@@ -59,12 +59,14 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 | Command | Needs login | Purpose |
 | --- | --- | --- |
 | `uv run ohlcv sync` | only if master cache must refresh from Kite | Archive `data/instruments/master.json` → `data/instruments/archive/yyyymmdd.json.gz`; upsert NFO rows into `data/ohlcv/nfo/catalog.duckdb` |
-| `uv run ohlcv rank [--force]` | yes | Rank underlyings by nearest-FUT **day** candle `volume * close` (weekend-safe; quote volume is 0 on Sundays) |
+| `uv run ohlcv rank [--force]` | only if no final snapshot (falls back to FUT day) | Rank underlyings: prefer final quote snapshot (`source=quote`); else nearest-FUT day `volume * close` |
 | `uv run ohlcv queue [--expiry] [--underlying] [--limit]` | only if sync must refresh master | Print series queue: expiry asc, traded_value desc, unranked last; request/time estimates |
 | `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
+| `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | Phase 2 end-of-day quote snapshot |
 
-### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=1)
-Tables: `meta`, `contracts`, `fetch_state` (watermarks; Phase 3 writes), `underlying_rank`, `runs`.
+### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=2)
+Tables: `meta`, `contracts`, `fetch_state` (watermarks; Phase 3 writes), `underlying_rank`, `runs`, `daily_snapshots`.
+v1→v2 soft-migrates by creating `daily_snapshots`.
 Single-writer: only one process should open the catalog for writes; a lock error means close notebooks / other `ohlcv` runs.
 
 ### Universe
@@ -72,12 +74,41 @@ Single-writer: only one process should open the catalog for writes; a lock error
 - Plus **unfinished expired** series still in `contracts` whose minute `fetch_state` is missing / not `done` through expiry-day 15:40 IST (so a series can be finished after it drops off the live master).
 
 ### Ranking
-Uses historical day candles of each underlying’s nearest live FUT (not `quote()`), because weekend quote `volume` / `average_price` are cleared. Phase 2 may switch to quote-snapshot traded value on trading days.
+- Prefer `daily/yyyymmdd.parquet` when a **final** snapshot exists: per-underlying `sum(volume * average_price)`, `source=quote`.
+- Fallback: historical day candles of each underlying’s nearest live FUT (`volume * close`, `source=fut_day`) — weekend-safe when no snapshot.
 
 ### Queue estimates
 - Default backfill = **60 inclusive calendar days** → **1** minute request per contract when chunk size is 60 (Phase 0).
 - Time ≈ `requests * max(0.34s pace, 0.19s Phase-0 median latency)`.
 - Partial watermarks roll back to 09:15 IST of that day before counting chunks.
+
+## OHLCV Phase 2 (daily quote snapshot)
+
+End-of-day `quote()` sweep of **all live NFO** contracts (not just nearest-3 expiries).
+
+### When to run
+- On a **trading day after 15:40 IST** (`status=final`). Earlier same-day runs write `status=intraday` and are overwritten later.
+- Weekend / holiday / next-morning runs are **refused** (quote `volume` / `average_price` are cleared; trade date ≠ today). Message: take the snapshot on the session day after close.
+- A missed day cannot be recovered from `quote()`; historical day-candle backfill (~40k req, ~3.7 h) is deferred.
+
+### Layout
+- File: `data/ohlcv/nfo/daily/yyyymmdd.parquet` (atomic write via `_staging/`).
+- Catalog row: `daily_snapshots` (one per `trade_date`; rerun overwrites).
+- Helper for Phase 3: `snapshot.untraded_tokens(trade_date)` → tokens with `volume == 0`.
+
+### Columns
+Contract: `trade_date`, `token`, `underlying`, `expiry`, `tradingsymbol`, `instrument_type`, `strike`, `lot_size`.
+Prices: `open`/`high`/`low` from `ohlc.*` (**NULL** when `volume=0`); `close` = `last_price`; `prev_close` = `ohlc.close` (previous session).
+Activity: `volume`, `average_price`, `traded_value` (`volume * average_price`), `traded`, `oi`, `oi_day_high`, `oi_day_low`, `buy_quantity`, `sell_quantity`, `last_trade_time`.
+
+### Commands
+| Command | Purpose |
+| --- | --- |
+| `uv run ohlcv daily` | Sync → quote all live NFO (~500/batch, 1 req/s) → write parquet → record snapshot → rank (`source=quote`) |
+| `uv run ohlcv daily --dry-run` | Contract/batch/time estimate; no quote calls |
+| `uv run ohlcv daily --show [yyyymmdd]` | Offline summary of an existing snapshot (default: latest) |
+
+Trade date = date of the latest `last_trade_time` in the response (must equal IST run date). Close notebooks that hold `catalog.duckdb` before running.
 
 ## Portfolio data (verified 2026-10-25 sample `data/samples/20261025-121155`)
 APIs: `holdings()`, `positions()` → `{net, day}`, `mf_holdings()`. No historical portfolio or demat txn API.

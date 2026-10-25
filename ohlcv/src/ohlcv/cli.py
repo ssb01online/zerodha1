@@ -93,6 +93,28 @@ def cmd_sync(args: argparse.Namespace) -> None:
         con.close()
 
 
+def _print_ranks(con) -> None:
+    from . import rank as rank_mod
+
+    ranks = sorted(
+        rank_mod.load_ranks(con).values(),
+        key=lambda r: r.traded_value,
+        reverse=True,
+    )
+    source = ranks[0].source if ranks else "-"
+    print()
+    print(
+        f"{'#':<4} {'underlying':<16} {'traded_value':>16} "
+        f"{'volume':>12} {'close':>10}  source={source}"
+    )
+    print("-" * 72)
+    for i, r in enumerate(ranks[:20], start=1):
+        print(
+            f"{i:<4} {r.underlying:<16} {r.traded_value:>16,.0f} "
+            f"{r.volume:>12,} {r.close:>10.2f}"
+        )
+
+
 def cmd_rank(args: argparse.Namespace) -> None:
     from . import catalog
     from . import rank as rank_mod
@@ -101,28 +123,193 @@ def cmd_rank(args: argparse.Namespace) -> None:
 
     started = datetime.now(auth.IST)
     try:
-        kite = auth.get_kite()
-    except (auth.NotLoggedIn, TokenException) as exc:
-        _login_exit(exc)
-
-    try:
         con = catalog.connect()
     except catalog.CatalogLocked as exc:
         raise SystemExit(str(exc)) from exc
+
+    client = None
     try:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "rank", started_at=started.replace(tzinfo=None))
         try:
             count, archive_path = _run_sync(con)
             print(f"Synced {count} NFO contracts (archive {archive_path})")
-            client = KiteClient(kite)
-            result = rank_mod.refresh_rank(client, con, force=args.force)
+            # Prefer final snapshot (no Kite). Fall back to FUT day candles if needed.
+            snap = catalog.latest_snapshot(con, status="final")
+            need_kite = snap is None or args.force
+            if need_kite and snap is None:
+                try:
+                    kite = auth.get_kite()
+                except (auth.NotLoggedIn, TokenException) as exc:
+                    catalog.finish_run(
+                        con,
+                        run_id,
+                        finished_at=datetime.now(auth.IST).replace(tzinfo=None),
+                        errors=1,
+                        note=str(exc),
+                    )
+                    _login_exit(exc)
+                client = KiteClient(kite)
+            # When force and a final snap exists, re-rank from the snap (still no hist).
+            if args.force and snap is not None:
+                result = rank_mod.rank_from_snapshot(con, snap.trade_date)
+            else:
+                result = rank_mod.refresh_rank(client, con, force=args.force)
         except SessionExpired as exc:
             catalog.finish_run(
                 con,
                 run_id,
                 finished_at=datetime.now(auth.IST).replace(tzinfo=None),
-                requests=0,
+                requests=client.counters.requests if client else 0,
+                errors=1,
+                note=str(exc),
+            )
+            _login_exit(exc)
+        except (auth.NotLoggedIn, TokenException) as exc:
+            catalog.finish_run(
+                con,
+                run_id,
+                finished_at=datetime.now(auth.IST).replace(tzinfo=None),
+                errors=1,
+                note=str(exc),
+            )
+            _login_exit(exc)
+
+        finished = datetime.now(auth.IST).replace(tzinfo=None)
+        requests = client.counters.requests if client else 0
+        retries = client.counters.retries if client else 0
+        errors = (client.counters.errors if client else 0) + len(result.errors)
+        catalog.finish_run(
+            con,
+            run_id,
+            finished_at=finished,
+            requests=requests,
+            retries=retries,
+            errors=errors,
+            note=(
+                f"skipped={result.skipped} upserted={result.upserted} "
+                f"trade_date={result.trade_date} source={result.source}"
+            ),
+        )
+
+        if result.skipped:
+            print(
+                f"Rank fresh (trade_date={result.trade_date}, source={result.source}); "
+                "skipped (use --force)"
+            )
+        else:
+            print(
+                f"Ranked {result.upserted} underlyings "
+                f"(trade_date={result.trade_date}, source={result.source}, "
+                f"requests={requests}, retries={retries})"
+            )
+        if result.errors:
+            print(f"Errors ({len(result.errors)}):", file=sys.stderr)
+            for err in result.errors[:20]:
+                print(f"  {err}", file=sys.stderr)
+
+        _print_ranks(con)
+        print(f"Catalog: {CATALOG_PATH}")
+    finally:
+        con.close()
+
+
+def cmd_daily(args: argparse.Namespace) -> None:
+    from . import catalog
+    from . import rank as rank_mod
+    from . import snapshot
+    from .client import KiteClient, RetryExhausted, SessionExpired
+    from .paths import CATALOG_PATH, DAILY_DIR
+
+    if args.show is not None:
+        _cmd_daily_show(args)
+        return
+
+    started = datetime.now(auth.IST)
+    try:
+        con = catalog.connect()
+    except catalog.CatalogLocked as exc:
+        raise SystemExit(str(exc)) from exc
+
+    client = None
+    try:
+        catalog.ensure_schema(con)
+        run_id = catalog.start_run(con, "daily", started_at=started.replace(tzinfo=None))
+        try:
+            count, archive_path = _run_sync(con)
+            print(f"Synced {count} NFO contracts (archive {archive_path})")
+            contracts = snapshot.live_contracts(con)
+            dry = snapshot.estimate_dry_run(contracts)
+            if args.dry_run:
+                catalog.finish_run(
+                    con,
+                    run_id,
+                    finished_at=datetime.now(auth.IST).replace(tzinfo=None),
+                    note=f"dry_run contracts={dry.contracts} batches={dry.batches}",
+                )
+                print(
+                    f"Dry run: {dry.contracts} contracts, {dry.batches} quote batches, "
+                    f"~{dry.estimated_seconds / 60:.1f} min"
+                )
+                print(f"Catalog: {CATALOG_PATH}")
+                return
+
+            try:
+                kite = auth.get_kite()
+            except (auth.NotLoggedIn, TokenException) as exc:
+                catalog.finish_run(
+                    con,
+                    run_id,
+                    finished_at=datetime.now(auth.IST).replace(tzinfo=None),
+                    errors=1,
+                    note=str(exc),
+                )
+                _login_exit(exc)
+
+            client = KiteClient(kite)
+            result = snapshot.take_snapshot(client, contracts)
+            catalog.record_snapshot(
+                con,
+                catalog.DailySnapshotMeta(
+                    trade_date=result.trade_date,
+                    status=result.status,
+                    taken_at=result.taken_at,
+                    contracts=result.contracts,
+                    traded_contracts=result.traded_contracts,
+                    missing=result.missing,
+                    total_volume=result.total_volume,
+                    path=str(result.path),
+                ),
+            )
+            rank_result = rank_mod.rank_from_snapshot(con, result.trade_date)
+        except snapshot.SnapshotRejected as exc:
+            catalog.finish_run(
+                con,
+                run_id,
+                finished_at=datetime.now(auth.IST).replace(tzinfo=None),
+                requests=client.counters.requests if client else 0,
+                retries=client.counters.retries if client else 0,
+                errors=1,
+                note=str(exc),
+            )
+            raise SystemExit(str(exc)) from exc
+        except RetryExhausted as exc:
+            catalog.finish_run(
+                con,
+                run_id,
+                finished_at=datetime.now(auth.IST).replace(tzinfo=None),
+                requests=client.counters.requests if client else 0,
+                retries=client.counters.retries if client else 0,
+                errors=1,
+                note=str(exc),
+            )
+            raise SystemExit(f"quote retries exhausted: {exc}") from exc
+        except SessionExpired as exc:
+            catalog.finish_run(
+                con,
+                run_id,
+                finished_at=datetime.now(auth.IST).replace(tzinfo=None),
+                requests=client.counters.requests if client else 0,
                 errors=1,
                 note=str(exc),
             )
@@ -142,44 +329,93 @@ def cmd_rank(args: argparse.Namespace) -> None:
             con,
             run_id,
             finished_at=finished,
-            requests=client.counters.requests,
-            retries=client.counters.retries,
-            errors=client.counters.errors + len(result.errors),
+            requests=client.counters.requests if client else 0,
+            retries=client.counters.retries if client else 0,
+            errors=(client.counters.errors if client else 0) + len(rank_result.errors),
             note=(
-                f"skipped={result.skipped} upserted={result.upserted} "
-                f"trade_date={result.trade_date}"
+                f"trade_date={result.trade_date} status={result.status} "
+                f"contracts={result.contracts} traded={result.traded_contracts} "
+                f"missing={result.missing} path={result.path}"
             ),
         )
-
-        if result.skipped:
-            print(f"Rank fresh (trade_date={result.trade_date}); skipped Kite calls (use --force)")
-        else:
-            print(
-                f"Ranked {result.upserted} underlyings "
-                f"(trade_date={result.trade_date}, "
-                f"requests={client.counters.requests}, retries={client.counters.retries})"
-            )
-        if result.errors:
-            print(f"Errors ({len(result.errors)}):", file=sys.stderr)
-            for err in result.errors[:20]:
-                print(f"  {err}", file=sys.stderr)
-
-        ranks = sorted(
-            rank_mod.load_ranks(con).values(),
-            key=lambda r: r.traded_value,
-            reverse=True,
+        print(
+            f"Snapshot {ymd(result.trade_date)} status={result.status} "
+            f"contracts={result.contracts} traded={result.traded_contracts} "
+            f"missing={result.missing} volume={result.total_volume:,}"
         )
-        print()
-        print(f"{'#':<4} {'underlying':<16} {'traded_value':>16} {'volume':>12} {'close':>10}")
-        print("-" * 64)
-        for i, r in enumerate(ranks[:20], start=1):
-            print(
-                f"{i:<4} {r.underlying:<16} {r.traded_value:>16,.0f} "
-                f"{r.volume:>12,} {r.close:>10.2f}"
-            )
+        print(f"Wrote {result.path}")
+        print(
+            f"Ranked {rank_result.upserted} underlyings "
+            f"(source={rank_result.source}, "
+            f"requests={client.counters.requests if client else 0})"
+        )
+        _print_ranks(con)
+        print(f"Daily dir: {DAILY_DIR}")
         print(f"Catalog: {CATALOG_PATH}")
     finally:
         con.close()
+
+
+def _cmd_daily_show(args: argparse.Namespace) -> None:
+    from . import catalog
+    from . import read as read_mod
+    from .paths import CATALOG_PATH, DAILY_DIR
+
+    meta = None
+    con = None
+    try:
+        if CATALOG_PATH.is_file():
+            try:
+                con = catalog.connect()
+            except catalog.CatalogLocked as exc:
+                raise SystemExit(str(exc)) from exc
+            catalog.ensure_schema(con)
+
+        if args.show:
+            trade_date = _parse_ymd(args.show)
+            if con is not None:
+                meta = catalog.get_snapshot(con, trade_date)
+        else:
+            if con is not None:
+                meta = catalog.latest_snapshot(con)
+            if meta is None:
+                files = sorted(DAILY_DIR.glob("*.parquet")) if DAILY_DIR.is_dir() else []
+                if not files:
+                    raise SystemExit("no daily snapshots recorded")
+                trade_date = _parse_ymd(files[-1].stem)
+            else:
+                trade_date = meta.trade_date
+
+        if meta is not None:
+            print(
+                f"Catalog: {ymd(meta.trade_date)} status={meta.status} "
+                f"contracts={meta.contracts} traded={meta.traded_contracts} "
+                f"missing={meta.missing}"
+            )
+
+        rows = read_mod.daily(trade_date)
+        traded = sum(1 for r in rows if r.get("traded") or (r.get("volume") or 0) > 0)
+        total_vol = sum(int(r.get("volume") or 0) for r in rows)
+        by_ul: dict[str, float] = {}
+        for r in rows:
+            ul = str(r["underlying"])
+            by_ul[ul] = by_ul.get(ul, 0.0) + float(r.get("traded_value") or 0.0)
+        print(f"File: {read_mod.daily_path(trade_date)}")
+        print(f"Rows: {len(rows)} traded={traded} volume={total_vol:,}")
+        print()
+        print(f"{'#':<4} {'underlying':<16} {'traded_value':>16}")
+        print("-" * 40)
+        for i, (ul, tv) in enumerate(
+            sorted(by_ul.items(), key=lambda kv: kv[1], reverse=True)[:20],
+            start=1,
+        ):
+            print(f"{i:<4} {ul:<16} {tv:>16,.0f}")
+        print(f"Catalog: {CATALOG_PATH}")
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        if con is not None:
+            con.close()
 
 
 def cmd_queue(args: argparse.Namespace) -> None:
@@ -289,7 +525,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ohlcv",
-        description="NFO OHLCV tools (probe, sync, rank, queue).",
+        description="NFO OHLCV tools (probe, sync, rank, queue, daily).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -318,7 +554,7 @@ def main() -> None:
 
     p_rank = sub.add_parser(
         "rank",
-        help="Rank underlyings by nearest-FUT day traded value (needs Kite login).",
+        help="Rank underlyings from final quote snapshot or FUT day candles.",
     )
     p_rank.add_argument(
         "--force",
@@ -348,6 +584,25 @@ def main() -> None:
         help="Print at most N series rows.",
     )
     p_queue.set_defaults(func=cmd_queue)
+
+    p_daily = sub.add_parser(
+        "daily",
+        help="End-of-day quote() snapshot of all live NFO contracts (run after 15:40 IST).",
+    )
+    p_daily.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print contract/batch estimates without calling quote().",
+    )
+    p_daily.add_argument(
+        "--show",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="YYYYMMDD",
+        help="Show an existing snapshot (default: latest). Offline; no quote() calls.",
+    )
+    p_daily.set_defaults(func=cmd_daily)
 
     args = parser.parse_args()
     args.func(args)

@@ -13,7 +13,7 @@ import duckdb
 
 from .paths import CATALOG_PATH, ensure_dir
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _LOCK_HINT = (
     "catalog.duckdb is locked — another ohlcv process or notebook has it open. "
@@ -57,6 +57,18 @@ class UnderlyingRank:
     source: str
 
 
+@dataclass(frozen=True)
+class DailySnapshotMeta:
+    trade_date: date
+    status: str
+    taken_at: datetime
+    contracts: int
+    traded_contracts: int
+    missing: int
+    total_volume: int
+    path: str
+
+
 class CatalogLocked(RuntimeError):
     """Raised when DuckDB cannot open the catalog due to a file lock."""
 
@@ -72,6 +84,22 @@ def connect(db_path: Path | None = None, *, read_only: bool = False) -> duckdb.D
         if "lock" in msg or "conflicting" in msg:
             raise CatalogLocked(_LOCK_HINT) from exc
         raise
+
+
+def _migrate_schema(con: duckdb.DuckDBPyConnection, stored: int) -> None:
+    if stored == SCHEMA_VERSION:
+        return
+    if stored == 1 and SCHEMA_VERSION == 2:
+        # daily_snapshots is created below via CREATE TABLE IF NOT EXISTS.
+        con.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            [str(SCHEMA_VERSION)],
+        )
+        return
+    raise RuntimeError(
+        f"catalog.duckdb schema_version={stored}, code expects {SCHEMA_VERSION}. "
+        "Bump SCHEMA_VERSION and migrate, or delete the DB to rebuild."
+    )
 
 
 def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -90,12 +118,7 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             [str(SCHEMA_VERSION)],
         )
     else:
-        stored = int(row[0])
-        if stored != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"catalog.duckdb schema_version={stored}, code expects {SCHEMA_VERSION}. "
-                "Bump SCHEMA_VERSION and migrate, or delete the DB to rebuild."
-            )
+        _migrate_schema(con, int(row[0]))
 
     con.execute(
         """
@@ -152,6 +175,20 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             retries INTEGER NOT NULL DEFAULT 0,
             errors INTEGER NOT NULL DEFAULT 0,
             note TEXT
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_snapshots (
+            trade_date DATE PRIMARY KEY,
+            status TEXT NOT NULL,
+            taken_at TIMESTAMP NOT NULL,
+            contracts INTEGER NOT NULL,
+            traded_contracts INTEGER NOT NULL,
+            missing INTEGER NOT NULL,
+            total_volume BIGINT NOT NULL,
+            path TEXT NOT NULL
         )
         """
     )
@@ -469,3 +506,132 @@ def finish_run(
         """,
         [finished_at, requests, retries, errors, note, run_id],
     )
+
+
+def _as_date(value: Any) -> date:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    return date.fromisoformat(str(value)[:10])
+
+
+def _as_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
+
+
+def record_snapshot(con: duckdb.DuckDBPyConnection, meta: DailySnapshotMeta) -> None:
+    con.execute(
+        """
+        INSERT INTO daily_snapshots (
+            trade_date, status, taken_at, contracts, traded_contracts,
+            missing, total_volume, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (trade_date) DO UPDATE SET
+            status = excluded.status,
+            taken_at = excluded.taken_at,
+            contracts = excluded.contracts,
+            traded_contracts = excluded.traded_contracts,
+            missing = excluded.missing,
+            total_volume = excluded.total_volume,
+            path = excluded.path
+        """,
+        [
+            meta.trade_date,
+            meta.status,
+            meta.taken_at,
+            meta.contracts,
+            meta.traded_contracts,
+            meta.missing,
+            meta.total_volume,
+            meta.path,
+        ],
+    )
+
+
+def get_snapshot(
+    con: duckdb.DuckDBPyConnection,
+    trade_date: date,
+) -> DailySnapshotMeta | None:
+    row = con.execute(
+        """
+        SELECT trade_date, status, taken_at, contracts, traded_contracts,
+               missing, total_volume, path
+        FROM daily_snapshots
+        WHERE trade_date = ?
+        """,
+        [trade_date],
+    ).fetchone()
+    if row is None:
+        return None
+    return DailySnapshotMeta(
+        trade_date=_as_date(row[0]),
+        status=str(row[1]),
+        taken_at=_as_datetime(row[2]),
+        contracts=int(row[3]),
+        traded_contracts=int(row[4]),
+        missing=int(row[5]),
+        total_volume=int(row[6]),
+        path=str(row[7]),
+    )
+
+
+def latest_snapshot(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    status: str | None = None,
+) -> DailySnapshotMeta | None:
+    if status is None:
+        row = con.execute(
+            """
+            SELECT trade_date, status, taken_at, contracts, traded_contracts,
+                   missing, total_volume, path
+            FROM daily_snapshots
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    else:
+        row = con.execute(
+            """
+            SELECT trade_date, status, taken_at, contracts, traded_contracts,
+                   missing, total_volume, path
+            FROM daily_snapshots
+            WHERE status = ?
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            [status],
+        ).fetchone()
+    if row is None:
+        return None
+    return DailySnapshotMeta(
+        trade_date=_as_date(row[0]),
+        status=str(row[1]),
+        taken_at=_as_datetime(row[2]),
+        contracts=int(row[3]),
+        traded_contracts=int(row[4]),
+        missing=int(row[5]),
+        total_volume=int(row[6]),
+        path=str(row[7]),
+    )
+
+
+def previous_session(
+    con: duckdb.DuckDBPyConnection,
+    trade_date: date,
+) -> date | None:
+    """Return the latest snapshot trade_date strictly before ``trade_date``."""
+    row = con.execute(
+        """
+        SELECT MAX(trade_date)
+        FROM daily_snapshots
+        WHERE trade_date < ?
+        """,
+        [trade_date],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return _as_date(row[0])

@@ -1,4 +1,4 @@
-"""Offline self-tests for ohlcv Phase 1. No Kite login required.
+"""Offline self-tests for ohlcv Phases 1–2. No Kite login required.
 
 Run: uv run python -m ohlcv.selftest
 """
@@ -16,10 +16,14 @@ from typing import Any, Callable
 from instruments.cache import clear_rows_override, set_rows_override
 from instruments.models import Instrument
 from kiteconnect.exceptions import InputException, NetworkException, TokenException
+from kitetools import auth
 
 from . import archive as archive_mod
 from . import catalog
 from . import planner
+from . import rank as rank_mod
+from . import read as read_mod
+from . import snapshot
 from . import universe
 from .client import (
     KiteClient,
@@ -463,6 +467,389 @@ def test_queue_order_and_chunks() -> None:
     _assert(rolled.date() == date(2026, 10, 24), "partial same day")
 
 
+def _quote_payload(
+    token: int,
+    symbol: str,
+    *,
+    last_trade_time: str,
+    volume: int,
+    last_price: float,
+    ohlc_close: float,
+    average_price: float | None = None,
+    open_: float = 100.0,
+    high: float = 110.0,
+    low: float = 90.0,
+) -> dict[str, Any]:
+    return {
+        "instrument_token": token,
+        "last_trade_time": last_trade_time,
+        "last_price": last_price,
+        "volume": volume,
+        "average_price": average_price if average_price is not None else last_price,
+        "oi": 10.0,
+        "oi_day_high": 12.0,
+        "oi_day_low": 8.0,
+        "buy_quantity": 1,
+        "sell_quantity": 2,
+        "ohlc": {"open": open_, "high": high, "low": low, "close": ohlc_close},
+    }
+
+
+def test_catalog_v1_to_v2_migration() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "c.duckdb"
+        con = catalog.connect(db)
+        try:
+            # Simulate a v1 catalog (schema_version=1, no daily_snapshots yet).
+            con.execute(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            con.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '1')"
+            )
+            con.execute(
+                """
+                CREATE TABLE contracts (
+                    token BIGINT PRIMARY KEY,
+                    underlying TEXT NOT NULL,
+                    expiry DATE NOT NULL,
+                    tradingsymbol TEXT NOT NULL,
+                    instrument_type TEXT NOT NULL,
+                    strike DOUBLE NOT NULL,
+                    lot_size INTEGER NOT NULL,
+                    first_seen DATE,
+                    last_seen DATE
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE fetch_state (
+                    token BIGINT NOT NULL,
+                    interval TEXT NOT NULL,
+                    fetched_to TIMESTAMP,
+                    status TEXT NOT NULL,
+                    rows_total BIGINT NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at TIMESTAMP,
+                    PRIMARY KEY (token, interval)
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE underlying_rank (
+                    trade_date DATE NOT NULL,
+                    underlying TEXT NOT NULL,
+                    fut_token BIGINT NOT NULL,
+                    volume BIGINT NOT NULL,
+                    close DOUBLE NOT NULL,
+                    traded_value DOUBLE NOT NULL,
+                    source TEXT NOT NULL,
+                    PRIMARY KEY (trade_date, underlying)
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE runs (
+                    run_id BIGINT PRIMARY KEY,
+                    command TEXT NOT NULL,
+                    started_at TIMESTAMP NOT NULL,
+                    finished_at TIMESTAMP,
+                    requests INTEGER NOT NULL DEFAULT 0,
+                    retries INTEGER NOT NULL DEFAULT 0,
+                    errors INTEGER NOT NULL DEFAULT 0,
+                    note TEXT
+                )
+                """
+            )
+        finally:
+            con.close()
+
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            _assert(catalog.schema_version(con) == 2, "migrated to v2")
+            # daily_snapshots must exist
+            con.execute("SELECT COUNT(*) FROM daily_snapshots").fetchone()
+            meta = catalog.DailySnapshotMeta(
+                trade_date=date(2026, 10, 24),
+                status="final",
+                taken_at=datetime(2026, 10, 24, 16, 0, 0),
+                contracts=10,
+                traded_contracts=3,
+                missing=0,
+                total_volume=100,
+                path="x.parquet",
+            )
+            catalog.record_snapshot(con, meta)
+            catalog.record_snapshot(
+                con,
+                catalog.DailySnapshotMeta(
+                    trade_date=date(2026, 10, 23),
+                    status="final",
+                    taken_at=datetime(2026, 10, 23, 16, 0, 0),
+                    contracts=9,
+                    traded_contracts=2,
+                    missing=0,
+                    total_volume=50,
+                    path="y.parquet",
+                ),
+            )
+            latest = catalog.latest_snapshot(con, status="final")
+            _assert(latest is not None and latest.trade_date == date(2026, 10, 24), "latest")
+            prev = catalog.previous_session(con, date(2026, 10, 24))
+            _assert(prev == date(2026, 10, 23), f"previous_session={prev}")
+        finally:
+            con.close()
+
+
+def test_snapshot_status_boundary() -> None:
+    day = date(2026, 10, 27)
+    before = datetime.combine(day, datetime.strptime("15:39", "%H:%M").time(), tzinfo=auth.IST)
+    at = datetime.combine(day, datetime.strptime("15:40", "%H:%M").time(), tzinfo=auth.IST)
+    after = datetime.combine(day, datetime.strptime("16:00", "%H:%M").time(), tzinfo=auth.IST)
+    _assert(snapshot.snapshot_status(before) == "intraday", "before 15:40")
+    _assert(snapshot.snapshot_status(at) == "final", "at 15:40")
+    _assert(snapshot.snapshot_status(after) == "final", "after 15:40")
+
+
+def test_snapshot_happy_path_and_fields() -> None:
+    trade_day = date(2026, 10, 27)
+    ltt = "2026-10-27T15:29:00+05:30"
+    contracts = [
+        catalog.ContractRow(1, "NIFTY", trade_day, "NIFTYFUT", "FUT", 0.0, 75),
+        catalog.ContractRow(2, "NIFTY", trade_day, "NIFTYCE", "CE", 25000.0, 75),
+        catalog.ContractRow(3, "RELIANCE", trade_day, "RELFUT", "FUT", 0.0, 250),
+    ]
+
+    def handler(instruments: list[str]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key in instruments:
+            sym = key.split(":", 1)[1]
+            if sym == "NIFTYFUT":
+                out[key] = _quote_payload(
+                    1, sym, last_trade_time=ltt, volume=100, last_price=250.5, ohlc_close=240.0, average_price=245.0
+                )
+            elif sym == "NIFTYCE":
+                out[key] = _quote_payload(
+                    2, sym, last_trade_time=ltt, volume=0, last_price=1.0, ohlc_close=2.0, average_price=0.0
+                )
+            elif sym == "RELFUT":
+                out[key] = _quote_payload(
+                    3, sym, last_trade_time=ltt, volume=50, last_price=1400.0, ohlc_close=1390.0, average_price=1395.0
+                )
+        return out
+
+    kite = FakeKite(handler=handler)
+    client = KiteClient(kite, quote_interval=0.0, clock=FakeClock(), rng=random.Random(0))  # type: ignore[arg-type]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        daily_dir = root / "daily"
+        staging = root / "staging"
+        now = datetime(2026, 10, 27, 16, 0, 0, tzinfo=auth.IST)
+        result = snapshot.take_snapshot(
+            client,
+            contracts,
+            now=now,
+            run_date=trade_day,
+            dest_dir=daily_dir,
+            staging_dir=staging,
+        )
+        _assert(result.status == "final", f"status={result.status}")
+        _assert(result.trade_date == trade_day, "trade_date")
+        _assert(result.contracts == 3, f"contracts={result.contracts}")
+        _assert(result.traded_contracts == 2, f"traded={result.traded_contracts}")
+        _assert(result.missing == 0, "missing")
+        _assert(result.path.is_file(), "parquet exists")
+
+        rows = read_mod.daily(trade_day, dest_dir=daily_dir)
+        by_token = {int(r["token"]): r for r in rows}
+        fut = by_token[1]
+        _assert(float(fut["close"]) == 250.5, "close=last_price")
+        _assert(float(fut["prev_close"]) == 240.0, "prev_close=ohlc.close")
+        _assert(float(fut["traded_value"]) == 100 * 245.0, "traded_value")
+        ce = by_token[2]
+        _assert(ce["open"] is None and ce["high"] is None and ce["low"] is None, "null OHLC when vol=0")
+        _assert(int(ce["volume"]) == 0 and ce["traded"] is False, "untraded flag")
+
+        untraded = snapshot.untraded_tokens(trade_day, dest_dir=daily_dir)
+        _assert(untraded == {2}, f"untraded={untraded}")
+
+        # Atomic overwrite
+        result2 = snapshot.take_snapshot(
+            client,
+            contracts,
+            now=now,
+            run_date=trade_day,
+            dest_dir=daily_dir,
+            staging_dir=staging,
+        )
+        _assert(result2.path == result.path, "same path overwrite")
+        _assert(result2.path.is_file(), "still exists")
+
+
+def test_snapshot_rejects_weekend_and_batch_failure() -> None:
+    trade_day = date(2026, 10, 24)  # Friday session stamped into quotes
+    run_day = date(2026, 10, 25)  # Sunday
+    contracts = [
+        catalog.ContractRow(1, "NIFTY", trade_day, "NIFTYFUT", "FUT", 0.0, 75),
+    ]
+    ltt = "2026-10-24T15:29:00+05:30"
+
+    def weekend_handler(instruments: list[str]) -> dict[str, Any]:
+        return {
+            f"NFO:NIFTYFUT": _quote_payload(
+                1, "NIFTYFUT", last_trade_time=ltt, volume=0, last_price=250.0, ohlc_close=249.0
+            )
+        }
+
+    kite = FakeKite(handler=weekend_handler)
+    client = KiteClient(kite, quote_interval=0.0, clock=FakeClock(), rng=random.Random(0))  # type: ignore[arg-type]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        try:
+            snapshot.take_snapshot(
+                client,
+                contracts,
+                now=datetime(2026, 10, 25, 12, 0, 0, tzinfo=auth.IST),
+                run_date=run_day,
+                dest_dir=root / "daily",
+                staging_dir=root / "staging",
+            )
+            raise Failure("expected SnapshotRejected on weekend")
+        except snapshot.SnapshotRejected as exc:
+            _assert("no session today" in str(exc), f"msg={exc}")
+        _assert(not (root / "daily" / "20261024.parquet").exists(), "no file on reject")
+        _assert(not (root / "daily" / "20261025.parquet").exists(), "no sunday file")
+
+    # Batch failure: no file written
+    boom_calls = {"n": 0}
+
+    def boom(instruments: list[str]) -> dict[str, Any]:
+        boom_calls["n"] += 1
+        raise NetworkException("down")
+
+    kite2 = FakeKite(handler=boom)
+    client2 = KiteClient(
+        kite2,  # type: ignore[arg-type]
+        quote_interval=0.0,
+        clock=FakeClock(),
+        rng=random.Random(0),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        try:
+            snapshot.take_snapshot(
+                client2,
+                contracts,
+                now=datetime(2026, 10, 24, 16, 0, 0, tzinfo=auth.IST),
+                run_date=trade_day,
+                dest_dir=root / "daily",
+                staging_dir=root / "staging",
+            )
+            raise Failure("expected RetryExhausted")
+        except RetryExhausted:
+            pass
+        files = list((root / "daily").glob("*.parquet")) if (root / "daily").exists() else []
+        _assert(files == [], f"no partial file: {files}")
+
+
+def test_snapshot_missing_keys_and_rank() -> None:
+    trade_day = date(2026, 10, 27)
+    ltt = "2026-10-27T15:29:00+05:30"
+    contracts = [
+        catalog.ContractRow(1, "NIFTY", trade_day, "NIFTYFUT", "FUT", 0.0, 75),
+        catalog.ContractRow(2, "NIFTY", trade_day, "NIFTYCE", "CE", 25000.0, 75),
+        catalog.ContractRow(3, "BANKNIFTY", trade_day, "BNFUT", "FUT", 0.0, 15),
+        catalog.ContractRow(4, "BANKNIFTY", trade_day, "BNCE", "CE", 50000.0, 15),
+    ]
+
+    def handler(instruments: list[str]) -> dict[str, Any]:
+        # Omit BNCE intentionally → missing=1
+        out: dict[str, Any] = {}
+        mapping = {
+            "NIFTYFUT": _quote_payload(
+                1, "NIFTYFUT", last_trade_time=ltt, volume=10, last_price=100.0, ohlc_close=99.0, average_price=100.0
+            ),
+            "NIFTYCE": _quote_payload(
+                2, "NIFTYCE", last_trade_time=ltt, volume=20, last_price=5.0, ohlc_close=4.0, average_price=5.0
+            ),
+            "BNFUT": _quote_payload(
+                3, "BNFUT", last_trade_time=ltt, volume=5, last_price=200.0, ohlc_close=190.0, average_price=200.0
+            ),
+        }
+        for key in instruments:
+            sym = key.split(":", 1)[1]
+            if sym in mapping:
+                out[key] = mapping[sym]
+        return out
+
+    kite = FakeKite(handler=handler)
+    client = KiteClient(kite, quote_interval=0.0, clock=FakeClock(), rng=random.Random(0))  # type: ignore[arg-type]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        daily_dir = root / "daily"
+        result = snapshot.take_snapshot(
+            client,
+            contracts,
+            now=datetime(2026, 10, 27, 16, 5, 0, tzinfo=auth.IST),
+            run_date=trade_day,
+            dest_dir=daily_dir,
+            staging_dir=root / "staging",
+        )
+        _assert(result.missing == 1, f"missing={result.missing}")
+        _assert(result.contracts == 3, f"rows={result.contracts}")
+
+        db = root / "c.duckdb"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            # Seed contracts so nearest FUT lookup works for fut_token/close.
+            catalog.upsert_contracts(con, contracts, seen_on=trade_day)
+            rr = rank_mod.rank_from_snapshot(con, trade_day, dest_dir=daily_dir)
+            _assert(rr.source == "quote", f"source={rr.source}")
+            _assert(rr.upserted == 2, f"upserted={rr.upserted}")
+            ranks = rank_mod.load_ranks(con)
+            # NIFTY traded_value = 10*100 + 20*5 = 1100; BANKNIFTY = 5*200 = 1000
+            _assert(abs(ranks["NIFTY"].traded_value - 1100.0) < 1e-6, f"nifty tv={ranks['NIFTY'].traded_value}")
+            _assert(abs(ranks["BANKNIFTY"].traded_value - 1000.0) < 1e-6, "bn tv")
+            _assert(ranks["NIFTY"].fut_token == 1, "nifty fut_token")
+            _assert(ranks["NIFTY"].source == "quote", "rank source")
+
+            # refresh_rank prefers final snapshot
+            catalog.record_snapshot(
+                con,
+                catalog.DailySnapshotMeta(
+                    trade_date=trade_day,
+                    status="final",
+                    taken_at=datetime(2026, 10, 27, 16, 5, 0),
+                    contracts=result.contracts,
+                    traded_contracts=result.traded_contracts,
+                    missing=result.missing,
+                    total_volume=result.total_volume,
+                    path=str(result.path),
+                ),
+            )
+            # Clear ranks and force refresh via snapshot (no client needed).
+            con.execute("DELETE FROM underlying_rank")
+            rr2 = rank_mod.refresh_rank(
+                None, con, today=trade_day, force=True, dest_dir=daily_dir
+            )
+            _assert(rr2.source == "quote", f"refresh source={rr2.source}")
+            _assert(rr2.upserted == 2, f"refresh upserted={rr2.upserted} errors={rr2.errors}")
+
+            # series_daily / daily readers
+            series_rows = read_mod.series_daily("NIFTY", trade_day, dest_dir=daily_dir)
+            _assert(len(series_rows) == 2, f"series_daily={len(series_rows)}")
+        finally:
+            con.close()
+
+
 def main() -> None:
     tests = [
         test_paths,
@@ -475,6 +862,11 @@ def main() -> None:
         test_token_exception_session_expired,
         test_universe_nearest3_and_unfinished,
         test_queue_order_and_chunks,
+        test_catalog_v1_to_v2_migration,
+        test_snapshot_status_boundary,
+        test_snapshot_happy_path_and_fields,
+        test_snapshot_rejects_weekend_and_batch_failure,
+        test_snapshot_missing_keys_and_rank,
     ]
     failed = 0
     for fn in tests:
