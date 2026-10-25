@@ -32,8 +32,8 @@ VITE_ORIGINS = (
     "http://localhost:5173",
 )
 
-# portfolio/src/portfolio/api.py → parents[2] = portfolio/
-DEFAULT_UI_DIST = Path(__file__).resolve().parents[2] / "ui" / "dist"
+# portfolio/src/portfolio/api.py → parents[3] = repo root
+DEFAULT_UI_DIST = Path(__file__).resolve().parents[3] / "ui" / "dist"
 
 
 def default_ui_dist() -> Path:
@@ -163,7 +163,7 @@ def create_app(
             return {
                 "message": "Portfolio API is running (UI build not found).",
                 "hint": (
-                    "Dev: cd portfolio/ui && set NODE_OPTIONS=--use-system-ca "
+                    "Dev: cd ui && set NODE_OPTIONS=--use-system-ca "
                     "&& npm run dev (http://127.0.0.1:5173). "
                     "Single-process: npm run build then restart portfolio serve."
                 ),

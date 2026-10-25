@@ -134,11 +134,11 @@ uv run portfolio serve       # FastAPI on http://127.0.0.1:8765 (serves UI when 
 ### UI — single-process (after build)
 
 ```powershell
-cd portfolio/ui
+cd ui
 $env:NODE_OPTIONS="--use-system-ca"   # Norton / system CA on this machine
 npm install
 npm run build
-cd ../..
+cd ..
 uv run portfolio serve
 ```
 
@@ -151,7 +151,7 @@ Open [http://127.0.0.1:8765](http://127.0.0.1:8765) — routes: `/portfolio` (li
 uv run portfolio serve
 
 # Terminal 2
-cd portfolio/ui
+cd ui
 $env:NODE_OPTIONS="--use-system-ca"
 npm run dev
 # http://127.0.0.1:5173 — proxies /api → :8765

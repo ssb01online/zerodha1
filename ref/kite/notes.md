@@ -79,7 +79,7 @@ Notes:
 
 ## API and UI (Phase 3)
 
-Dev UI lives in `portfolio/ui` (React 19 + Vite 6 + TypeScript).
+Dev UI lives in `ui/` (React 19 + Vite 6 + TypeScript).
 
 ### Run (two terminals)
 
@@ -89,7 +89,7 @@ uv run portfolio serve
 # http://127.0.0.1:8765
 
 # Terminal 2 — Vite (Norton SSL: use system CAs)
-cd portfolio/ui
+cd ui
 $env:NODE_OPTIONS="--use-system-ca"
 npm install
 npm run dev
@@ -102,12 +102,12 @@ npm run dev
 - 401 → token panel with the server's `steps` (run `uv run kitetools login`).
 - Snapshots list `/snapshots`; detail `/snapshots/:id` shows as-of banner + same tables + composition keys.
 - `localStorage`: `portfolio_ui_theme_v1` (`dark`|`light`), `portfolio_ui_tab_v1` (`holdings`|`mf`|`positions`), `portfolio_ui_pos_filters_v1` (`{ kind: all|equity|fo, expiryKey: all|unknown|YYYY-MM-DD }` — Positions toolbar kind/expiry filters).
-- Build check: `cd portfolio/ui; $env:NODE_OPTIONS="--use-system-ca"; npm run build`.
+- Build check: `cd ui; $env:NODE_OPTIONS="--use-system-ca"; npm run build`.
 
 ## UI polish and SPA mount (Phase 4)
 
 - Tables: clickable column sort (unsorted → asc → desc); Columns picker with prefs in `localStorage`:
   - `portfolio_ui_cols_holdings_v1`, `portfolio_ui_cols_mf_v1`, `portfolio_ui_cols_positions_v1` (`{ hidden: string[] }`).
   - Identity columns (`symbol` / `fund`) are locked and cannot be hidden.
-- Single-process: after `npm run build`, `uv run portfolio serve` mounts `portfolio/ui/dist` (`/assets` + SPA fallback to `index.html`). `/api/health` reports `ui_dist_exists`. If dist is missing, `/` returns a JSON hint (API-only).
+- Single-process: after `npm run build`, `uv run portfolio serve` mounts `ui/dist` (`/assets` + SPA fallback to `index.html`). `/api/health` reports `ui_dist_exists`. If dist is missing, `/` returns a JSON hint (API-only).
 - Open `http://127.0.0.1:8765/portfolio` (no Vite required when dist is present).

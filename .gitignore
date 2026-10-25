@@ -12,6 +12,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Node / portfolio UI
+# Node / UI
 node_modules/
-portfolio/ui/dist/
+ui/dist/
