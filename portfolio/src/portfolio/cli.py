@@ -7,6 +7,11 @@ from . import store
 from .fetch import TokenInvalid
 from .samples import resolve_sample_dir
 
+_DB_LOCK_HINT = (
+    "Database is in use by `portfolio serve`; capture from the UI instead "
+    "(POST /api/portfolio/capture), or stop the server first."
+)
+
 
 def cmd_sample(args: argparse.Namespace) -> None:
     folder = samples.capture_sample()
@@ -41,6 +46,11 @@ def cmd_capture(args: argparse.Namespace) -> None:
             print("Source: live")
     except TokenInvalid as exc:
         raise SystemExit(str(exc)) from exc
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "lock" in msg or "conflicting" in msg or "already open" in msg:
+            raise SystemExit(_DB_LOCK_HINT) from exc
+        raise
 
     if result.saved:
         print(f"Saved snapshot id={result.snapshot_id} hash={result.fingerprint_hash[:8]}")
@@ -49,6 +59,24 @@ def cmd_capture(args: argparse.Namespace) -> None:
         print(
             f"No change (existing id={result.snapshot_id} hash={result.fingerprint_hash[:8]})"
         )
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    from .api import create_app
+
+    host = args.host
+    port = args.port
+    db_path = Path(args.db) if args.db else None
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        print(
+            f"WARNING: binding to {host!r} exposes the portfolio API (and your "
+            "session-backed data) beyond this machine. Prefer 127.0.0.1."
+        )
+    app = create_app(db_path=db_path)
+    print(f"Serving portfolio API on http://{host}:{port}  (health: /api/health)")
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 def cmd_snapshots(args: argparse.Namespace) -> None:
@@ -151,6 +179,15 @@ def main() -> None:
     p_show.add_argument("id", type=int, help="Snapshot id.")
     p_show.add_argument("--db", default=None, help=f"DuckDB path (default: {store.DEFAULT_DB_PATH}).")
     p_show.set_defaults(func=cmd_show)
+
+    p_serve = sub.add_parser(
+        "serve",
+        help="Run the local FastAPI portfolio server (JSON API for the UI).",
+    )
+    p_serve.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1).")
+    p_serve.add_argument("--port", type=int, default=8765, help="Port (default 8765).")
+    p_serve.add_argument("--db", default=None, help=f"DuckDB path (default: {store.DEFAULT_DB_PATH}).")
+    p_serve.set_defaults(func=cmd_serve)
 
     args = parser.parse_args()
     args.func(args)

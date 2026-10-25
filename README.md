@@ -119,13 +119,18 @@ Always `import kitetools` (or `from kitetools...`) before other HTTPS clients so
 
 ---
 
-## Portfolio samples (`portfolio` package)
+## Portfolio package
 
-Workspace member for portfolio capture (snapshots/UI come later). After `uv sync --all-packages`:
+Workspace member for samples, sparse composition snapshots, and the local JSON API (React UI comes next). After `uv sync --all-packages`:
 
 ```powershell
 uv run portfolio sample      # fetch holdings + positions + mf_holdings → data/samples/<IST timestamp>/
 uv run portfolio summarize   # field/qty report for the latest sample (or pass a folder name)
+uv run portfolio capture     # write a DuckDB snapshot only when composition changed
+uv run portfolio snapshots   # list stored snapshots
+uv run portfolio serve       # FastAPI on http://127.0.0.1:8765
 ```
 
-Requires a valid session (`uv run kitetools login`). Samples stay under gitignored `data/`. Verified quantity rules live in `ref/kite/notes.md`.
+Health check: [http://127.0.0.1:8765/api/health](http://127.0.0.1:8765/api/health). Live portfolio: `/api/portfolio/live`. Capture: `POST /api/portfolio/capture`.
+
+Requires a valid session (`uv run kitetools login`). Samples and `data/portfolio.duckdb` stay under gitignored `data/`. Verified quantity rules and API notes live in `ref/kite/notes.md`. Offline checks: `uv run python -m portfolio.selftest`.

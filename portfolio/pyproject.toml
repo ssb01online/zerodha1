@@ -5,7 +5,10 @@ description = "Portfolio samples, snapshots, and UI for Kite Connect holdings/po
 requires-python = ">=3.13"
 dependencies = [
     "duckdb>=1.1.0",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
     "kitetools",
+    "uvicorn>=0.32.0",
 ]
 
 [project.scripts]

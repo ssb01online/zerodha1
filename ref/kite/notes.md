@@ -64,6 +64,14 @@ Notes:
 - DuckDB path: `data/portfolio.duckdb` (gitignored via `data/`). Schema version `1` in `meta.schema_version`.
 - Tables: `snapshots` (incl. ISO `observed_at`, `raw_json`, `fingerprint_hash`), `snapshot_composition`, `snapshot_holdings`, `snapshot_mf_holdings`, `snapshot_positions`.
 - Capture writes **only** when the fingerprint hash differs from the latest snapshot. Prices at capture are stored as metadata, never as a trigger.
-- Single-writer assumption: only one process should write the DB (Phase 2 will make the API the sole writer). Concurrent DuckDB writers fail on Windows file locks.
+- Single-writer assumption: only one process should write the DB. Concurrent DuckDB writers fail on Windows file locks.
 - CLI: `uv run portfolio capture [--from-sample] [--db PATH]`, `snapshots`, `show ID`. Self-test: `uv run python -m portfolio.selftest`.
 - Open verification (first real buy/sell day): confirm `used_quantity` behaviour and CNC equity rows in `positions.net` merge onto the holding ISIN as expected.
+
+## API (Phase 2)
+
+- Serve: `uv run portfolio serve` → `http://127.0.0.1:8765` (bind loopback only).
+- Endpoints: `GET /api/health`, `GET /api/portfolio/live?refresh=`, `POST /api/portfolio/capture`, `GET /api/portfolio/snapshots`, `GET /api/portfolio/snapshots/{id}`.
+- Live Kite responses are cached ~10s (errors never cached). Capture prefers the fresh cache so UI auto-capture after live does not double-fetch.
+- API opens DuckDB per call under a process lock (releases the file between requests so CLI reads can still work). Prefer capturing via the API while `serve` is running.
+- Token missing/expired → HTTP 401 `{error: token_invalid, message, steps}` with `uv run kitetools login` instructions. CORS allows Vite `http://127.0.0.1:5173` / `localhost:5173` only.

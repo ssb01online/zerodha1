@@ -7,6 +7,7 @@ Uses data/samples/* and a temporary DuckDB file.
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import tempfile
 from datetime import datetime
@@ -279,6 +280,163 @@ def test_capture_idempotence() -> None:
     print("  ok capture_idempotence")
 
 
+class _CountingFetcher:
+    """Sample-backed fetcher that counts calls for cache tests."""
+
+    def __init__(self, folder: Path | None = None) -> None:
+        self.folder = folder or latest_sample_dir()
+        self.calls = 0
+        self._override: RawPayload | None = None
+
+    def set_override(self, raw: RawPayload | None) -> None:
+        self._override = raw
+
+    def __call__(self) -> RawPayload:
+        self.calls += 1
+        if self._override is not None:
+            return self._override
+        return load_from_sample(self.folder)
+
+
+def _api_client(tmp: Path, fetcher: _CountingFetcher, ttl: float = 10.0):
+    from fastapi.testclient import TestClient
+
+    from .api import create_app
+
+    db = tmp / "api.duckdb"
+    app = create_app(db_path=db, fetcher=fetcher, ttl=ttl)
+    return TestClient(app), db
+
+
+def test_api_health() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _db = _api_client(Path(tmp), _CountingFetcher())
+        r = client.get("/api/health")
+        _assert(r.status_code == 200, f"health status={r.status_code}")
+        body = r.json()
+        _assert(body.get("ok") is True, f"health ok={body.get('ok')}")
+        blob = json.dumps(body)
+        _assert("access_token" not in blob, "health must not leak access_token")
+        _assert("session" in body and "db" in body, "health missing session/db")
+    print("  ok api_health")
+
+
+def test_api_live_and_cache() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        fetcher = _CountingFetcher()
+        client, _db = _api_client(Path(tmp), fetcher, ttl=30.0)
+
+        r1 = client.get("/api/portfolio/live")
+        _assert(r1.status_code == 200, f"live status={r1.status_code} body={r1.text}")
+        body = r1.json()
+        _assert(body["source"] == "live", f"source={body.get('source')}")
+        _assert(len(body["holdings"]) == 28, f"holdings={len(body['holdings'])}")
+        _assert(body["cached"] is False, "first live must be uncached")
+        _assert(fetcher.calls == 1, f"fetcher calls after first={fetcher.calls}")
+
+        row_sum = sum(h["current_value"] for h in body["holdings"])
+        _assert(
+            abs(body["summary"]["equity"]["current_value"] - row_sum) < 1e-6,
+            f"summary equity value {body['summary']['equity']['current_value']} != row sum {row_sum}",
+        )
+
+        r2 = client.get("/api/portfolio/live")
+        _assert(r2.status_code == 200, f"live2 status={r2.status_code}")
+        body2 = r2.json()
+        _assert(body2["cached"] is True, "second live must be cached")
+        _assert(fetcher.calls == 1, f"fetcher must still be 1, got {fetcher.calls}")
+
+        r3 = client.get("/api/portfolio/live", params={"refresh": "true"})
+        _assert(r3.status_code == 200, f"live refresh status={r3.status_code}")
+        body3 = r3.json()
+        _assert(body3["cached"] is False, "refresh must bypass cache")
+        _assert(fetcher.calls == 2, f"fetcher after refresh={fetcher.calls}")
+    print("  ok api_live_and_cache")
+
+
+def test_api_capture_and_snapshots() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        fetcher = _CountingFetcher()
+        client, _db = _api_client(Path(tmp), fetcher, ttl=30.0)
+
+        # Warm cache via live so capture reuses it.
+        live = client.get("/api/portfolio/live")
+        _assert(live.status_code == 200, f"live before capture={live.status_code}")
+        calls_after_live = fetcher.calls
+
+        c1 = client.post("/api/portfolio/capture")
+        _assert(c1.status_code == 200, f"capture1={c1.status_code} {c1.text}")
+        b1 = c1.json()
+        _assert(b1["saved"] is True, f"first capture saved={b1}")
+        _assert(b1["snapshot_id"] == 1, f"id={b1.get('snapshot_id')}")
+        _assert(
+            fetcher.calls == calls_after_live,
+            f"capture must reuse cache; calls={fetcher.calls}",
+        )
+
+        c2 = client.post("/api/portfolio/capture")
+        _assert(c2.status_code == 200, f"capture2={c2.status_code}")
+        b2 = c2.json()
+        _assert(b2["saved"] is False, f"second capture must not save: {b2}")
+        _assert(b2["snapshot_id"] == 1, "second points at existing")
+
+        # Quantity change via override + refresh so capture sees new view.
+        mutated = _mutate_raw(load_from_sample(latest_sample_dir()))
+        mutated.holdings[0]["quantity"] = int(mutated.holdings[0].get("quantity") or 0) + 3
+        mutated.fetched_at = datetime.now(IST)
+        fetcher.set_override(mutated)
+        client.get("/api/portfolio/live", params={"refresh": "true"})
+        c3 = client.post("/api/portfolio/capture")
+        _assert(c3.status_code == 200, f"capture3={c3.status_code} {c3.text}")
+        b3 = c3.json()
+        _assert(b3["saved"] is True, f"qty change must save: {b3}")
+        _assert(b3["snapshot_id"] == 2, f"id={b3.get('snapshot_id')}")
+        _assert(b3["diff"]["changed"], f"diff.changed empty: {b3['diff']}")
+
+        listing = client.get("/api/portfolio/snapshots")
+        _assert(listing.status_code == 200, f"list={listing.status_code}")
+        snaps = listing.json()["snapshots"]
+        _assert(len(snaps) == 2, f"expected 2 snapshots, got {len(snaps)}")
+
+        one = client.get("/api/portfolio/snapshots/1")
+        _assert(one.status_code == 200, f"get1={one.status_code}")
+        body = one.json()
+        for key in ("as_of", "source", "user", "summary", "holdings", "mf_holdings", "positions"):
+            _assert(key in body, f"snapshot missing {key}")
+        _assert("composition" in body, "snapshot missing composition")
+        _assert(body["source"] == "snapshot", f"source={body['source']}")
+        _assert(len(body["holdings"]) == 28, f"holdings={len(body['holdings'])}")
+
+        missing = client.get("/api/portfolio/snapshots/999")
+        _assert(missing.status_code == 404, f"expected 404, got {missing.status_code}")
+        err = missing.json()
+        _assert(err.get("error") == "snapshot_not_found", f"error={err}")
+    print("  ok api_capture_and_snapshots")
+
+
+def test_api_token_invalid() -> None:
+    from .fetch import TokenInvalid
+
+    def bad_fetcher() -> RawPayload:
+        raise TokenInvalid()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        from fastapi.testclient import TestClient
+
+        from .api import create_app
+
+        app = create_app(db_path=Path(tmp) / "t.duckdb", fetcher=bad_fetcher)
+        client = TestClient(app, raise_server_exceptions=False)
+        r = client.get("/api/portfolio/live")
+        _assert(r.status_code == 401, f"expected 401, got {r.status_code} {r.text}")
+        body = r.json()
+        _assert(body.get("error") == "token_invalid", f"error={body}")
+        steps = body.get("steps") or []
+        _assert(len(steps) >= 1, f"steps empty: {body}")
+        _assert(any("kitetools login" in s for s in steps), f"login hint missing: {steps}")
+    print("  ok api_token_invalid")
+
+
 def main() -> int:
     print(f"portfolio.selftest  samples={SAMPLES_DIR}  data={DATA_DIR}")
     tests = [
@@ -288,6 +446,10 @@ def main() -> int:
         test_zero_positions_excluded_and_cnc_merge,
         test_mf_rounding_and_change,
         test_capture_idempotence,
+        test_api_health,
+        test_api_live_and_cache,
+        test_api_capture_and_snapshots,
+        test_api_token_invalid,
     ]
     failed = 0
     for test in tests:
