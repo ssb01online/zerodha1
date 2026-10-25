@@ -119,6 +119,22 @@ Always `import kitetools` (or `from kitetools...`) before other HTTPS clients so
 
 ---
 
+## OHLCV package (NFO candles)
+
+Workspace member for F&O price/volume download planning and (later) Parquet storage. After `uv sync --all-packages`:
+
+```powershell
+uv run ohlcv sync          # archive instruments master + upsert NFO contracts into catalog
+uv run ohlcv rank          # rank underlyings by nearest-FUT day traded value (needs login)
+uv run ohlcv queue         # print expiry-first download queue with request estimates
+uv run ohlcv queue --expiry 20261027 --limit 20
+uv run python -m ohlcv.selftest
+```
+
+Data lives under gitignored `data/ohlcv/nfo/` (`catalog.duckdb`) and `data/instruments/archive/`. Minute candle downloads are Phase 3. Notes: `ref/kite/notes.md` (OHLCV Phase 1).
+
+---
+
 ## Portfolio package
 
 Workspace member for samples, sparse composition snapshots, FastAPI JSON API, and a React SPA (holdings / mutual funds / positions). After `uv sync --all-packages`:

@@ -1,0 +1,21 @@
+[project]
+name = "ohlcv"
+version = "0.1.0"
+description = "NFO OHLCV download, storage, and query (Parquet + DuckDB catalog)"
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.1.0",
+    "instruments",
+    "kitetools",
+]
+
+[project.scripts]
+ohlcv = "ohlcv.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+instruments = { workspace = true }
+kitetools = { workspace = true }

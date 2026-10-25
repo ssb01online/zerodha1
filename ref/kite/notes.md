@@ -19,10 +19,65 @@
 
 ## Historical data (`historical.md`)
 - `historical_data(instrument_token, from_date, to_date, interval, continuous=False, oi=False)`; intervals: minute, 3minute, 5minute, 10minute, 15minute, 30minute, 60minute, day.
-- Candle = `[timestamp, open, high, low, close, volume(, oi)]`, timestamps in IST (+0530).
+- Candle = `[timestamp, open, high, low, close, volume(, oi)]`, timestamps in IST (+0530). SDK returns dicts (`date`, `open`, `high`, `low`, `close`, `volume`, optional `oi`).
 - Instrument master only lists live contracts; F&O tokens change every expiry. Cache `instruments()` daily to keep tokens for expired contracts.
 - `continuous=1` works only for NFO/MCX futures and returns day candles only.
-- Max date range per request per interval is not in the docs; confirm before designing the chunked downloader.
+- Max date range (verified Phase 0 probe `data/ohlcv/nfo/_probe/20261025-213003.json`, token NIFTY 50):
+  - **minute: 60 days** (API error text: `interval exceeds max limit: 60 days`). Inclusive calendar span of 61 days still returned OK once; design chunk size = **60**.
+  - **day: ≥2001 days** (all probe spans succeeded; true upper bound not hit).
+
+## Historical probe (Phase 0)
+
+CLI: `uv run ohlcv probe` (report under `data/ohlcv/nfo/_probe/`). Re-test expired tokens after 27 Oct 2026: `uv run ohlcv probe --expired` (uses `watch_list` from latest report).
+
+Verified 2026-10-25 (Sunday, IST) against live Kite:
+
+| Check | Result |
+| --- | --- |
+| Minute max span | 60 days (API); treat as hard limit for chunking |
+| Day max span | ≥2001 days |
+| OI (`oi=True`) | Present on minute and day for NFO FUT; field varies across bars |
+| Session timestamps | Minute bars start `09:15` IST; liquid NFO often runs to `15:30`–`15:39` (not just 15:29). Expect ~376–385 rows/day when dense |
+| Sparsity (liquid ATM CE) | Dense ~385 rows/day, almost no zero-volume bars |
+| Sparsity (far OTM stock CE) | Sparse (57–275 rows/day); many gaps **and** many zero-volume bars — empty minutes are often omitted, not filled |
+| Pre-listing | Day request before first trade returns **empty list**, not an error (`RELIANCE26DECFUT` first day 2026-09-30) |
+| Day vs minute volume/OI | Do **not** require exact equality (NIFTY Oct FUT 2026-10-23: day vol 5 761 080 vs minute sum 5 527 730; day OI ≠ last-minute OI) |
+| Latency | Historical median ~0.19s (p95 ~1.2s) at ≤3 req/s pacing |
+| Quote (500 NFO, weekend) | All keys returned; `last_trade_time` / `timestamp` present; `volume` and `average_price` were **0** on Sunday while `oi` / `last_price` / `ohlc` remained. `ohlc.close` ≠ `last_price` (previous close). Trade date for a snapshot = date of `last_trade_time`, not calendar today |
+
+Phase 3 fetch decision from this probe:
+- 60-day minute backfill fits in **one** request per contract → day-candle prefetch is **not** required for chunking.
+- Still useful later for “which days traded” screens, but optional for the first minute downloader.
+- Take `quote()` daily snapshots on a **trading day after close** (weekend volume is cleared).
+- Pending: `ohlcv probe --expired` on/after 2026-10-28 for watch_list tokens (NIFTY/RELIANCE 2026-10-27 series).
+
+## OHLCV Phase 1 (foundation + download queue)
+
+Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
+
+### Commands
+| Command | Needs login | Purpose |
+| --- | --- | --- |
+| `uv run ohlcv sync` | only if master cache must refresh from Kite | Archive `data/instruments/master.json` → `data/instruments/archive/yyyymmdd.json.gz`; upsert NFO rows into `data/ohlcv/nfo/catalog.duckdb` |
+| `uv run ohlcv rank [--force]` | yes | Rank underlyings by nearest-FUT **day** candle `volume * close` (weekend-safe; quote volume is 0 on Sundays) |
+| `uv run ohlcv queue [--expiry] [--underlying] [--limit]` | only if sync must refresh master | Print series queue: expiry asc, traded_value desc, unranked last; request/time estimates |
+| `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
+
+### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=1)
+Tables: `meta`, `contracts`, `fetch_state` (watermarks; Phase 3 writes), `underlying_rank`, `runs`.
+Single-writer: only one process should open the catalog for writes; a lock error means close notebooks / other `ohlcv` runs.
+
+### Universe
+- Live: nearest **3** expiries per NFO underlying with `expiry >= today`.
+- Plus **unfinished expired** series still in `contracts` whose minute `fetch_state` is missing / not `done` through expiry-day 15:40 IST (so a series can be finished after it drops off the live master).
+
+### Ranking
+Uses historical day candles of each underlying’s nearest live FUT (not `quote()`), because weekend quote `volume` / `average_price` are cleared. Phase 2 may switch to quote-snapshot traded value on trading days.
+
+### Queue estimates
+- Default backfill = **60 inclusive calendar days** → **1** minute request per contract when chunk size is 60 (Phase 0).
+- Time ≈ `requests * max(0.34s pace, 0.19s Phase-0 median latency)`.
+- Partial watermarks roll back to 09:15 IST of that day before counting chunks.
 
 ## Portfolio data (verified 2026-10-25 sample `data/samples/20261025-121155`)
 APIs: `holdings()`, `positions()` → `{net, day}`, `mf_holdings()`. No historical portfolio or demat txn API.
