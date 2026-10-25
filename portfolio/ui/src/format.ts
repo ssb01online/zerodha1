@@ -94,6 +94,20 @@ export function formatIst(
   return (mode === "date" ? istDate : istDateTime).format(d) + " IST";
 }
 
+const expiryChipFmt = new Intl.DateTimeFormat("en-IN", {
+  timeZone: "UTC",
+  day: "numeric",
+  month: "short",
+});
+
+/** Chip label for an ISO calendar date (`YYYY-MM-DD`), e.g. `28 Oct`. */
+export function formatExpiryChip(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!m) return iso;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  return expiryChipFmt.format(d);
+}
+
 export function pnlClass(value: number | null | undefined): string {
   if (value === null || value === undefined || value === 0) return "pnl-flat";
   return value > 0 ? "pnl-pos" : "pnl-neg";

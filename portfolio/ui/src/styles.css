@@ -360,8 +360,13 @@ button {
 .sub-toggle {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.5rem;
   margin-bottom: 0.75rem;
+}
+
+.sub-toggle-end {
+  margin-left: auto;
 }
 
 .segmented {

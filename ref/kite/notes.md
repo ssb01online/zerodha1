@@ -101,7 +101,7 @@ npm run dev
 - Capture soft-fails in the status bar (`db_busy`, etc.) without hiding portfolio data.
 - 401 → token panel with the server's `steps` (run `uv run kitetools login`).
 - Snapshots list `/snapshots`; detail `/snapshots/:id` shows as-of banner + same tables + composition keys.
-- `localStorage`: `portfolio_ui_theme_v1` (`dark`|`light`), `portfolio_ui_tab_v1` (`holdings`|`mf`|`positions`).
+- `localStorage`: `portfolio_ui_theme_v1` (`dark`|`light`), `portfolio_ui_tab_v1` (`holdings`|`mf`|`positions`), `portfolio_ui_pos_filters_v1` (`{ kind: all|equity|fo, expiryKey: all|unknown|YYYY-MM-DD }` — Positions toolbar kind/expiry filters).
 - Build check: `cd portfolio/ui; $env:NODE_OPTIONS="--use-system-ca"; npm run build`.
 
 ## UI polish and SPA mount (Phase 4)
