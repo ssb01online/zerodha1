@@ -389,6 +389,59 @@ button {
   font-weight: 600;
 }
 
+.table-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.table-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.col-picker {
+  position: relative;
+}
+
+.col-picker-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 15;
+  min-width: 160px;
+  padding: 0.4rem 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.col-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.3rem 0.75rem;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.col-picker-item:hover {
+  background: var(--bg-muted);
+}
+
+.col-picker-item.locked {
+  color: var(--text-faint);
+  cursor: default;
+}
+
+.col-picker-item input {
+  margin: 0;
+}
+
 .table-wrap {
   overflow: auto;
   border: 1px solid var(--border);
@@ -421,6 +474,37 @@ button {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-muted);
+}
+
+.data-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.data-table th.sortable:hover {
+  color: var(--text);
+}
+
+.data-table th.sortable .th-label::after {
+  content: "⇅";
+  margin-left: 0.3rem;
+  font-size: 10px;
+  opacity: 0.35;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.data-table th.sorted-asc .th-label::after {
+  content: "▲";
+  opacity: 0.9;
+  color: var(--accent);
+}
+
+.data-table th.sorted-desc .th-label::after {
+  content: "▼";
+  opacity: 0.9;
+  color: var(--accent);
 }
 
 .data-table th.num,

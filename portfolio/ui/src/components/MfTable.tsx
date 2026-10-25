@@ -13,9 +13,7 @@ interface MfTableProps {
 }
 
 export default function MfTable({ rows }: MfTableProps) {
-  const sorted = [...rows].sort((a, b) => b.current_value - a.current_value);
-
-  const totals = sorted.reduce(
+  const totals = rows.reduce(
     (acc, r) => {
       acc.invested += r.invested;
       acc.current_value += r.current_value;
@@ -31,6 +29,8 @@ export default function MfTable({ rows }: MfTableProps) {
     {
       key: "fund",
       header: "Fund",
+      locked: true,
+      sortValue: (r) => r.fund || r.tradingsymbol,
       cell: (r) => (
         <>
           <span className="cell-primary">{r.fund || r.tradingsymbol}</span>
@@ -45,24 +45,28 @@ export default function MfTable({ rows }: MfTableProps) {
       key: "units",
       header: "Units",
       align: "right",
+      sortValue: (r) => r.quantity,
       cell: (r) => formatUnits(r.quantity),
     },
     {
       key: "avg",
       header: "Avg NAV",
       align: "right",
+      sortValue: (r) => r.average_price,
       cell: (r) => formatPrice(r.average_price),
     },
     {
       key: "nav",
       header: "NAV",
       align: "right",
+      sortValue: (r) => r.last_price,
       cell: (r) => formatPrice(r.last_price),
     },
     {
       key: "invested",
       header: "Invested",
       align: "right",
+      sortValue: (r) => r.invested,
       cell: (r) => formatInr(r.invested),
       footer: formatInr(totals.invested),
     },
@@ -70,6 +74,7 @@ export default function MfTable({ rows }: MfTableProps) {
       key: "value",
       header: "Value",
       align: "right",
+      sortValue: (r) => r.current_value,
       cell: (r) => formatInr(r.current_value),
       footer: formatInr(totals.current_value),
     },
@@ -77,6 +82,7 @@ export default function MfTable({ rows }: MfTableProps) {
       key: "pnl",
       header: "P&L",
       align: "right",
+      sortValue: (r) => r.pnl,
       cell: (r) => (
         <span className={pnlClass(r.pnl)}>
           {formatInr(r.pnl)}
@@ -95,9 +101,12 @@ export default function MfTable({ rows }: MfTableProps) {
   return (
     <DataTable
       columns={columns}
-      rows={sorted}
+      rows={rows}
       rowKey={(r) => `${r.isin}:${r.folio}`}
       empty={<div className="empty-state">No mutual fund holdings</div>}
+      storageKey="portfolio_ui_cols_mf_v1"
+      defaultSortKey="value"
+      defaultSortDir="desc"
     />
   );
 }

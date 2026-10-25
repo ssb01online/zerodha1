@@ -20,6 +20,8 @@ export default function PositionsTable({ net, day }: PositionsTableProps) {
     {
       key: "symbol",
       header: "Symbol",
+      locked: true,
+      sortValue: (r) => r.tradingsymbol,
       cell: (r) => (
         <>
           <span className="cell-primary">{r.tradingsymbol}</span>
@@ -30,12 +32,14 @@ export default function PositionsTable({ net, day }: PositionsTableProps) {
     {
       key: "product",
       header: "Product",
+      sortValue: (r) => r.product,
       cell: (r) => <span className="badge badge-product">{r.product}</span>,
     },
     {
       key: "qty",
       header: "Qty",
       align: "right",
+      sortValue: (r) => r.quantity,
       cell: (r) => (
         <span className={r.quantity < 0 ? "pnl-neg" : undefined}>
           {formatQty(r.quantity)}
@@ -46,24 +50,28 @@ export default function PositionsTable({ net, day }: PositionsTableProps) {
       key: "overnight",
       header: "Overnight",
       align: "right",
+      sortValue: (r) => r.overnight_quantity,
       cell: (r) => formatQty(r.overnight_quantity),
     },
     {
       key: "avg",
       header: "Avg",
       align: "right",
+      sortValue: (r) => r.average_price,
       cell: (r) => formatPrice(r.average_price),
     },
     {
       key: "ltp",
       header: "LTP",
       align: "right",
+      sortValue: (r) => r.last_price,
       cell: (r) => formatPrice(r.last_price),
     },
     {
       key: "pnl",
       header: "P&L",
       align: "right",
+      sortValue: (r) => r.pnl,
       cell: (r) => (
         <span className={pnlClass(r.pnl)}>{formatInr(r.pnl)}</span>
       ),
@@ -72,6 +80,7 @@ export default function PositionsTable({ net, day }: PositionsTableProps) {
       key: "m2m",
       header: "M2M",
       align: "right",
+      sortValue: (r) => r.m2m,
       cell: (r) => (
         <span className={pnlClass(r.m2m)}>{formatInr(r.m2m)}</span>
       ),
@@ -80,6 +89,7 @@ export default function PositionsTable({ net, day }: PositionsTableProps) {
       key: "realised",
       header: "Realised",
       align: "right",
+      sortValue: (r) => r.realised,
       cell: (r) => (
         <span className={pnlClass(r.realised)}>{formatInr(r.realised)}</span>
       ),
@@ -88,6 +98,7 @@ export default function PositionsTable({ net, day }: PositionsTableProps) {
       key: "unrealised",
       header: "Unrealised",
       align: "right",
+      sortValue: (r) => r.unrealised,
       cell: (r) => (
         <span className={pnlClass(r.unrealised)}>
           {formatInr(r.unrealised)}
@@ -140,6 +151,9 @@ export default function PositionsTable({ net, day }: PositionsTableProps) {
               : "No open positions — use Show closed to see flat rows"}
           </div>
         }
+        storageKey="portfolio_ui_cols_positions_v1"
+        defaultSortKey="pnl"
+        defaultSortDir="desc"
       />
     </div>
   );

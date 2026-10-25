@@ -13,9 +13,7 @@ interface HoldingsTableProps {
 }
 
 export default function HoldingsTable({ rows }: HoldingsTableProps) {
-  const sorted = [...rows].sort((a, b) => b.current_value - a.current_value);
-
-  const totals = sorted.reduce(
+  const totals = rows.reduce(
     (acc, r) => {
       acc.invested += r.invested;
       acc.current_value += r.current_value;
@@ -32,6 +30,8 @@ export default function HoldingsTable({ rows }: HoldingsTableProps) {
     {
       key: "symbol",
       header: "Symbol",
+      locked: true,
+      sortValue: (r) => r.tradingsymbol,
       cell: (r) => (
         <>
           <span className="cell-primary">
@@ -52,24 +52,28 @@ export default function HoldingsTable({ rows }: HoldingsTableProps) {
       key: "qty",
       header: "Qty",
       align: "right",
+      sortValue: (r) => r.owned_quantity,
       cell: (r) => formatQty(r.owned_quantity),
     },
     {
       key: "avg",
       header: "Avg cost",
       align: "right",
+      sortValue: (r) => r.average_price,
       cell: (r) => formatPrice(r.average_price),
     },
     {
       key: "ltp",
       header: "LTP",
       align: "right",
+      sortValue: (r) => r.last_price,
       cell: (r) => formatPrice(r.last_price),
     },
     {
       key: "invested",
       header: "Invested",
       align: "right",
+      sortValue: (r) => r.invested,
       cell: (r) => formatInr(r.invested),
       footer: formatInr(totals.invested),
     },
@@ -77,6 +81,7 @@ export default function HoldingsTable({ rows }: HoldingsTableProps) {
       key: "value",
       header: "Value",
       align: "right",
+      sortValue: (r) => r.current_value,
       cell: (r) => formatInr(r.current_value),
       footer: formatInr(totals.current_value),
     },
@@ -84,6 +89,7 @@ export default function HoldingsTable({ rows }: HoldingsTableProps) {
       key: "pnl",
       header: "P&L",
       align: "right",
+      sortValue: (r) => r.pnl,
       cell: (r) => (
         <span className={pnlClass(r.pnl)}>
           {formatInr(r.pnl)}
@@ -101,6 +107,7 @@ export default function HoldingsTable({ rows }: HoldingsTableProps) {
       key: "day",
       header: "Day chg",
       align: "right",
+      sortValue: (r) => r.day_change_value,
       cell: (r) => (
         <span className={pnlClass(r.day_change_value)}>
           {formatInr(r.day_change_value)}
@@ -119,6 +126,7 @@ export default function HoldingsTable({ rows }: HoldingsTableProps) {
       key: "weight",
       header: "Weight",
       align: "right",
+      sortValue: (r) => r.weight ?? null,
       cell: (r) =>
         r.weight === null || r.weight === undefined
           ? "—"
@@ -129,9 +137,12 @@ export default function HoldingsTable({ rows }: HoldingsTableProps) {
   return (
     <DataTable
       columns={columns}
-      rows={sorted}
+      rows={rows}
       rowKey={(r) => r.isin || `${r.exchange}:${r.tradingsymbol}`}
       empty={<div className="empty-state">No equity holdings</div>}
+      storageKey="portfolio_ui_cols_holdings_v1"
+      defaultSortKey="value"
+      defaultSortDir="desc"
     />
   );
 }

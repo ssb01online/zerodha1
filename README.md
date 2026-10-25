@@ -121,16 +121,42 @@ Always `import kitetools` (or `from kitetools...`) before other HTTPS clients so
 
 ## Portfolio package
 
-Workspace member for samples, sparse composition snapshots, and the local JSON API (React UI comes next). After `uv sync --all-packages`:
+Workspace member for samples, sparse composition snapshots, FastAPI JSON API, and a React SPA (holdings / mutual funds / positions). After `uv sync --all-packages`:
 
 ```powershell
 uv run portfolio sample      # fetch holdings + positions + mf_holdings → data/samples/<IST timestamp>/
 uv run portfolio summarize   # field/qty report for the latest sample (or pass a folder name)
 uv run portfolio capture     # write a DuckDB snapshot only when composition changed
 uv run portfolio snapshots   # list stored snapshots
-uv run portfolio serve       # FastAPI on http://127.0.0.1:8765
+uv run portfolio serve       # FastAPI on http://127.0.0.1:8765 (serves UI when ui/dist exists)
 ```
 
-Health check: [http://127.0.0.1:8765/api/health](http://127.0.0.1:8765/api/health). Live portfolio: `/api/portfolio/live`. Capture: `POST /api/portfolio/capture`.
+### UI — single-process (after build)
+
+```powershell
+cd portfolio/ui
+$env:NODE_OPTIONS="--use-system-ca"   # Norton / system CA on this machine
+npm install
+npm run build
+cd ../..
+uv run portfolio serve
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765) — routes: `/portfolio` (live), `/snapshots`, `/snapshots/:id`. Health includes `ui_dist_exists`.
+
+### UI — dev (two terminals)
+
+```powershell
+# Terminal 1
+uv run portfolio serve
+
+# Terminal 2
+cd portfolio/ui
+$env:NODE_OPTIONS="--use-system-ca"
+npm run dev
+# http://127.0.0.1:5173 — proxies /api → :8765
+```
+
+API: [http://127.0.0.1:8765/api/health](http://127.0.0.1:8765/api/health), `/api/portfolio/live`, `POST /api/portfolio/capture`.
 
 Requires a valid session (`uv run kitetools login`). Samples and `data/portfolio.duckdb` stay under gitignored `data/`. Verified quantity rules and API notes live in `ref/kite/notes.md`. Offline checks: `uv run python -m portfolio.selftest`.

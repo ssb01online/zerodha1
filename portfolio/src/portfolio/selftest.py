@@ -298,13 +298,21 @@ class _CountingFetcher:
         return load_from_sample(self.folder)
 
 
-def _api_client(tmp: Path, fetcher: _CountingFetcher, ttl: float = 10.0):
+def _api_client(
+    tmp: Path,
+    fetcher: _CountingFetcher,
+    ttl: float = 10.0,
+    *,
+    ui_dist: Path | None = None,
+):
     from fastapi.testclient import TestClient
 
     from .api import create_app
 
     db = tmp / "api.duckdb"
-    app = create_app(db_path=db, fetcher=fetcher, ttl=ttl)
+    # Default: no SPA so health/UI tests stay deterministic regardless of a local build.
+    dist = ui_dist if ui_dist is not None else tmp / "no-ui-dist"
+    app = create_app(db_path=db, fetcher=fetcher, ttl=ttl, ui_dist=dist)
     return TestClient(app), db
 
 
@@ -318,7 +326,47 @@ def test_api_health() -> None:
         blob = json.dumps(body)
         _assert("access_token" not in blob, "health must not leak access_token")
         _assert("session" in body and "db" in body, "health missing session/db")
+        _assert(body.get("ui_dist_exists") is False, f"ui_dist_exists={body.get('ui_dist_exists')}")
+        root = client.get("/")
+        _assert(root.status_code == 200, f"root status={root.status_code}")
+        root_body = root.json()
+        _assert("hint" in root_body, f"root hint missing: {root_body}")
     print("  ok api_health")
+
+
+def test_api_spa_mount() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        dist = base / "ui" / "dist"
+        assets = dist / "assets"
+        assets.mkdir(parents=True)
+        (dist / "index.html").write_text(
+            "<!doctype html><html><body>spa</body></html>",
+            encoding="utf-8",
+        )
+        (assets / "app.js").write_text("console.log(1)", encoding="utf-8")
+
+        client, _db = _api_client(base, _CountingFetcher(), ui_dist=dist)
+        health = client.get("/api/health")
+        _assert(health.status_code == 200, f"health={health.status_code}")
+        _assert(health.json().get("ui_dist_exists") is True, "ui_dist_exists should be true")
+
+        # API still works when SPA is mounted.
+        live = client.get("/api/portfolio/live")
+        _assert(live.status_code == 200, f"live under spa={live.status_code}")
+
+        index = client.get("/portfolio")
+        _assert(index.status_code == 200, f"spa /portfolio={index.status_code}")
+        _assert("spa" in index.text, f"spa body unexpected: {index.text[:80]}")
+
+        deep = client.get("/snapshots/1")
+        _assert(deep.status_code == 200, f"spa deep link={deep.status_code}")
+        _assert("spa" in deep.text, "deep link must return index.html")
+
+        asset = client.get("/assets/app.js")
+        _assert(asset.status_code == 200, f"asset={asset.status_code}")
+        _assert("console.log" in asset.text, f"asset body={asset.text}")
+    print("  ok api_spa_mount")
 
 
 def test_api_live_and_cache() -> None:
@@ -425,7 +473,11 @@ def test_api_token_invalid() -> None:
 
         from .api import create_app
 
-        app = create_app(db_path=Path(tmp) / "t.duckdb", fetcher=bad_fetcher)
+        app = create_app(
+            db_path=Path(tmp) / "t.duckdb",
+            fetcher=bad_fetcher,
+            ui_dist=Path(tmp) / "no-ui-dist",
+        )
         client = TestClient(app, raise_server_exceptions=False)
         r = client.get("/api/portfolio/live")
         _assert(r.status_code == 401, f"expected 401, got {r.status_code} {r.text}")
@@ -447,6 +499,7 @@ def main() -> int:
         test_mf_rounding_and_change,
         test_capture_idempotence,
         test_api_health,
+        test_api_spa_mount,
         test_api_live_and_cache,
         test_api_capture_and_snapshots,
         test_api_token_invalid,
