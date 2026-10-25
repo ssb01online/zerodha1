@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Portfolio samples, snapshots, and UI for Kite Connect holdings/positions"
 requires-python = ">=3.13"
 dependencies = [
+    "duckdb>=1.1.0",
     "kitetools",
 ]
 

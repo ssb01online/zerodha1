@@ -9,42 +9,16 @@ from pathlib import Path
 from typing import Any
 
 import kiteconnect
-from kiteconnect.exceptions import TokenException
 
-from kitetools import auth
-from kitetools.auth import IST
 from kitetools.config import DATA_DIR
 
+from .fetch import TOKEN_HINT, TokenInvalid, fetch_live, load_from_sample
+
 SAMPLES_DIR = DATA_DIR / "samples"
-TOKEN_HINT = "Token is invalid or expired. Run: uv run kitetools login"
-
-
-def _now_ist() -> datetime:
-    return datetime.now(IST)
 
 
 def _dump(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-
-
-def _load(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def fetch_live() -> tuple[list, dict, list, dict]:
-    """Return holdings, positions, mf_holdings, and a small profile dict."""
-    try:
-        kite = auth.get_kite()
-        profile = kite.profile()
-        holdings = kite.holdings()
-        positions = kite.positions()
-        mf_holdings = kite.mf_holdings()
-    except (auth.NotLoggedIn, TokenException) as exc:
-        raise SystemExit(f"{TOKEN_HINT}\n({exc})") from exc
-    return holdings, positions, mf_holdings, {
-        "user_id": profile.get("user_id"),
-        "user_name": profile.get("user_name"),
-    }
 
 
 def save_sample(
@@ -55,7 +29,9 @@ def save_sample(
     *,
     fetched_at: datetime | None = None,
 ) -> Path:
-    fetched_at = fetched_at or _now_ist()
+    from kitetools.auth import IST
+
+    fetched_at = fetched_at or datetime.now(IST)
     folder = SAMPLES_DIR / fetched_at.strftime("%Y%m%d-%H%M%S")
     folder.mkdir(parents=True, exist_ok=False)
 
@@ -89,8 +65,17 @@ def save_sample(
 
 
 def capture_sample() -> Path:
-    holdings, positions, mf_holdings, profile = fetch_live()
-    return save_sample(holdings, positions, mf_holdings, profile)
+    try:
+        raw = fetch_live()
+    except TokenInvalid as exc:
+        raise SystemExit(str(exc)) from exc
+    return save_sample(
+        raw.holdings,
+        raw.positions,
+        raw.mf_holdings,
+        raw.profile,
+        fetched_at=raw.fetched_at,
+    )
 
 
 def latest_sample_dir() -> Path:
@@ -107,7 +92,6 @@ def resolve_sample_dir(folder: str | None) -> Path:
         return latest_sample_dir()
     path = Path(folder)
     if not path.is_absolute():
-        # Allow bare timestamp folder name or relative path.
         candidate = SAMPLES_DIR / folder
         if candidate.is_dir():
             path = candidate
@@ -117,16 +101,26 @@ def resolve_sample_dir(folder: str | None) -> Path:
 
 
 def load_sample(folder: Path) -> dict[str, Any]:
-    required = ("holdings.json", "positions.json", "mf_holdings.json", "meta.json")
-    missing = [name for name in required if not (folder / name).exists()]
-    if missing:
-        raise SystemExit(f"{folder} is missing: {', '.join(missing)}")
+    folder = Path(folder)
+    raw = load_from_sample(folder)
+    meta_path = folder / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {
+        "fetched_at": raw.fetched_at.isoformat(),
+        "user_id": raw.profile.get("user_id"),
+        "user_name": raw.profile.get("user_name"),
+        "counts": {
+            "holdings": len(raw.holdings),
+            "positions_net": len((raw.positions.get("net") or [])),
+            "positions_day": len((raw.positions.get("day") or [])),
+            "mf_holdings": len(raw.mf_holdings),
+        },
+    }
     return {
         "folder": folder,
-        "holdings": _load(folder / "holdings.json"),
-        "positions": _load(folder / "positions.json"),
-        "mf_holdings": _load(folder / "mf_holdings.json"),
-        "meta": _load(folder / "meta.json"),
+        "holdings": raw.holdings,
+        "positions": raw.positions,
+        "mf_holdings": raw.mf_holdings,
+        "meta": meta,
     }
 
 
@@ -172,10 +166,12 @@ def summarize(folder: Path) -> None:
     day: list[dict] = positions.get("day") or []
 
     print(f"Sample: {folder}")
-    print(f"Fetched: {meta.get('fetched_at')}  user={meta.get('user_id')}  kiteconnect={meta.get('kiteconnect_version')}")
+    print(
+        f"Fetched: {meta.get('fetched_at')}  user={meta.get('user_id')}  "
+        f"kiteconnect={meta.get('kiteconnect_version', '')}"
+    )
     print(f"Counts: holdings={len(holdings)} net={len(net)} day={len(day)} mf={len(mf_holdings)}")
 
-    # --- Holdings ---
     _print_section("Holdings")
     print(f"fields: {', '.join(_field_set(holdings)) or '(none)'}")
     mtf_fields = _nested_fields(holdings, "mtf")
@@ -205,12 +201,19 @@ def summarize(folder: Path) -> None:
     print(f"non-zero mtf.quantity: {len(mtf_hits)}")
     for r in mtf_hits[:10]:
         mtf = r.get("mtf") or {}
-        print(f"  {r.get('exchange')}:{r.get('tradingsymbol')} mtf.qty={mtf.get('quantity')} mtf.avg={mtf.get('average_price')}")
+        print(
+            f"  {r.get('exchange')}:{r.get('tradingsymbol')} "
+            f"mtf.qty={mtf.get('quantity')} mtf.avg={mtf.get('average_price')}"
+        )
 
     def _owned(r: dict) -> int:
         return (r.get("quantity") or 0) + (r.get("t1_quantity") or 0) + (r.get("collateral_quantity") or 0)
 
-    qty_eq = sum(1 for r in holdings if (r.get("quantity") or 0) + (r.get("t1_quantity") or 0) == (r.get("opening_quantity") or 0))
+    qty_eq = sum(
+        1
+        for r in holdings
+        if (r.get("quantity") or 0) + (r.get("t1_quantity") or 0) == (r.get("opening_quantity") or 0)
+    )
     owned_eq = sum(1 for r in holdings if _owned(r) == (r.get("opening_quantity") or 0))
     print(f"quantity + t1_quantity == opening_quantity: {qty_eq}/{len(holdings)}")
     print(f"quantity + t1_quantity + collateral_quantity == opening_quantity: {owned_eq}/{len(holdings)}")
@@ -220,7 +223,8 @@ def summarize(folder: Path) -> None:
         print(
             f"  mismatch {r.get('exchange')}:{r.get('tradingsymbol')} "
             f"qty={r.get('quantity')} t1={r.get('t1_quantity')} coll={r.get('collateral_quantity')} "
-            f"opening={r.get('opening_quantity')} used={r.get('used_quantity')} realised={r.get('realised_quantity')}"
+            f"opening={r.get('opening_quantity')} used={r.get('used_quantity')} "
+            f"realised={r.get('realised_quantity')}"
         )
 
     las_hits = [r for r in holdings if (r.get("las_quantity") or 0) != 0]
@@ -235,10 +239,11 @@ def summarize(folder: Path) -> None:
     print(f"ISINs on multiple exchanges: {len(dup_isins)}")
     for isin, exs in list(dup_isins.items())[:10]:
         rows = [r for r in holdings if r.get("isin") == isin]
-        detail = ", ".join(f"{r.get('exchange')}:{r.get('tradingsymbol')} qty={r.get('quantity')}" for r in rows)
+        detail = ", ".join(
+            f"{r.get('exchange')}:{r.get('tradingsymbol')} qty={r.get('quantity')}" for r in rows
+        )
         print(f"  {isin}: {exs} -> {detail}")
 
-    # --- Positions ---
     _print_section("Positions (net)")
     print(f"fields: {', '.join(_field_set(net)) or '(none)'}")
     by_ex_prod: Counter[tuple[str, str]] = Counter(
@@ -285,7 +290,6 @@ def summarize(folder: Path) -> None:
             f"qty={r.get('quantity')} buy={r.get('day_buy_quantity')} sell={r.get('day_sell_quantity')}"
         )
 
-    # --- MF ---
     _print_section("MF holdings")
     print(f"fields: {', '.join(_field_set(mf_holdings)) or '(none)'}")
     folio_present = sum(1 for r in mf_holdings if r.get("folio"))
@@ -319,7 +323,17 @@ def summarize(folder: Path) -> None:
             print(f"non-zero {key}: {nonzero}/{len(mf_holdings)}")
 
     extra_nonzero: dict[str, int] = defaultdict(int)
-    skip = {"tradingsymbol", "folio", "fund", "isin", "quantity", "average_price", "last_price", "pnl", "instrument_token"}
+    skip = {
+        "tradingsymbol",
+        "folio",
+        "fund",
+        "isin",
+        "quantity",
+        "average_price",
+        "last_price",
+        "pnl",
+        "instrument_token",
+    }
     for r in mf_holdings:
         for k, v in r.items():
             if k in skip:
@@ -341,23 +355,27 @@ def summarize(folder: Path) -> None:
     if len(mf_holdings) > 15:
         print(f"  ... {len(mf_holdings) - 15} more")
 
-    # --- Key uniqueness ---
     _print_section("Key uniqueness")
-    holding_keys = [(r.get("isin") or f"NOISIN:{r.get('exchange')}:{r.get('tradingsymbol')}") for r in holdings]
+    holding_keys = [
+        (r.get("isin") or f"NOISIN:{r.get('exchange')}:{r.get('tradingsymbol')}") for r in holdings
+    ]
     holding_dup = [k for k, n in Counter(holding_keys).items() if n > 1]
     print(f"holdings ISIN keys unique: {not holding_dup} (dups={len(holding_dup)})")
     for k in holding_dup[:10]:
         print(f"  dup ISIN key: {k}")
 
-    # Also report exchange:tradingsymbol uniqueness for holdings
     ht_keys = [f"{r.get('exchange')}:{r.get('tradingsymbol')}" for r in holdings]
     ht_dup = [k for k, n in Counter(ht_keys).items() if n > 1]
     print(f"holdings exchange:tradingsymbol unique: {not ht_dup} (dups={len(ht_dup)})")
 
     net_keys = [f"{r.get('exchange')}:{r.get('tradingsymbol')}" for r in net]
-    # Same symbol can appear under different products — include product in key check
-    net_prod_keys = [f"{r.get('exchange')}:{r.get('tradingsymbol')}:{r.get('product')}" for r in net]
-    print(f"positions net exchange:tradingsymbol unique: {len(net_keys) == len(set(net_keys))} (n={len(net_keys)})")
+    net_prod_keys = [
+        f"{r.get('exchange')}:{r.get('tradingsymbol')}:{r.get('product')}" for r in net
+    ]
+    print(
+        f"positions net exchange:tradingsymbol unique: "
+        f"{len(net_keys) == len(set(net_keys))} (n={len(net_keys)})"
+    )
     print(
         f"positions net exchange:tradingsymbol:product unique: "
         f"{len(net_prod_keys) == len(set(net_prod_keys))} (n={len(net_prod_keys)})"
@@ -373,3 +391,16 @@ def summarize(folder: Path) -> None:
     print(f"mf isin:folio unique: {not mf_dup} (dups={len(mf_dup)})")
     for k in mf_dup[:10]:
         print(f"  dup mf key: {k}")
+
+
+# Re-export for callers that previously imported TOKEN_HINT from samples.
+__all__ = [
+    "SAMPLES_DIR",
+    "TOKEN_HINT",
+    "capture_sample",
+    "latest_sample_dir",
+    "load_sample",
+    "resolve_sample_dir",
+    "save_sample",
+    "summarize",
+]

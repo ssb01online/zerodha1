@@ -57,3 +57,13 @@ Notes:
 - `opening_quantity` equals owned qty at day open but does not move with same-day buys/sells; use the sum above for live fingerprints.
 - `used_quantity` is not added back (docs: sold from net holding; appears already reflected in `quantity` when non-zero — confirm on a sell day).
 - Snapshot `observed_at` = fetch time; `effective_date` of the true trade stays null until tradebook reconstruction.
+
+## Snapshots (Phase 1)
+
+- Formula lives only in `portfolio.fingerprint` (keys prefixed `EQ:` / `POS:` / `MF:`).
+- DuckDB path: `data/portfolio.duckdb` (gitignored via `data/`). Schema version `1` in `meta.schema_version`.
+- Tables: `snapshots` (incl. ISO `observed_at`, `raw_json`, `fingerprint_hash`), `snapshot_composition`, `snapshot_holdings`, `snapshot_mf_holdings`, `snapshot_positions`.
+- Capture writes **only** when the fingerprint hash differs from the latest snapshot. Prices at capture are stored as metadata, never as a trigger.
+- Single-writer assumption: only one process should write the DB (Phase 2 will make the API the sole writer). Concurrent DuckDB writers fail on Windows file locks.
+- CLI: `uv run portfolio capture [--from-sample] [--db PATH]`, `snapshots`, `show ID`. Self-test: `uv run python -m portfolio.selftest`.
+- Open verification (first real buy/sell day): confirm `used_quantity` behaviour and CNC equity rows in `positions.net` merge onto the holding ISIN as expected.
