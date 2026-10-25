@@ -75,3 +75,30 @@ Notes:
 - Live Kite responses are cached ~10s (errors never cached). Capture prefers the fresh cache so UI auto-capture after live does not double-fetch.
 - API opens DuckDB per call under a process lock (releases the file between requests so CLI reads can still work). Prefer capturing via the API while `serve` is running.
 - Token missing/expired → HTTP 401 `{error: token_invalid, message, steps}` with `uv run kitetools login` instructions. CORS allows Vite `http://127.0.0.1:5173` / `localhost:5173` only.
+
+## API and UI (Phase 3)
+
+Dev UI lives in `portfolio/ui` (React 19 + Vite 6 + TypeScript). No SPA mount on the API yet (Phase 4).
+
+### Run (two terminals)
+
+```powershell
+# Terminal 1 — API
+uv run portfolio serve
+# http://127.0.0.1:8765
+
+# Terminal 2 — Vite (Norton SSL: use system CAs)
+cd portfolio/ui
+$env:NODE_OPTIONS="--use-system-ca"
+npm install
+npm run dev
+# http://127.0.0.1:5173 — proxies /api → :8765
+```
+
+### Behaviour
+- Live page (`/portfolio`): `GET /api/portfolio/live` then auto `POST /api/portfolio/capture` once per load (StrictMode-guarded). Refresh button forces `?refresh=true` then capture again.
+- Capture soft-fails in the status bar (`db_busy`, etc.) without hiding portfolio data.
+- 401 → token panel with the server's `steps` (run `uv run kitetools login`).
+- Snapshots list `/snapshots`; detail `/snapshots/:id` shows as-of banner + same tables + composition keys.
+- `localStorage`: `portfolio_ui_theme_v1` (`dark`|`light`), `portfolio_ui_tab_v1` (`holdings`|`mf`|`positions`).
+- Build check: `cd portfolio/ui; $env:NODE_OPTIONS="--use-system-ca"; npm run build`.
