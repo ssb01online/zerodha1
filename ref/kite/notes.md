@@ -64,6 +64,8 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 | `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
 | `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | Phase 2 end-of-day quote snapshot |
 | `uv run ohlcv fetch [--expiry] [--underlying] [--max-series] [--max-minutes] [--dry-run]` | yes (except `--dry-run`) | Phase 3 minute candle download |
+| `uv run ohlcv status [--all] [--expiry] [--underlying] [--limit] [--runs]` | no | Phase 4 offline progress report |
+| `uv run ohlcv show UNDERLYING EXPIRY [--symbol\|--token] [--tail]` | no | Phase 4 inspect one minute series file |
 
 ### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=2)
 Tables: `meta`, `contracts`, `fetch_state` (watermarks; Phase 3 writes), `underlying_rank`, `runs`, `daily_snapshots`.
@@ -150,6 +152,42 @@ Only when a watermark already exists **and** every remaining weekday in the wind
 
 ### Offline check
 `uv run python -m ohlcv.selftest` (includes Phase 3 fake-kite tests).
+
+## OHLCV Phase 4 (status and read)
+
+Offline visibility and Parquet read helpers. No Kite calls; catalog opened **read-only**.
+
+### Daily routine (after 15:40 IST on a session day)
+1. `uv run ohlcv daily` — quote snapshot + rank
+2. `uv run ohlcv fetch` — incremental minute download (use `--max-minutes` to budget)
+3. `uv run ohlcv status` — check completion, snapshot gaps, recent runs
+
+If `status`/`show` fail with a catalog lock message, a `daily`/`fetch` run (or notebook) still holds `catalog.duckdb`; retry after it finishes. On Windows a read-only open fails while another process holds the write connection. Notebooks using `ohlcv.read` open/close DuckDB per call so they do not keep series Parquet files locked between queries.
+
+### Commands
+| Command | Purpose |
+| --- | --- |
+| `uv run ohlcv status [--all] [--expiry] [--underlying] [--limit] [--runs N]` | Series table (done%/pending/file size), subtotals, latest snapshots + weekday gaps, recent runs |
+| `uv run ohlcv show UNDERLYING EXPIRY` | File path, row/ts span, contracts with data, type breakdown, top-10 by volume |
+| `uv run ohlcv show UNDERLYING EXPIRY --symbol TS` / `--token N` | Per-day bars + `fetch_state` + last `--tail` bars (default 5) |
+
+`--all` includes every series with a `minute/<UL>/yyyymmdd.parquet` file (sanitised folders like `M_M` map back to catalog `M&M`). Default set is the download universe (`select_series`: live nearest-3 + unfinished expired).
+
+### Status semantics
+- **complete%**: contracts whose watermark reaches `min(fetch_end(now), expiry 15:40 IST)` with status `done`, plus every `gave_up`.
+- **pending**: estimated historical requests left (`planner.series_pending_requests`).
+- **snapshot gaps**: weekdays from the first recorded snapshot through the last completed session with no `final` row. **May include market holidays**; a missed quote day cannot be recovered from `quote()`.
+
+### Read helpers (`ohlcv.read`)
+- `daily(trade_date)`, `series_daily(underlying, expiry)` — quote snapshots
+- `series(underlying, expiry, *, tokens=, symbols=, start=, end=)` — small minute slices (opens/closes its own connection)
+- `series_rel(con, ...)` — same filters as a DuckDB relation (caller owns `con`)
+- `underlying_minute(underlying, ...)` — glob all expiries under `minute/<UL>/`
+- `file_info(path)` → `(bytes, rows, min_ts, max_ts)` via Parquet footer metadata
+- In-memory DuckDB: `memory_limit=4GB`, modest threads, temp dir under `_staging/duckdb_tmp`
+
+### Offline check
+`uv run python -m ohlcv.selftest` (includes Phase 4 status/read tests).
 
 ## Portfolio data (verified 2026-10-25 sample `data/samples/20261025-121155`)
 APIs: `holdings()`, `positions()` → `{net, day}`, `mf_holdings()`. No historical portfolio or demat txn API.

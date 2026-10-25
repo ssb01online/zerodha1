@@ -687,6 +687,329 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             con.close()
 
 
+def _catalog_ro():
+    """Open catalog read-only; exit with a clear message on lock."""
+    from . import catalog
+
+    try:
+        return catalog.connect(read_only=True)
+    except catalog.CatalogLocked as exc:
+        raise SystemExit(
+            "a daily/fetch run (or notebook) holds catalog.duckdb; "
+            "retry after it finishes"
+        ) from exc
+    except Exception as exc:
+        # DuckDB raises IOException when the file does not exist under read_only.
+        msg = str(exc).lower()
+        if "cannot open" in msg or "no such file" in msg or "does not exist" in msg:
+            from .paths import CATALOG_PATH
+
+            raise SystemExit(
+                f"catalog not found: {CATALOG_PATH}\n"
+                "Run: uv run ohlcv sync"
+            ) from exc
+        raise
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    from collections import defaultdict
+
+    from . import catalog
+    from . import status as status_mod
+    from .paths import CATALOG_PATH, ymd as paths_ymd
+
+    expiry_filter = _parse_ymd(args.expiry) if args.expiry else None
+    con = _catalog_ro()
+    try:
+        rows = status_mod.series_status(
+            con,
+            include_all=args.all,
+            expiry=expiry_filter,
+            underlying=args.underlying,
+        )
+        if args.limit is not None and args.limit >= 0:
+            rows = rows[: args.limit]
+
+        print(
+            f"{'expiry':<10} {'underlying':<14} {'ctr':>5} {'done%':>6} "
+            f"{'part':>4} {'err':>4} {'give':>4} {'miss':>4} "
+            f"{'pend':>5} {'est_m':>6} {'MB':>7} {'rows':>8} {'watermark':<16}"
+        )
+        print("-" * 110)
+        for r in rows:
+            wm = status_mod.watermark_label(r.max_fetched_to)
+            mb = r.file_bytes / (1024 * 1024) if r.file_bytes else 0.0
+            print(
+                f"{paths_ymd(r.expiry):<10} {r.underlying:<14} {r.contracts:>5} "
+                f"{r.complete_pct:>5.0f}% {r.partial:>4} {r.error:>4} "
+                f"{r.gave_up:>4} {r.missing:>4} {r.pending_requests:>5} "
+                f"{r.estimated_minutes:>6.1f} {mb:>7.1f} {r.file_rows:>8,} {wm:<16}"
+            )
+
+        by_expiry: dict = defaultdict(list)
+        for r in rows:
+            by_expiry[r.expiry].append(r)
+        print()
+        print("Subtotals by expiry:")
+        for expiry in sorted(by_expiry):
+            group = by_expiry[expiry]
+            t = status_mod.totals(group)
+            print(
+                f"  {paths_ymd(expiry)}: {t.series} series, {t.contracts} contracts, "
+                f"{t.complete_pct:.0f}% complete, {t.pending_requests} pending, "
+                f"~{t.estimated_minutes:.1f} min, {status_mod.format_bytes(t.file_bytes)}"
+            )
+        grand = status_mod.totals(rows)
+        print(
+            f"Total: {grand.series} series, {grand.contracts} contracts, "
+            f"{grand.complete_pct:.0f}% complete, {grand.pending_requests} pending, "
+            f"~{grand.estimated_minutes:.1f} min, {status_mod.format_bytes(grand.file_bytes)}"
+        )
+
+        print()
+        print("Daily snapshots (latest 5):")
+        snaps = catalog.list_snapshots(con, limit=5)
+        if not snaps:
+            print("  (none)")
+        else:
+            for s in snaps:
+                print(
+                    f"  {paths_ymd(s.trade_date)} status={s.status} "
+                    f"contracts={s.contracts} traded={s.traded_contracts} "
+                    f"missing={s.missing} volume={s.total_volume:,}"
+                )
+        gaps = status_mod.snapshot_gaps(con)
+        if gaps:
+            gap_text = ", ".join(paths_ymd(d) for d in gaps[:20])
+            extra = f" (+{len(gaps) - 20} more)" if len(gaps) > 20 else ""
+            print(
+                f"Missing final snapshots (weekdays; may include holidays): "
+                f"{gap_text}{extra}"
+            )
+        else:
+            print("Missing final snapshots: none")
+
+        print()
+        print(f"Recent runs (last {args.runs}):")
+        runs = catalog.list_runs(con, limit=args.runs)
+        if not runs:
+            print("  (none)")
+        else:
+            for run in runs:
+                if run.finished_at is None:
+                    dur = "running or crashed"
+                else:
+                    secs = (run.finished_at - run.started_at).total_seconds()
+                    if secs < 60:
+                        dur = f"{secs:.0f}s"
+                    else:
+                        dur = f"{secs / 60:.1f}m"
+                note = (run.note or "")[:60]
+                started = run.started_at.strftime("%Y-%m-%d %H:%M")
+                print(
+                    f"  #{run.run_id} {run.command:<8} {started} {dur:>16} "
+                    f"req={run.requests} retry={run.retries} err={run.errors}"
+                    + (f"  {note}" if note else "")
+                )
+        print(f"Catalog: {CATALOG_PATH}")
+    finally:
+        con.close()
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    from . import catalog
+    from . import read as read_mod
+    from . import status as status_mod
+    from .paths import CATALOG_PATH, sanitize_underlying, ymd as paths_ymd
+
+    expiry = _parse_ymd(args.expiry)
+    underlying = args.underlying.strip()
+    if args.symbol and args.token is not None:
+        raise SystemExit("use either --symbol or --token, not both")
+
+    con = _catalog_ro()
+    try:
+        # Resolve catalog name: accept M&M or M_M.
+        contracts = catalog.list_contracts(con, expiry=expiry)
+        name_map = {
+            sanitize_underlying(c.underlying): c.underlying for c in contracts
+        }
+        # Also search all contracts if expiry filter returned nothing for name map.
+        if not name_map:
+            name_map = {
+                sanitize_underlying(c.underlying): c.underlying
+                for c in catalog.list_contracts(con)
+            }
+        catalog_ul = name_map.get(sanitize_underlying(underlying), underlying)
+        series_contracts = [
+            c
+            for c in catalog.list_contracts(con, underlying=catalog_ul, expiry=expiry)
+        ]
+        path = read_mod.minute_path(catalog_ul, expiry)
+        try:
+            file_bytes, file_rows, min_ts, max_ts = read_mod.file_info(path)
+        except FileNotFoundError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        print(f"Series: {catalog_ul} {paths_ymd(expiry)}")
+        print(f"File: {path}")
+        print(
+            f"Size: {status_mod.format_bytes(file_bytes)}  rows={file_rows:,}  "
+            f"ts=[{status_mod.watermark_label(min_ts)} .. "
+            f"{status_mod.watermark_label(max_ts)}]"
+        )
+        print(f"Catalog contracts: {len(series_contracts)}")
+
+        duck = read_mod.connect()
+        try:
+            if args.symbol or args.token is not None:
+                match = None
+                if args.token is not None:
+                    match = next(
+                        (c for c in series_contracts if c.token == args.token), None
+                    )
+                elif args.symbol:
+                    match = next(
+                        (
+                            c
+                            for c in series_contracts
+                            if c.tradingsymbol == args.symbol
+                        ),
+                        None,
+                    )
+                state = None
+                if match is not None:
+                    state = catalog.get_fetch_state(con, match.token, "minute")
+                    print(
+                        f"Contract: {match.tradingsymbol} token={match.token} "
+                        f"type={match.instrument_type} strike={match.strike}"
+                    )
+                elif args.symbol:
+                    print(f"Contract: {args.symbol} (not in catalog for this series)")
+                else:
+                    print(f"Contract: token={args.token} (not in catalog for this series)")
+
+                if state is not None:
+                    print(
+                        f"fetch_state: status={state.status} "
+                        f"fetched_to={status_mod.watermark_label(state.fetched_to)} "
+                        f"attempts={state.attempts} rows_total={state.rows_total}"
+                    )
+                    if state.last_error:
+                        print(f"  last_error: {state.last_error[:120]}")
+                else:
+                    print("fetch_state: (none)")
+
+                day_rows = duck.execute(
+                    """
+                    SELECT CAST(ts AS DATE) AS trade_date,
+                           COUNT(*) AS bars,
+                           SUM(volume) AS volume,
+                           arg_max(oi, ts) AS last_oi,
+                           MIN(ts) AS first_ts,
+                           MAX(ts) AS last_ts
+                    FROM read_parquet(?)
+                    WHERE (? IS NULL OR token = ?)
+                      AND (? IS NULL OR tradingsymbol = ?)
+                    GROUP BY 1
+                    ORDER BY 1
+                    """,
+                    [
+                        str(path),
+                        args.token,
+                        args.token,
+                        args.symbol,
+                        args.symbol,
+                    ],
+                ).fetchall()
+                print()
+                print(
+                    f"{'date':<12} {'bars':>6} {'volume':>12} "
+                    f"{'last_oi':>10} {'first':<16} {'last':<16}"
+                )
+                print("-" * 78)
+                if not day_rows:
+                    print("  (no bars)")
+                for row in day_rows:
+                    print(
+                        f"{str(row[0])[:10]:<12} {int(row[1]):>6} {int(row[2] or 0):>12,} "
+                        f"{int(row[3] or 0):>10,} "
+                        f"{status_mod.watermark_label(row[4]):<16} "
+                        f"{status_mod.watermark_label(row[5]):<16}"
+                    )
+
+                tail_n = max(0, int(args.tail))
+                if tail_n > 0:
+                    bars = read_mod.series(
+                        catalog_ul,
+                        expiry,
+                        tokens=[args.token] if args.token is not None else None,
+                        symbols=[args.symbol] if args.symbol else None,
+                    )
+                    print()
+                    print(f"Last {tail_n} bars:")
+                    for d in bars[-tail_n:]:
+                        print(
+                            f"  {d.get('ts')} o={d.get('open')} h={d.get('high')} "
+                            f"l={d.get('low')} c={d.get('close')} "
+                            f"v={d.get('volume')} oi={d.get('oi')}"
+                        )
+            else:
+                overview = duck.execute(
+                    """
+                    SELECT
+                        instrument_type,
+                        COUNT(DISTINCT token) AS contracts,
+                        COUNT(*) AS rows
+                    FROM read_parquet(?)
+                    GROUP BY instrument_type
+                    ORDER BY instrument_type
+                    """,
+                    [str(path)],
+                ).fetchall()
+                tokens_with = duck.execute(
+                    "SELECT COUNT(DISTINCT token) FROM read_parquet(?)",
+                    [str(path)],
+                ).fetchone()
+                n_with = int(tokens_with[0] or 0) if tokens_with else 0
+                print(
+                    f"Contracts with data: {n_with} / {len(series_contracts)}"
+                )
+                print()
+                print(f"{'type':<6} {'contracts':>10} {'rows':>12}")
+                print("-" * 32)
+                for row in overview:
+                    print(
+                        f"{str(row[0]):<6} {int(row[1]):>10} {int(row[2]):>12,}"
+                    )
+
+                top = duck.execute(
+                    """
+                    SELECT token, ANY_VALUE(tradingsymbol) AS symbol,
+                           SUM(volume) AS volume
+                    FROM read_parquet(?)
+                    GROUP BY token
+                    ORDER BY volume DESC
+                    LIMIT 10
+                    """,
+                    [str(path)],
+                ).fetchall()
+                print()
+                print("Top 10 by volume:")
+                print(f"{'#':<4} {'symbol':<24} {'token':>10} {'volume':>14}")
+                print("-" * 56)
+                for i, row in enumerate(top, start=1):
+                    print(
+                        f"{i:<4} {str(row[1]):<24} {int(row[0]):>10} "
+                        f"{int(row[2] or 0):>14,}"
+                    )
+        finally:
+            duck.close()
+        print(f"Catalog: {CATALOG_PATH}")
+    finally:
+        con.close()
+
+
 def cmd_queue(args: argparse.Namespace) -> None:
     from . import catalog
     from . import planner
@@ -794,7 +1117,9 @@ def cmd_queue(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ohlcv",
-        description="NFO OHLCV tools (probe, sync, rank, queue, daily, fetch).",
+        description=(
+            "NFO OHLCV tools (probe, sync, rank, queue, daily, fetch, status, show)."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -917,6 +1242,70 @@ def main() -> None:
         help="Write run log to PATH (default: data/ohlcv/nfo/logs/fetch_YYYYMMDD_HHMMSS.log).",
     )
     p_fetch.set_defaults(func=cmd_fetch)
+
+    p_status = sub.add_parser(
+        "status",
+        help="Offline progress report: series completion, snapshot gaps, recent runs.",
+    )
+    p_status.add_argument(
+        "--all",
+        action="store_true",
+        help="Include every series with a minute/*.parquet file (not just the live queue).",
+    )
+    p_status.add_argument(
+        "--expiry",
+        default=None,
+        help="Filter to one expiry (yyyymmdd or YYYY-MM-DD).",
+    )
+    p_status.add_argument(
+        "--underlying",
+        default=None,
+        help="Filter to one underlying name (e.g. NIFTY or M&M).",
+    )
+    p_status.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Print at most N series rows.",
+    )
+    p_status.add_argument(
+        "--runs",
+        type=int,
+        default=5,
+        help="How many recent catalog runs to list (default 5).",
+    )
+    p_status.set_defaults(func=cmd_status)
+
+    p_show = sub.add_parser(
+        "show",
+        help="Inspect one minute series file (offline).",
+    )
+    p_show.add_argument(
+        "underlying",
+        help="Underlying name (catalog form, e.g. NIFTY or M&M).",
+    )
+    p_show.add_argument(
+        "expiry",
+        help="Expiry yyyymmdd or YYYY-MM-DD.",
+    )
+    p_show.add_argument(
+        "--symbol",
+        default=None,
+        help="Filter to one tradingsymbol.",
+    )
+    p_show.add_argument(
+        "--token",
+        type=int,
+        default=None,
+        help="Filter to one instrument_token.",
+    )
+    p_show.add_argument(
+        "--tail",
+        type=int,
+        default=5,
+        help="With --symbol/--token, print the last N bars (default 5).",
+    )
+    p_show.set_defaults(func=cmd_show)
 
     args = parser.parse_args()
     args.func(args)

@@ -678,3 +678,88 @@ def previous_session(
     if row is None or row[0] is None:
         return None
     return _as_date(row[0])
+
+
+@dataclass(frozen=True)
+class RunRow:
+    run_id: int
+    command: str
+    started_at: datetime
+    finished_at: datetime | None
+    requests: int
+    retries: int
+    errors: int
+    note: str | None
+
+
+def list_runs(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    limit: int = 10,
+) -> list[RunRow]:
+    """Return recent runs, newest first."""
+    rows = con.execute(
+        """
+        SELECT run_id, command, started_at, finished_at, requests, retries, errors, note
+        FROM runs
+        ORDER BY run_id DESC
+        LIMIT ?
+        """,
+        [limit],
+    ).fetchall()
+    out: list[RunRow] = []
+    for row in rows:
+        out.append(
+            RunRow(
+                run_id=int(row[0]),
+                command=str(row[1]),
+                started_at=_as_datetime(row[2]),
+                finished_at=_as_datetime(row[3]) if row[3] is not None else None,
+                requests=int(row[4] or 0),
+                retries=int(row[5] or 0),
+                errors=int(row[6] or 0),
+                note=row[7],
+            )
+        )
+    return out
+
+
+def list_snapshots(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    limit: int | None = None,
+) -> list[DailySnapshotMeta]:
+    """Return daily snapshots ordered by trade_date descending."""
+    if limit is None:
+        rows = con.execute(
+            """
+            SELECT trade_date, status, taken_at, contracts, traded_contracts,
+                   missing, total_volume, path
+            FROM daily_snapshots
+            ORDER BY trade_date DESC
+            """
+        ).fetchall()
+    else:
+        rows = con.execute(
+            """
+            SELECT trade_date, status, taken_at, contracts, traded_contracts,
+                   missing, total_volume, path
+            FROM daily_snapshots
+            ORDER BY trade_date DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+    return [
+        DailySnapshotMeta(
+            trade_date=_as_date(row[0]),
+            status=str(row[1]),
+            taken_at=_as_datetime(row[2]),
+            contracts=int(row[3]),
+            traded_contracts=int(row[4]),
+            missing=int(row[5]),
+            total_volume=int(row[6]),
+            path=str(row[7]),
+        )
+        for row in rows
+    ]

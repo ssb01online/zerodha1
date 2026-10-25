@@ -1,4 +1,4 @@
-"""Offline self-tests for ohlcv Phases 1–3. No Kite login required.
+"""Offline self-tests for ohlcv Phases 1–4. No Kite login required.
 
 Run: uv run python -m ohlcv.selftest
 """
@@ -29,6 +29,7 @@ from . import planner
 from . import rank as rank_mod
 from . import read as read_mod
 from . import snapshot
+from . import status as status_mod
 from . import universe
 from .client import (
     KiteClient,
@@ -1502,6 +1503,433 @@ def test_fetch_soft_interrupt_commits_and_stops() -> None:
             con.close()
 
 
+def _write_tiny_minute_parquet(
+    *,
+    contracts: list[catalog.ContractRow],
+    spool_rows: list[dict[str, Any]],
+    dest: Path,
+    staging_dir: Path,
+) -> int:
+    """Write a tiny minute series parquet via fetch.merge_series_parquet."""
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, spool_name = tempfile.mkstemp(prefix="ohlcv_spool_", suffix=".csv")
+    os.close(fd)
+    spool = Path(spool_name)
+    try:
+        import csv
+
+        with open(spool, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=["token", "ts", "open", "high", "low", "close", "volume", "oi"],
+            )
+            writer.writeheader()
+            for row in spool_rows:
+                writer.writerow(row)
+        return fetch_mod.merge_series_parquet(
+            existing=None,
+            spool_csv=spool,
+            contracts=contracts,
+            dest=dest,
+            staging_dir=staging_dir,
+        )
+    finally:
+        try:
+            spool.unlink()
+        except OSError:
+            pass
+
+
+def test_status_counts_and_pending() -> None:
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db = root / "c.duckdb"
+        minute_dir = root / "minute"
+        staging = root / "staging"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con,
+                underlying="NIFTY",
+                expiry=expiry,
+                tokens=[1, 2, 3, 4, 5],
+                seen_on=now.date(),
+            )
+            # done / partial / error / gave_up / missing(no row)
+            catalog.upsert_fetch_state(
+                con,
+                catalog.FetchState(
+                    token=1,
+                    interval="minute",
+                    fetched_to=datetime(2026, 10, 25, 15, 40, 0),
+                    status="done",
+                    rows_total=10,
+                    attempts=1,
+                    last_error=None,
+                    updated_at=now.replace(tzinfo=None),
+                ),
+            )
+            catalog.upsert_fetch_state(
+                con,
+                catalog.FetchState(
+                    token=2,
+                    interval="minute",
+                    fetched_to=datetime(2026, 10, 24, 12, 0, 0),
+                    status="partial",
+                    rows_total=5,
+                    attempts=1,
+                    last_error=None,
+                    updated_at=now.replace(tzinfo=None),
+                ),
+            )
+            catalog.upsert_fetch_state(
+                con,
+                catalog.FetchState(
+                    token=3,
+                    interval="minute",
+                    fetched_to=None,
+                    status="error",
+                    rows_total=0,
+                    attempts=2,
+                    last_error="boom",
+                    updated_at=now.replace(tzinfo=None),
+                ),
+            )
+            catalog.upsert_fetch_state(
+                con,
+                catalog.FetchState(
+                    token=4,
+                    interval="minute",
+                    fetched_to=None,
+                    status="gave_up",
+                    rows_total=0,
+                    attempts=3,
+                    last_error="gone",
+                    updated_at=now.replace(tzinfo=None),
+                ),
+            )
+            # token 5 = missing
+
+            rows = status_mod.series_status(
+                con, now=now, minute_dir=minute_dir
+            )
+            nifty = next(r for r in rows if r.underlying == "NIFTY" and r.expiry == expiry)
+            _assert(nifty.contracts == 5, f"contracts={nifty.contracts}")
+            _assert(nifty.done == 1, f"done={nifty.done}")
+            _assert(nifty.partial == 1, f"partial={nifty.partial}")
+            _assert(nifty.error == 1, f"error={nifty.error}")
+            _assert(nifty.gave_up == 1, f"gave_up={nifty.gave_up}")
+            _assert(nifty.missing == 1, f"missing={nifty.missing}")
+            # complete = done (watermark at target) + gave_up
+            _assert(nifty.complete == 2, f"complete={nifty.complete}")
+            _assert(nifty.pending_requests >= 1, f"pending={nifty.pending_requests}")
+
+            # Write a tiny file and check file_rows via status.
+            n = _write_tiny_minute_parquet(
+                contracts=list(series.contracts),
+                spool_rows=[
+                    {
+                        "token": 1,
+                        "ts": "2026-10-24 09:15:00",
+                        "open": 1,
+                        "high": 2,
+                        "low": 1,
+                        "close": 1.5,
+                        "volume": 10,
+                        "oi": 100,
+                    },
+                    {
+                        "token": 1,
+                        "ts": "2026-10-24 09:16:00",
+                        "open": 1.5,
+                        "high": 2,
+                        "low": 1.4,
+                        "close": 1.6,
+                        "volume": 5,
+                        "oi": 101,
+                    },
+                ],
+                dest=series_path(minute_dir, "NIFTY", expiry),
+                staging_dir=staging,
+            )
+            _assert(n == 2, f"rows written={n}")
+            rows2 = status_mod.series_status(con, now=now, minute_dir=minute_dir)
+            nifty2 = next(r for r in rows2 if r.underlying == "NIFTY")
+            _assert(nifty2.file_rows == 2, f"file_rows={nifty2.file_rows}")
+            _assert(nifty2.file_bytes > 0, "file_bytes")
+            tot = status_mod.totals(rows2)
+            _assert(tot.series >= 1, "totals series")
+            _assert(tot.file_bytes == nifty2.file_bytes, "totals bytes")
+        finally:
+            con.close()
+
+
+def test_status_include_all_maps_sanitized_folder() -> None:
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    # Expired + fully done so it drops out of default select_series unfinished set.
+    expired = date(2026, 10, 20)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db = root / "c.duckdb"
+        minute_dir = root / "minute"
+        staging = root / "staging"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con,
+                underlying="M&M",
+                expiry=expired,
+                tokens=[90],
+                seen_on=expired,
+            )
+            catalog.upsert_fetch_state(
+                con,
+                catalog.FetchState(
+                    token=90,
+                    interval="minute",
+                    fetched_to=datetime(2026, 10, 20, 15, 40, 0),
+                    status="done",
+                    rows_total=2,
+                    attempts=1,
+                    last_error=None,
+                    updated_at=now.replace(tzinfo=None),
+                ),
+            )
+            dest = series_path(minute_dir, "M&M", expired)
+            _assert("M_M" in str(dest), f"sanitized path={dest}")
+            _write_tiny_minute_parquet(
+                contracts=list(series.contracts),
+                spool_rows=[
+                    {
+                        "token": 90,
+                        "ts": "2026-10-20 09:15:00",
+                        "open": 1,
+                        "high": 1,
+                        "low": 1,
+                        "close": 1,
+                        "volume": 1,
+                        "oi": 1,
+                    }
+                ],
+                dest=dest,
+                staging_dir=staging,
+            )
+
+            default_rows = status_mod.series_status(con, now=now, minute_dir=minute_dir)
+            _assert(
+                not any(r.underlying == "M&M" and r.expiry == expired for r in default_rows),
+                "finished expired excluded from default",
+            )
+            all_rows = status_mod.series_status(
+                con, now=now, include_all=True, minute_dir=minute_dir
+            )
+            mm = next(r for r in all_rows if r.expiry == expired)
+            _assert(mm.underlying == "M&M", f"mapped underlying={mm.underlying}")
+            _assert(mm.file_rows == 1, f"file_rows={mm.file_rows}")
+            _assert(mm.live is False, "expired not live")
+        finally:
+            con.close()
+
+
+def test_snapshot_gaps_weekdays_only() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "c.duckdb"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            # Calendar (2026): Mon 19, Tue 20, Wed 21, Thu 22, Fri 23, Sat 24, Sun 25.
+            # Snapshots on Tue 20 + Thu 22; gaps should be Wed 21 + Fri 23.
+            for d, status in [
+                (date(2026, 10, 20), "final"),
+                (date(2026, 10, 22), "final"),
+            ]:
+                catalog.record_snapshot(
+                    con,
+                    catalog.DailySnapshotMeta(
+                        trade_date=d,
+                        status=status,
+                        taken_at=datetime(d.year, d.month, d.day, 16, 0),
+                        contracts=1,
+                        traded_contracts=1,
+                        missing=0,
+                        total_volume=1,
+                        path=f"{ymd(d)}.parquet",
+                    ),
+                )
+            # Fri 2026-10-23 after session → last = Fri (include Fri as a gap).
+            gaps = status_mod.snapshot_gaps(
+                con,
+                today=date(2026, 10, 23),
+                now=datetime(2026, 10, 23, 16, 0, 0, tzinfo=auth.IST),
+            )
+            _assert(date(2026, 10, 21) in gaps, f"wed missing in {gaps}")
+            _assert(date(2026, 10, 23) in gaps, f"fri missing in {gaps}")
+            _assert(date(2026, 10, 24) not in gaps, "weekend sat not included")
+            _assert(date(2026, 10, 25) not in gaps, "weekend sun not included")
+            _assert(date(2026, 10, 20) not in gaps, "present tue not a gap")
+            _assert(date(2026, 10, 22) not in gaps, "present thu not a gap")
+            # Before 15:40 on Fri → last = Thu (Fri not yet expected).
+            gaps_am = status_mod.snapshot_gaps(
+                con,
+                today=date(2026, 10, 23),
+                now=datetime(2026, 10, 23, 12, 0, 0, tzinfo=auth.IST),
+            )
+            _assert(date(2026, 10, 23) not in gaps_am, f"fri before close in {gaps_am}")
+            _assert(date(2026, 10, 21) in gaps_am, "wed still a gap before close")
+        finally:
+            con.close()
+
+
+def test_read_series_filters_and_file_info() -> None:
+    expiry = date(2026, 10, 27)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        minute_dir = root / "minute"
+        staging = root / "staging"
+        contracts = [
+            catalog.ContractRow(
+                1, "NIFTY", expiry, "NIFTY1", "FUT", 0.0, 50
+            ),
+            catalog.ContractRow(
+                2, "NIFTY", expiry, "NIFTY2", "CE", 25000.0, 50
+            ),
+        ]
+        dest = series_path(minute_dir, "NIFTY", expiry)
+        _write_tiny_minute_parquet(
+            contracts=contracts,
+            spool_rows=[
+                {
+                    "token": 1,
+                    "ts": "2026-10-24 09:15:00",
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100.5,
+                    "volume": 10,
+                    "oi": 1,
+                },
+                {
+                    "token": 1,
+                    "ts": "2026-10-24 09:16:00",
+                    "open": 100.5,
+                    "high": 102,
+                    "low": 100,
+                    "close": 101,
+                    "volume": 20,
+                    "oi": 2,
+                },
+                {
+                    "token": 2,
+                    "ts": "2026-10-24 09:15:00",
+                    "open": 50,
+                    "high": 51,
+                    "low": 49,
+                    "close": 50.5,
+                    "volume": 5,
+                    "oi": 3,
+                },
+            ],
+            dest=dest,
+            staging_dir=staging,
+        )
+        size, rows, min_ts, max_ts = read_mod.file_info(dest)
+        _assert(size > 0, "size")
+        _assert(rows == 3, f"rows={rows}")
+        _assert(min_ts is not None and max_ts is not None, "ts span")
+        _assert(min_ts <= max_ts, "min<=max")
+
+        by_token = read_mod.series(
+            "NIFTY", expiry, tokens=[1], minute_dir=minute_dir
+        )
+        _assert(len(by_token) == 2, f"token filter={len(by_token)}")
+        _assert(all(r["token"] == 1 for r in by_token), "all token 1")
+
+        by_sym = read_mod.series(
+            "NIFTY", expiry, symbols=["NIFTY2"], minute_dir=minute_dir
+        )
+        _assert(len(by_sym) == 1, f"symbol filter={len(by_sym)}")
+        _assert(by_sym[0]["tradingsymbol"] == "NIFTY2", "symbol")
+
+        by_time = read_mod.series(
+            "NIFTY",
+            expiry,
+            start=datetime(2026, 10, 24, 9, 16, 0),
+            end=datetime(2026, 10, 24, 9, 16, 0),
+            minute_dir=minute_dir,
+        )
+        _assert(len(by_time) == 1, f"time filter={len(by_time)}")
+
+        raised = False
+        try:
+            read_mod.series("NIFTY", date(2026, 1, 1), minute_dir=minute_dir)
+        except FileNotFoundError:
+            raised = True
+        _assert(raised, "missing series raises")
+
+        raised2 = False
+        try:
+            read_mod.file_info(root / "nope.parquet")
+        except FileNotFoundError:
+            raised2 = True
+        _assert(raised2, "missing file_info raises")
+
+        # underlying_minute glob
+        all_rows = read_mod.underlying_minute(
+            "NIFTY", instrument_type="CE", minute_dir=minute_dir
+        )
+        _assert(len(all_rows) == 1, f"underlying CE={len(all_rows)}")
+
+
+def test_catalog_readonly_open() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "c.duckdb"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            catalog.start_run(
+                con, "sync", started_at=datetime(2026, 10, 25, 10, 0, 0)
+            )
+            catalog.finish_run(
+                con,
+                1,
+                finished_at=datetime(2026, 10, 25, 10, 1, 0),
+                requests=0,
+                note="ok",
+            )
+            catalog.record_snapshot(
+                con,
+                catalog.DailySnapshotMeta(
+                    trade_date=date(2026, 10, 24),
+                    status="final",
+                    taken_at=datetime(2026, 10, 24, 16, 0),
+                    contracts=1,
+                    traded_contracts=1,
+                    missing=0,
+                    total_volume=1,
+                    path="x.parquet",
+                ),
+            )
+        finally:
+            con.close()
+
+        ro = catalog.connect(db, read_only=True)
+        try:
+            runs = catalog.list_runs(ro, limit=5)
+            _assert(len(runs) == 1, f"runs={len(runs)}")
+            _assert(runs[0].command == "sync", "command")
+            _assert(runs[0].note == "ok", "note")
+            snaps = catalog.list_snapshots(ro, limit=5)
+            _assert(len(snaps) == 1, f"snaps={len(snaps)}")
+            _assert(snaps[0].trade_date == date(2026, 10, 24), "snap date")
+        finally:
+            ro.close()
+
+
 def main() -> None:
     tests = [
         test_paths,
@@ -1529,6 +1957,11 @@ def main() -> None:
         test_setup_run_logging_writes_file,
         test_interrupt_soft_then_force,
         test_fetch_soft_interrupt_commits_and_stops,
+        test_status_counts_and_pending,
+        test_status_include_all_maps_sanitized_folder,
+        test_snapshot_gaps_weekdays_only,
+        test_read_series_filters_and_file_info,
+        test_catalog_readonly_open,
     ]
     failed = 0
     for fn in tests:

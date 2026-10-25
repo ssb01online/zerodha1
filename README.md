@@ -132,10 +132,24 @@ uv run ohlcv fetch --dry-run
 uv run ohlcv fetch --max-series 1          # smoke: one series
 uv run ohlcv fetch --expiry 20261027       # one expiry, all underlyings
 uv run ohlcv fetch --max-minutes 30        # time-budgeted; resumes next run
+uv run ohlcv status                        # offline: completion, snapshot gaps, recent runs
+uv run ohlcv show NIFTY 20261027           # inspect one minute series file
 uv run python -m ohlcv.selftest
 ```
 
-Data under gitignored `data/ohlcv/nfo/`: `catalog.duckdb`, `daily/yyyymmdd.parquet`, `minute/<UL>/yyyymmdd.parquet`. Notes: `ref/kite/notes.md` (OHLCV Phases 0–3). Close notebooks holding the catalog or series files before a fetch (Windows locks).
+Typical session-day flow after 15:40 IST: `daily` → `fetch` → `status`.
+
+Read helpers (notebooks / scripts):
+
+```python
+from datetime import date
+from ohlcv import read
+
+rows = read.series("NIFTY", date(2026, 10, 27), symbols=["NIFTY26O2725000CE"])
+snap = read.daily(date(2026, 10, 24))
+```
+
+Data under gitignored `data/ohlcv/nfo/`: `catalog.duckdb`, `daily/yyyymmdd.parquet`, `minute/<UL>/yyyymmdd.parquet`. Notes: `ref/kite/notes.md` (OHLCV Phases 0–4). Close notebooks holding the catalog or series files before a fetch (Windows locks).
 
 ---
 
