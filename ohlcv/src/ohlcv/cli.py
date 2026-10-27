@@ -456,17 +456,25 @@ def _cmd_daily_show(args: argparse.Namespace) -> None:
             con.close()
 
 
-def cmd_fetch(args: argparse.Namespace) -> None:
+def _cmd_fetch_interval(args: argparse.Namespace, *, interval: str) -> None:
     from . import catalog
     from . import fetch as fetch_mod
     from . import planner
     from . import rank as rank_mod
     from . import universe
     from .client import KiteClient, SessionExpired
-    from .paths import CATALOG_PATH, MINUTE_DIR, ymd as paths_ymd
+    from .paths import CATALOG_PATH, DAY_DIR, MINUTE_DIR, ymd as paths_ymd
+    from .planner import IntervalName
     from .progress import InterruptController, ProgressReporter, setup_run_logging
 
-    log_path = setup_run_logging("fetch", log_file=_optional_log_path(args))
+    if interval not in ("minute", "day"):
+        raise SystemExit(f"unsupported interval: {interval}")
+    iv: IntervalName = interval  # type: ignore[assignment]
+    run_name = "fetch-day" if iv == "day" else "fetch"
+    series_root = DAY_DIR if iv == "day" else MINUTE_DIR
+    dir_label = "Day dir" if iv == "day" else "Minute dir"
+
+    log_path = setup_run_logging(run_name, log_file=_optional_log_path(args))
     reporter = ProgressReporter(logger=logging.getLogger("ohlcv"))
     interrupt = InterruptController()
     interrupt.install(on_soft_stop=reporter.soft_stop_announced)
@@ -482,7 +490,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 
         client = None
         catalog.ensure_schema(con)
-        run_id = catalog.start_run(con, "fetch", started_at=started.replace(tzinfo=None))
+        run_id = catalog.start_run(con, run_name, started_at=started.replace(tzinfo=None))
         try:
             count, archive_path = _run_sync(con)
         except (auth.NotLoggedIn, TokenException) as exc:
@@ -505,10 +513,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             raise SystemExit(str(exc)) from exc
 
         reporter.note(f"Synced {count} NFO contracts (archive {archive_path})")
-        series = universe.select_series(con)
+        series = universe.select_series(con, interval=iv)
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
-        fetch_states = catalog.list_fetch_states(con, interval="minute", tokens=tokens)
+        fetch_states = catalog.list_fetch_states(con, interval=iv, tokens=tokens)
         now = datetime.now(auth.IST)
         items = planner.build_queue(
             series,
@@ -518,6 +526,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             expiry_filter=expiry_filter,
             underlying_filter=args.underlying,
             limit=args.max_series,
+            interval=iv,
         )
         series_by_key = {(s.underlying, s.expiry): s for s in series}
         queue_series = [
@@ -539,7 +548,12 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             total_skip = 0
             for item, s in zip(items, queue_series):
                 skip_n = fetch_mod.count_skippable(
-                    con, s, fetch_states, now=now, untraded_cache=skip_cache
+                    con,
+                    s,
+                    fetch_states,
+                    now=now,
+                    untraded_cache=skip_cache,
+                    interval=iv,
                 )
                 # Approximate: each skip removes one pending request.
                 adj_req = max(0, item.pending_requests - skip_n)
@@ -556,13 +570,13 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 run_id,
                 finished_at=datetime.now(auth.IST).replace(tzinfo=None),
                 note=(
-                    f"dry_run series={len(items)} requests~={total_req} "
+                    f"dry_run interval={iv} series={len(items)} requests~={total_req} "
                     f"skip~={total_skip}"
                 ),
             )
             print()
             print(
-                f"Dry run: {len(items)} series, ~{total_req} requests "
+                f"Dry run ({iv}): {len(items)} series, ~{total_req} requests "
                 f"(~{total_skip} untraded skips), ~{total_sec / 60:.1f} min"
             )
             print(f"Catalog: {CATALOG_PATH}")
@@ -585,7 +599,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         contracts_total = sum(len(s.contracts) for s in queue_series)
         reporter.set_totals(contracts_total=contracts_total)
         reporter.note(
-            f"Fetch queue: {len(queue_series)} series, {contracts_total} contracts"
+            f"Fetch queue ({iv}): {len(queue_series)} series, {contracts_total} contracts"
         )
 
         def _on_series_start(idx: int, total: int, s: universe.Series) -> None:
@@ -622,6 +636,8 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 now=now,
                 max_series=args.max_series,
                 max_minutes=args.max_minutes,
+                interval=iv,
+                series_root=series_root,
                 on_series=_on_series,
                 on_contract=reporter.contract,
                 on_series_start=_on_series_start,
@@ -641,6 +657,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 
         finished = datetime.now(auth.IST).replace(tzinfo=None)
         note_parts = [
+            f"interval={iv}",
             f"series_done={run.series_done}",
             f"fetched={run.contracts_fetched}",
             f"skipped={run.contracts_skipped}",
@@ -668,7 +685,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         reporter.clear_heartbeat()
         print()
         print(
-            f"Done: {run.series_done} series, fetched={run.contracts_fetched}, "
+            f"Done ({iv}): {run.series_done} series, fetched={run.contracts_fetched}, "
             f"skipped={run.contracts_skipped}, rows={run.rows_written:,}, "
             f"errors={run.errors}, gave_up={run.gave_up}"
         )
@@ -678,13 +695,21 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 print(f"  {u} {paths_ymd(e)}")
         if run.stopped_reason:
             print(f"Stopped: {run.stopped_reason}")
-        print(f"Minute dir: {MINUTE_DIR}")
+        print(f"{dir_label}: {series_root}")
         print(f"Catalog: {CATALOG_PATH}")
         print(f"Log: {log_path}")
     finally:
         interrupt.restore()
         if con is not None:
             con.close()
+
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    _cmd_fetch_interval(args, interval="minute")
+
+
+def cmd_fetch_day(args: argparse.Namespace) -> None:
+    _cmd_fetch_interval(args, interval="day")
 
 
 def _catalog_ro():
@@ -718,6 +743,9 @@ def cmd_status(args: argparse.Namespace) -> None:
     from . import status as status_mod
     from .paths import CATALOG_PATH, ymd as paths_ymd
 
+    interval = getattr(args, "interval", "minute") or "minute"
+    if interval not in ("minute", "day"):
+        raise SystemExit(f"unsupported --interval: {interval}")
     expiry_filter = _parse_ymd(args.expiry) if args.expiry else None
     con = _catalog_ro()
     try:
@@ -726,7 +754,9 @@ def cmd_status(args: argparse.Namespace) -> None:
             include_all=args.all,
             expiry=expiry_filter,
             underlying=args.underlying,
+            interval=interval,
         )
+        print(f"Interval: {interval}")
         if args.limit is not None and args.limit >= 0:
             rows = rows[: args.limit]
 
@@ -845,13 +875,16 @@ def cmd_show(args: argparse.Namespace) -> None:
             c
             for c in catalog.list_contracts(con, underlying=catalog_ul, expiry=expiry)
         ]
-        path = read_mod.minute_path(catalog_ul, expiry)
+        interval = getattr(args, "interval", "minute") or "minute"
+        if interval not in ("minute", "day"):
+            raise SystemExit(f"unsupported --interval: {interval}")
+        path = read_mod.series_file_path(catalog_ul, expiry, interval=interval)
         try:
             file_bytes, file_rows, min_ts, max_ts = read_mod.file_info(path)
         except FileNotFoundError as exc:
             raise SystemExit(str(exc)) from exc
 
-        print(f"Series: {catalog_ul} {paths_ymd(expiry)}")
+        print(f"Series: {catalog_ul} {paths_ymd(expiry)}  interval={interval}")
         print(f"File: {path}")
         print(
             f"Size: {status_mod.format_bytes(file_bytes)}  rows={file_rows:,}  "
@@ -879,7 +912,7 @@ def cmd_show(args: argparse.Namespace) -> None:
                     )
                 state = None
                 if match is not None:
-                    state = catalog.get_fetch_state(con, match.token, "minute")
+                    state = catalog.get_fetch_state(con, match.token, interval)
                     print(
                         f"Contract: {match.tradingsymbol} token={match.token} "
                         f"type={match.instrument_type} strike={match.strike}"
@@ -1047,10 +1080,13 @@ def cmd_queue(args: argparse.Namespace) -> None:
             )
             raise SystemExit(str(exc)) from exc
 
-        series = universe.select_series(con)
+        interval = getattr(args, "interval", "minute") or "minute"
+        if interval not in ("minute", "day"):
+            raise SystemExit(f"unsupported --interval: {interval}")
+        series = universe.select_series(con, interval=interval)
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
-        fetch_states = catalog.list_fetch_states(con, interval="minute", tokens=tokens)
+        fetch_states = catalog.list_fetch_states(con, interval=interval, tokens=tokens)
         now = datetime.now(auth.IST)
         items = planner.build_queue(
             series,
@@ -1060,16 +1096,18 @@ def cmd_queue(args: argparse.Namespace) -> None:
             expiry_filter=expiry_filter,
             underlying_filter=args.underlying,
             limit=args.limit,
+            interval=interval,
         )
 
         catalog.finish_run(
             con,
             run_id,
             finished_at=datetime.now(auth.IST).replace(tzinfo=None),
-            note=f"series={len(items)} contracts_synced={count}",
+            note=f"interval={interval} series={len(items)} contracts_synced={count}",
         )
 
         print(f"Synced {count} NFO contracts (archive {archive_path})")
+        print(f"Interval: {interval}")
         if not ranks:
             print("Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering")
         print()
@@ -1118,7 +1156,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ohlcv",
         description=(
-            "NFO OHLCV tools (probe, sync, rank, queue, daily, fetch, status, show)."
+            "NFO OHLCV tools (probe, sync, rank, queue, daily, fetch, fetch-day, status, show)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1176,6 +1214,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Print at most N series rows.",
+    )
+    p_queue.add_argument(
+        "--interval",
+        choices=("minute", "day"),
+        default="minute",
+        help="Candle interval for pending-request estimates (default: minute).",
     )
     p_queue.set_defaults(func=cmd_queue)
 
@@ -1243,6 +1287,45 @@ def main() -> None:
     )
     p_fetch.set_defaults(func=cmd_fetch)
 
+    p_fetch_day = sub.add_parser(
+        "fetch-day",
+        help="Fetch day candles for queued NFO series (full history ~2000d, incremental).",
+    )
+    p_fetch_day.add_argument(
+        "--expiry",
+        default=None,
+        help="Filter to one expiry (yyyymmdd or YYYY-MM-DD).",
+    )
+    p_fetch_day.add_argument(
+        "--underlying",
+        default=None,
+        help="Filter to one underlying name (e.g. NIFTY).",
+    )
+    p_fetch_day.add_argument(
+        "--max-series",
+        type=int,
+        default=None,
+        help="Process at most N series then stop (commits progress).",
+    )
+    p_fetch_day.add_argument(
+        "--max-minutes",
+        type=float,
+        default=None,
+        help="Stop after about M minutes (finishes current contract, then commits).",
+    )
+    p_fetch_day.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print queue and skip estimates without calling historical_data().",
+    )
+    p_fetch_day.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Write run log to PATH (default: data/ohlcv/nfo/logs/fetch-day_YYYYMMDD_HHMMSS.log).",
+    )
+    p_fetch_day.set_defaults(func=cmd_fetch_day)
+
     p_status = sub.add_parser(
         "status",
         help="Offline progress report: series completion, snapshot gaps, recent runs.",
@@ -1250,7 +1333,7 @@ def main() -> None:
     p_status.add_argument(
         "--all",
         action="store_true",
-        help="Include every series with a minute/*.parquet file (not just the live queue).",
+        help="Include every series with a series parquet file (not just the live queue).",
     )
     p_status.add_argument(
         "--expiry",
@@ -1261,6 +1344,12 @@ def main() -> None:
         "--underlying",
         default=None,
         help="Filter to one underlying name (e.g. NIFTY or M&M).",
+    )
+    p_status.add_argument(
+        "--interval",
+        choices=("minute", "day"),
+        default="minute",
+        help="Candle interval (default: minute).",
     )
     p_status.add_argument(
         "--limit",
@@ -1278,7 +1367,7 @@ def main() -> None:
 
     p_show = sub.add_parser(
         "show",
-        help="Inspect one minute series file (offline).",
+        help="Inspect one minute/day series file (offline).",
     )
     p_show.add_argument(
         "underlying",
@@ -1287,6 +1376,12 @@ def main() -> None:
     p_show.add_argument(
         "expiry",
         help="Expiry yyyymmdd or YYYY-MM-DD.",
+    )
+    p_show.add_argument(
+        "--interval",
+        choices=("minute", "day"),
+        default="minute",
+        help="Candle interval (default: minute).",
     )
     p_show.add_argument(
         "--symbol",

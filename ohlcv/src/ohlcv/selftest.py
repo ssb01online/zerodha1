@@ -473,6 +473,27 @@ def test_queue_order_and_chunks() -> None:
     _assert(rolled.hour == 9 and rolled.minute == 15, f"partial rollback={rolled}")
     _assert(rolled.date() == date(2026, 10, 24), "partial same day")
 
+    # Day backfill: 2000 inclusive days ⇒ 1 chunk; day_fetch_end after close = today 15:40
+    day_start = planner.default_day_backfill_start(now)
+    day_end = planner.day_fetch_end(now)
+    _assert(
+        (day_end.date() - day_start.date()).days + 1 == planner.DAY_BACKFILL_DAYS,
+        "day backfill inclusive span",
+    )
+    _assert(
+        planner.chunk_count(day_start, day_end, chunk_days=planner.DAY_CHUNK_DAYS) == 1,
+        "2000d day window = 1 chunk",
+    )
+    _assert(day_end.date() == now.date() and day_end.hour == 15, "day end after close = today")
+    before_close = datetime(2026, 10, 25, 12, 0, 0, tzinfo=auth.IST)
+    _assert(
+        planner.day_fetch_end(before_close).date() == date(2026, 10, 24),
+        "day end before close excludes today",
+    )
+    day_items = planner.build_queue(series, ranks, {}, now, interval="day")
+    _assert(day_items[0].pending_requests == 2, f"day nifty pending={day_items[0].pending_requests}")
+    _assert(day_items[1].pending_requests == 1, "day reliance 1 req")
+
 
 def _quote_payload(
     token: int,
@@ -889,6 +910,45 @@ def _synth_candles(
     return out
 
 
+def _synth_day_candles(
+    token: int,
+    from_date: Any,
+    to_date: Any,
+    *,
+    n: int = 5,
+    price: float = 100.0,
+) -> list[dict[str, Any]]:
+    """Synthetic day bars starting at from_date (or last n weekdays ending at to_date)."""
+    if isinstance(to_date, datetime):
+        end = to_date.date() if to_date.tzinfo is None else to_date.astimezone(auth.IST).date()
+    elif isinstance(to_date, date):
+        end = to_date
+    else:
+        end = date.fromisoformat(str(to_date)[:10])
+    days: list[date] = []
+    d = end
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    days.reverse()
+    out: list[dict[str, Any]] = []
+    for i, day in enumerate(days):
+        ts = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=auth.IST)
+        out.append(
+            {
+                "date": ts,
+                "open": price,
+                "high": price + 1,
+                "low": price - 1,
+                "close": price + 0.5,
+                "volume": 100 + i,
+                "oi": 2000 + i,
+            }
+        )
+    return out
+
+
 def _make_client(handler: Callable[..., Any]) -> tuple[KiteClient, FakeKite, FakeClock]:
     kite = FakeKite(handler)
     clock = FakeClock()
@@ -982,6 +1042,164 @@ def _snap_row(
         "sell_quantity": 0,
         "last_trade_time": f"{trade_date.isoformat()}T15:29:00+05:30",
     }
+
+
+def test_fetch_day_backfill_and_rerun() -> None:
+    """Day interval: one hist call per contract over multi-month span; parquet under day/."""
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+    call_spans: list[tuple[Any, Any]] = []
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        _assert(interval == "day", f"interval={interval}")
+        call_spans.append((from_date, to_date))
+        return _synth_day_candles(token, from_date, to_date, n=5, price=float(token))
+
+    client, kite, _clock = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db = root / "c.duckdb"
+        day_dir = root / "day"
+        staging = root / "staging"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="NIFTY", expiry=expiry, tokens=[20, 21], seen_on=now.date()
+            )
+            states: dict[int, catalog.FetchState] = {}
+            result = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                states,
+                now=now,
+                interval="day",
+                series_root=day_dir,
+                staging_dir=staging,
+            )
+            _assert(not result.locked, "not locked")
+            _assert(result.fetched == 2, f"fetched={result.fetched}")
+            _assert(result.path is not None and result.path.is_file(), "parquet written")
+            _assert(kite.calls == 2, f"hist calls={kite.calls}")
+            _assert(str(day_dir) in str(result.path), f"path under day/: {result.path}")
+            # Full ~2000d window still one request (span >> contract life).
+            for fr, to in call_spans:
+                fr_d = fr.date() if isinstance(fr, datetime) else date.fromisoformat(str(fr)[:10])
+                to_d = to.date() if isinstance(to, datetime) else date.fromisoformat(str(to)[:10])
+                _assert((to_d - fr_d).days + 1 >= 100, f"wide span {fr_d}..{to_d}")
+
+            dcon = duckdb.connect()
+            try:
+                rows = dcon.execute(
+                    "SELECT token, COUNT(*) FROM read_parquet(?) GROUP BY 1 ORDER BY 1",
+                    [str(result.path)],
+                ).fetchall()
+            finally:
+                dcon.close()
+            _assert(rows == [(20, 5), (21, 5)], f"rows={rows}")
+
+            st20 = catalog.get_fetch_state(con, 20, "day")
+            _assert(st20 is not None and st20.status == "done", f"status={st20}")
+            _assert(st20.interval == "day", "interval=day")
+            # Minute state untouched
+            _assert(catalog.get_fetch_state(con, 20, "minute") is None, "no minute state")
+
+            calls_before = kite.calls
+            result2 = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                states,
+                now=now,
+                interval="day",
+                series_root=day_dir,
+                staging_dir=staging,
+            )
+            _assert(kite.calls == calls_before, "rerun makes 0 hist calls")
+            _assert(result2.fetched == 0, "nothing fetched on rerun")
+            _assert(result2.skipped == 2, f"skipped={result2.skipped}")
+
+            loaded = read_mod.day_series("NIFTY", expiry, day_dir=day_dir)
+            _assert(len(loaded) == 10, f"day_series rows={len(loaded)}")
+        finally:
+            con.close()
+
+
+def test_fetch_day_excludes_today_before_close() -> None:
+    """During session, day_fetch_end is yesterday — today bars must not be stored."""
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=auth.IST)  # Friday midday
+    expiry = date(2026, 10, 27)
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        # Return yesterday + today day bars; today must be dropped.
+        yday = date(2026, 10, 23)
+        today = date(2026, 10, 24)
+        out = []
+        for day, vol in ((yday, 50), (today, 99)):
+            out.append(
+                {
+                    "date": datetime(day.year, day.month, day.day, tzinfo=auth.IST),
+                    "open": 1.0,
+                    "high": 2.0,
+                    "low": 0.5,
+                    "close": 1.5,
+                    "volume": vol,
+                    "oi": 10,
+                }
+            )
+        return out
+
+    client, _kite, _clock = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="NIFTY", expiry=expiry, tokens=[30], seen_on=now.date()
+            )
+            # Pretend we already have a watermark through day before yesterday so
+            # the pending window is short (yesterday..end).
+            states = {
+                30: catalog.FetchState(
+                    token=30,
+                    interval="day",
+                    fetched_to=datetime(2026, 10, 22, 15, 40, 0),
+                    status="done",
+                    rows_total=1,
+                    attempts=1,
+                    last_error=None,
+                    updated_at=None,
+                )
+            }
+            result = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                states,
+                now=now,
+                interval="day",
+                series_root=root / "day",
+                staging_dir=root / "staging",
+            )
+            _assert(result.fetched == 1, f"fetched={result.fetched}")
+            dcon = duckdb.connect()
+            try:
+                vols = dcon.execute(
+                    "SELECT volume FROM read_parquet(?) ORDER BY ts",
+                    [str(result.path)],
+                ).fetchall()
+            finally:
+                dcon.close()
+            # Only yesterday's bar (vol 50); today's vol 99 must be absent.
+            _assert(any(v[0] == 50 for v in vols), f"vols={vols}")
+            _assert(all(v[0] != 99 for v in vols), f"today leaked: {vols}")
+            st = catalog.get_fetch_state(con, 30, "day")
+            _assert(st is not None and st.status == "done", f"status={st}")
+            _assert(st.fetched_to is not None and st.fetched_to.date() == date(2026, 10, 23), f"wm={st.fetched_to}")
+        finally:
+            con.close()
 
 
 def test_fetch_backfill_and_rerun() -> None:
@@ -1947,6 +2165,8 @@ def main() -> None:
         test_snapshot_happy_path_and_fields,
         test_snapshot_rejects_weekend_and_batch_failure,
         test_snapshot_missing_keys_and_rank,
+        test_fetch_day_backfill_and_rerun,
+        test_fetch_day_excludes_today_before_close,
         test_fetch_backfill_and_rerun,
         test_fetch_partial_rollback_and_dedupe,
         test_fetch_skip_untraded_and_missing_snapshot,

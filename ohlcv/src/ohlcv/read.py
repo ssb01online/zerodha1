@@ -1,4 +1,4 @@
-"""Read helpers for daily quote snapshots and minute series (in-memory DuckDB)."""
+"""Read helpers for daily quote snapshots and minute/day series (in-memory DuckDB)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,17 @@ from typing import Any, Iterable, Sequence
 
 import duckdb
 
-from .paths import DAILY_DIR, MINUTE_DIR, STAGING_DIR, ensure_dir, sanitize_underlying, series_path, ymd
+from .paths import (
+    DAILY_DIR,
+    DAY_DIR,
+    MINUTE_DIR,
+    STAGING_DIR,
+    ensure_dir,
+    sanitize_underlying,
+    series_path,
+    ymd,
+)
+from .planner import IntervalName
 
 DUCKDB_MEMORY = "4GB"
 DUCKDB_THREADS = 4
@@ -90,6 +100,30 @@ def minute_path(
     return series_path(root, underlying, expiry)
 
 
+def day_path(
+    underlying: str,
+    expiry: date,
+    *,
+    day_dir: Path | None = None,
+) -> Path:
+    root = day_dir if day_dir is not None else DAY_DIR
+    return series_path(root, underlying, expiry)
+
+
+def series_file_path(
+    underlying: str,
+    expiry: date,
+    *,
+    interval: IntervalName = "minute",
+    series_root: Path | None = None,
+) -> Path:
+    if series_root is not None:
+        return series_path(series_root, underlying, expiry)
+    if interval == "day":
+        return day_path(underlying, expiry)
+    return minute_path(underlying, expiry)
+
+
 def _quote_idents(columns: Iterable[str] | None) -> str:
     if not columns:
         return "*"
@@ -148,12 +182,19 @@ def series_rel(
     symbols: Sequence[str] | None = None,
     start: datetime | date | None = None,
     end: datetime | date | None = None,
+    interval: IntervalName = "minute",
+    series_root: Path | None = None,
     minute_dir: Path | None = None,
 ) -> duckdb.DuckDBPyRelation:
-    """Return a DuckDB relation for one minute series. Caller owns ``con``."""
-    path = minute_path(underlying, expiry, minute_dir=minute_dir)
+    """Return a DuckDB relation for one minute/day series. Caller owns ``con``."""
+    root = series_root
+    if root is None and minute_dir is not None and interval == "minute":
+        root = minute_dir
+    path = series_file_path(
+        underlying, expiry, interval=interval, series_root=root
+    )
     if not path.is_file():
-        raise FileNotFoundError(f"minute series not found: {path}")
+        raise FileNotFoundError(f"{interval} series not found: {path}")
     cols = _quote_idents(columns)
     where, params = _series_filters(tokens=tokens, symbols=symbols, start=start, end=end)
     sql = f"""
@@ -174,9 +215,11 @@ def series(
     symbols: Sequence[str] | None = None,
     start: datetime | date | None = None,
     end: datetime | date | None = None,
+    interval: IntervalName = "minute",
+    series_root: Path | None = None,
     minute_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Load a small minute-series slice into memory (opens/closes its own connection)."""
+    """Load a small series slice into memory (opens/closes its own connection)."""
     con = connect()
     try:
         rel = series_rel(
@@ -188,12 +231,39 @@ def series(
             symbols=symbols,
             start=start,
             end=end,
+            interval=interval,
+            series_root=series_root,
             minute_dir=minute_dir,
         )
         names = [d[0] for d in rel.description]
         return [dict(zip(names, row)) for row in rel.fetchall()]
     finally:
         con.close()
+
+
+def day_series(
+    underlying: str,
+    expiry: date,
+    *,
+    columns: Iterable[str] | None = None,
+    tokens: Sequence[int] | None = None,
+    symbols: Sequence[str] | None = None,
+    start: datetime | date | None = None,
+    end: datetime | date | None = None,
+    day_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Load historical day bars for one (underlying, expiry) series file."""
+    return series(
+        underlying,
+        expiry,
+        columns=columns,
+        tokens=tokens,
+        symbols=symbols,
+        start=start,
+        end=end,
+        interval="day",
+        series_root=day_dir,
+    )
 
 
 def underlying_minute(

@@ -1,4 +1,4 @@
-"""Minute candle fetch: one series at a time, atomic parquet rewrite, catalog watermarks."""
+"""Candle fetch (minute or day): one series at a time, atomic parquet rewrite, catalog watermarks."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from .client import (
     SessionExpired,
 )
 from .paths import (
+    DAY_DIR,
     MINUTE_DIR,
     STAGING_DIR,
     ensure_dir,
@@ -37,16 +38,30 @@ from .paths import (
     series_path,
     ymd,
 )
+from .planner import IntervalName
 from .progress import ContractProgress, InterruptController
 from .snapshot import untraded_tokens
 from .universe import SESSION_END, Series
 
+# Backward-compatible default (minute fetch).
 INTERVAL = "minute"
 MAX_ERROR_ATTEMPTS = 3
 CONSECUTIVE_RETRY_ABORT = 5
 LOCK_RETRY_SLEEP_S = 5.0
 DUCKDB_MEMORY = "4GB"
 DUCKDB_THREADS = 4
+
+
+def series_root_for(interval: IntervalName) -> Path:
+    return DAY_DIR if interval == "day" else MINUTE_DIR
+
+
+def _spool_name(interval: IntervalName, underlying: str, expiry: date) -> str:
+    return f"{interval}_{sanitize_underlying(underlying)}_{ymd(expiry)}.csv"
+
+
+def _staging_parquet_name(interval: IntervalName, dest: Path) -> str:
+    return f"{interval}_{dest.parent.name}_{dest.stem}.parquet"
 
 _SPOOL_COLUMNS = [
     "token",
@@ -125,18 +140,35 @@ def expiry_session_end(expiry: date) -> datetime:
     return datetime.combine(expiry, SESSION_END, tzinfo=auth.IST)
 
 
-def contract_end(now: datetime, expiry: date) -> datetime:
-    """Last minute to fetch for a contract: min(fetch_end(now), expiry 15:40 IST)."""
-    return min(planner.fetch_end(now), expiry_session_end(expiry))
+def contract_end(
+    now: datetime,
+    expiry: date,
+    *,
+    interval: IntervalName = "minute",
+) -> datetime:
+    """Last bar end to fetch: min(interval fetch_end(now), expiry 15:40 IST)."""
+    return min(planner.interval_fetch_end(now, interval), expiry_session_end(expiry))
 
 
-def classify_status(end: datetime, now: datetime) -> str:
+def classify_status(
+    end: datetime,
+    now: datetime,
+    *,
+    interval: IntervalName = "minute",
+) -> str:
     """done when end is outside the session window; partial when inside."""
     end = _as_aware_ist(end)
     now = _as_aware_ist(now)
     day = end.date()
     session_start = datetime.combine(day, planner.SESSION_START, tzinfo=auth.IST)
     session_end = datetime.combine(day, SESSION_END, tzinfo=auth.IST)
+    if interval == "day":
+        # Day bars: incomplete only when watermark is today's bar while session still open.
+        if now.date() == day and now < session_end and end >= session_end:
+            return "partial"
+        if now.date() == day and session_start < now < session_end and end.date() == day:
+            return "partial"
+        return "done"
     if end >= session_end or end <= session_start:
         return "done"
     # During session hours on end's day — only partial if we're still in that session.
@@ -298,12 +330,13 @@ def merge_series_parquet(
     contracts: Sequence[ContractRow],
     dest: Path,
     staging_dir: Path,
+    interval: IntervalName = "minute",
 ) -> int:
     """Merge existing parquet + spool CSV into dest via staging. Returns row count written."""
     ensure_dir(dest.parent)
     ensure_dir(staging_dir)
     tmp_dir = ensure_dir(staging_dir / "duckdb_tmp")
-    staging = staging_dir / f"minute_{dest.parent.name}_{dest.stem}.parquet"
+    staging = staging_dir / _staging_parquet_name(interval, dest)
     fd, contracts_name = tempfile.mkstemp(prefix="ohlcv_contracts_", suffix=".csv")
     os.close(fd)
     contracts_path = Path(contracts_name)
@@ -443,10 +476,11 @@ def process_contract(
     untraded_cache: dict[date, set[int] | None],
     spool_writer: csv.DictWriter,
     today: date,
+    interval: IntervalName = "minute",
 ) -> ContractOutcome:
-    """Fetch one contract's minute window into the spool. May raise SessionExpired / FetchAborted."""
-    end = contract_end(now, contract.expiry)
-    start = planner.contract_range_start(state, now=now)
+    """Fetch one contract's window into the spool. May raise SessionExpired / FetchAborted."""
+    end = contract_end(now, contract.expiry, interval=interval)
+    start = planner.contract_range_start(state, now=now, interval=interval)
     prev_attempts = state.attempts if state is not None else 0
     prev_rows = state.rows_total if state is not None else 0
     prev_fetched = state.fetched_to if state is not None else None
@@ -456,7 +490,7 @@ def process_contract(
         watermark = end if prev_fetched is None else max(_as_aware_ist(prev_fetched), end)
         return ContractOutcome(
             token=contract.token,
-            status=classify_status(watermark, now),
+            status=classify_status(watermark, now, interval=interval),
             fetched_to=_as_naive(watermark),
             rows=prev_rows,
             attempts=prev_attempts,
@@ -470,7 +504,7 @@ def process_contract(
         if can_skip_untraded(con, contract.token, start, end, untraded_cache=untraded_cache):
             return ContractOutcome(
                 token=contract.token,
-                status=classify_status(end, now),
+                status=classify_status(end, now, interval=interval),
                 fetched_to=_as_naive(end),
                 rows=prev_rows,
                 attempts=prev_attempts,
@@ -479,7 +513,7 @@ def process_contract(
                 fetched=False,
             )
 
-    windows = _chunk_windows(start, end)
+    windows = _chunk_windows(start, end, chunk_days=planner.chunk_days_for(interval))
     rows_written = 0
     try:
         for win_start, win_end in windows:
@@ -487,16 +521,20 @@ def process_contract(
                 contract.token,
                 _as_naive(win_start),
                 _as_naive(win_end),
-                INTERVAL,
+                interval,
                 oi=True,
             )
             for candle in candles:
                 row = _candle_row(contract.token, candle)
                 if row is None:
                     continue
-                # Drop incomplete current minute when fetching during session.
+                # Drop bars past the requested end (incomplete minute / future day).
                 ts = datetime.fromisoformat(row["ts"])
-                if ts.replace(tzinfo=auth.IST) > end:
+                ts_aware = ts.replace(tzinfo=auth.IST)
+                if interval == "day":
+                    if ts_aware.date() > end.date():
+                        continue
+                elif ts_aware > end:
                     continue
                 spool_writer.writerow(row)
                 rows_written += 1
@@ -535,7 +573,7 @@ def process_contract(
 
     return ContractOutcome(
         token=contract.token,
-        status=classify_status(end, now),
+        status=classify_status(end, now, interval=interval),
         fetched_to=_as_naive(end),
         rows=prev_rows + rows_written,
         attempts=prev_attempts + 1,
@@ -545,12 +583,17 @@ def process_contract(
     )
 
 
-def _outcomes_to_states(outcomes: Iterable[ContractOutcome], *, updated_at: datetime) -> list[FetchState]:
+def _outcomes_to_states(
+    outcomes: Iterable[ContractOutcome],
+    *,
+    updated_at: datetime,
+    interval: IntervalName = "minute",
+) -> list[FetchState]:
     naive_updated = _as_naive(updated_at)
     return [
         FetchState(
             token=o.token,
-            interval=INTERVAL,
+            interval=interval,
             fetched_to=o.fetched_to,
             status=o.status,
             rows_total=o.rows,
@@ -568,12 +611,15 @@ def commit_series(
     series: Series,
     outcomes: list[ContractOutcome],
     spool_csv: Path | None,
-    minute_dir: Path,
+    series_root: Path,
     staging_dir: Path,
     now: datetime,
+    interval: IntervalName = "minute",
+    minute_dir: Path | None = None,
 ) -> tuple[Path, int]:
     """Merge spool into series parquet and commit fetch_state. Returns (path, rows)."""
-    dest = series_path(minute_dir, series.underlying, series.expiry)
+    root = minute_dir if minute_dir is not None else series_root
+    dest = series_path(root, series.underlying, series.expiry)
     existing = dest if dest.is_file() else None
     # Only merge contracts that produced spool rows or already exist — always rewrite with all series contracts meta available.
     row_count = merge_series_parquet(
@@ -582,8 +628,9 @@ def commit_series(
         contracts=series.contracts,
         dest=dest,
         staging_dir=staging_dir,
+        interval=interval,
     )
-    upsert_fetch_states(con, _outcomes_to_states(outcomes, updated_at=now))
+    upsert_fetch_states(con, _outcomes_to_states(outcomes, updated_at=now, interval=interval))
     if spool_csv is not None and spool_csv.exists():
         try:
             spool_csv.unlink()
@@ -599,7 +646,9 @@ def process_series(
     fetch_states: dict[int, FetchState],
     *,
     now: datetime,
-    minute_dir: Path = MINUTE_DIR,
+    interval: IntervalName = "minute",
+    series_root: Path | None = None,
+    minute_dir: Path | None = None,
     staging_dir: Path = STAGING_DIR,
     untraded_cache: dict[date, set[int] | None] | None = None,
     should_stop: Callable[[], str | None] | None = None,
@@ -611,8 +660,11 @@ def process_series(
     t0 = time.monotonic()
     today = _as_aware_ist(now).date()
     cache = untraded_cache if untraded_cache is not None else {}
+    root = series_root if series_root is not None else (
+        minute_dir if minute_dir is not None else series_root_for(interval)
+    )
     ensure_dir(staging_dir)
-    spool_path = staging_dir / f"minute_{sanitize_underlying(series.underlying)}_{ymd(series.expiry)}.csv"
+    spool_path = staging_dir / _spool_name(interval, series.underlying, series.expiry)
     if spool_path.exists():
         try:
             spool_path.unlink()
@@ -645,6 +697,7 @@ def process_series(
                     untraded_cache=cache,
                     spool_writer=writer,
                     today=today,
+                    interval=interval,
                 )
             except SessionExpired as exc:
                 session_exc = exc
@@ -722,14 +775,15 @@ def process_series(
             series=series,
             outcomes=outcomes,
             spool_csv=spool_path if spool_path.exists() else None,
-            minute_dir=minute_dir,
+            series_root=root,
             staging_dir=staging_dir,
             now=now,
+            interval=interval,
         )
         for o in outcomes:
             fetch_states[o.token] = FetchState(
                 token=o.token,
-                interval=INTERVAL,
+                interval=interval,
                 fetched_to=o.fetched_to,
                 status=o.status,
                 rows_total=o.rows,
@@ -765,7 +819,7 @@ def process_series(
             elapsed_s=elapsed,
             locked=True,
             outcomes=outcomes,
-            path=series_path(minute_dir, series.underlying, series.expiry),
+            path=series_path(root, series.underlying, series.expiry),
             stop_reason=stop,
         )
 
@@ -783,6 +837,7 @@ def count_skippable(
     *,
     now: datetime,
     untraded_cache: dict[date, set[int] | None] | None = None,
+    interval: IntervalName = "minute",
 ) -> int:
     """How many contracts would be skipped by the untraded rule (for dry-run)."""
     cache = untraded_cache if untraded_cache is not None else {}
@@ -793,8 +848,8 @@ def count_skippable(
             continue
         if state.status == "gave_up":
             continue
-        end = contract_end(now, c.expiry)
-        start = planner.contract_range_start(state, now=now)
+        end = contract_end(now, c.expiry, interval=interval)
+        start = planner.contract_range_start(state, now=now, interval=interval)
         if end <= start:
             continue
         if can_skip_untraded(con, c.token, start, end, untraded_cache=cache):
@@ -811,7 +866,9 @@ def run_fetch(
     now: datetime | None = None,
     max_series: int | None = None,
     max_minutes: float | None = None,
-    minute_dir: Path = MINUTE_DIR,
+    interval: IntervalName = "minute",
+    series_root: Path | None = None,
+    minute_dir: Path | None = None,
     staging_dir: Path = STAGING_DIR,
     on_series: Callable[[int, int, SeriesResult], None] | None = None,
     on_contract: Callable[[ContractProgress], None] | None = None,
@@ -821,6 +878,9 @@ def run_fetch(
     """Process queue series in order. Handles Ctrl+C, budgets, lock retries."""
     now = now if now is not None else datetime.now(auth.IST)
     now = _as_aware_ist(now)
+    root = series_root if series_root is not None else (
+        minute_dir if minute_dir is not None else series_root_for(interval)
+    )
     own_interrupt = interrupt is None
     ctrl = interrupt if interrupt is not None else InterruptController()
     if own_interrupt:
@@ -857,7 +917,8 @@ def run_fetch(
                     series,
                     fetch_states,
                     now=now,
-                    minute_dir=minute_dir,
+                    interval=interval,
+                    series_root=root,
                     staging_dir=staging_dir,
                     untraded_cache=untraded_cache,
                     should_stop=should_stop,
@@ -875,7 +936,7 @@ def run_fetch(
                                 series.expiry,
                                 series,
                                 attached.outcomes,
-                                series_path(minute_dir, series.underlying, series.expiry),
+                                series_path(root, series.underlying, series.expiry),
                             )
                         )
                     results.append(attached)
@@ -890,7 +951,7 @@ def run_fetch(
                         series.expiry,
                         series,
                         result.outcomes,
-                        series_path(minute_dir, series.underlying, series.expiry),
+                        series_path(root, series.underlying, series.expiry),
                     )
                 )
             results.append(result)
@@ -912,21 +973,22 @@ def run_fetch(
     if locked and stopped is None:
         time.sleep(LOCK_RETRY_SLEEP_S)
         for underlying, expiry, series, outcomes, _path in locked:
-            spool = staging_dir / f"minute_{sanitize_underlying(series.underlying)}_{ymd(series.expiry)}.csv"
+            spool = staging_dir / _spool_name(interval, series.underlying, series.expiry)
             try:
                 path, row_count = commit_series(
                     con,
                     series=series,
                     outcomes=outcomes,
                     spool_csv=spool if spool.exists() else None,
-                    minute_dir=minute_dir,
+                    series_root=root,
                     staging_dir=staging_dir,
                     now=now,
+                    interval=interval,
                 )
                 for o in outcomes:
                     fetch_states[o.token] = FetchState(
                         token=o.token,
-                        interval=INTERVAL,
+                        interval=interval,
                         fetched_to=o.fetched_to,
                         status=o.status,
                         rows_total=o.rows,
@@ -944,7 +1006,7 @@ def run_fetch(
             except PermissionError:
                 still_locked.append((underlying, expiry))
                 print(
-                    f"locked: {series_path(minute_dir, underlying, expiry)} "
+                    f"locked: {series_path(root, underlying, expiry)} "
                     "(close notebooks holding the file)",
                     file=sys.stderr,
                 )

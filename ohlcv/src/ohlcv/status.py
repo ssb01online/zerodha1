@@ -20,7 +20,8 @@ from .catalog import (
     list_snapshots,
 )
 from .fetch import contract_end
-from .paths import MINUTE_DIR, sanitize_underlying, ymd
+from .paths import DAY_DIR, MINUTE_DIR, sanitize_underlying, ymd
+from .planner import IntervalName
 from .universe import Series, select_series
 
 
@@ -104,16 +105,16 @@ def _build_folder_map(contracts: list[ContractRow]) -> dict[str, str]:
     return out
 
 
-def _scan_minute_files(
+def _scan_series_files(
     *,
-    minute_dir: Path,
+    series_root: Path,
     folder_map: dict[str, str],
 ) -> list[tuple[str, date, Path]]:
-    """Return (catalog_underlying, expiry, path) for every minute/*.parquet file."""
-    if not minute_dir.is_dir():
+    """Return (catalog_underlying, expiry, path) for every series/*.parquet file."""
+    if not series_root.is_dir():
         return []
     found: list[tuple[str, date, Path]] = []
-    for folder in sorted(minute_dir.iterdir()):
+    for folder in sorted(series_root.iterdir()):
         if not folder.is_dir():
             continue
         catalog_name = folder_map.get(folder.name)
@@ -132,16 +133,26 @@ def _scan_minute_files(
     return found
 
 
+def _scan_minute_files(
+    *,
+    minute_dir: Path,
+    folder_map: dict[str, str],
+) -> list[tuple[str, date, Path]]:
+    """Backward-compatible alias for ``_scan_series_files``."""
+    return _scan_series_files(series_root=minute_dir, folder_map=folder_map)
+
+
 def _status_for_series(
     series: Series,
     *,
     now: datetime,
     fetch_states: dict[int, FetchState],
     live_keys: set[tuple[str, date]],
-    minute_dir: Path,
+    series_root: Path,
+    interval: IntervalName = "minute",
 ) -> SeriesStatus:
     now = _as_aware_ist(now)
-    target_end = contract_end(now, series.expiry)
+    target_end = contract_end(now, series.expiry, interval=interval)
     done = partial = error = gave_up = missing = complete = 0
     fetched_times: list[datetime] = []
 
@@ -166,8 +177,12 @@ def _status_for_series(
         if state.fetched_to is not None:
             fetched_times.append(_as_naive(state.fetched_to))
 
-    pending = planner.series_pending_requests(series, fetch_states, now=now)
-    path = read_mod.minute_path(series.underlying, series.expiry, minute_dir=minute_dir)
+    pending = planner.series_pending_requests(
+        series, fetch_states, now=now, interval=interval
+    )
+    path = read_mod.series_file_path(
+        series.underlying, series.expiry, interval=interval, series_root=series_root
+    )
     file_bytes = 0
     file_rows = 0
     file_path: Path | None = None
@@ -205,13 +220,20 @@ def series_status(
     include_all: bool = False,
     expiry: date | None = None,
     underlying: str | None = None,
+    interval: IntervalName = "minute",
+    series_root: Path | None = None,
     minute_dir: Path | None = None,
 ) -> list[SeriesStatus]:
     """Aggregate fetch_state + file info for the download universe (or all on-disk series)."""
     now = _as_aware_ist(now if now is not None else datetime.now(auth.IST))
-    root = minute_dir if minute_dir is not None else MINUTE_DIR
+    if series_root is not None:
+        root = series_root
+    elif minute_dir is not None:
+        root = minute_dir
+    else:
+        root = DAY_DIR if interval == "day" else MINUTE_DIR
 
-    selected = select_series(con, today=now.date())
+    selected = select_series(con, today=now.date(), interval=interval)
     # select_series mixes live + unfinished; mark live as expiry >= today.
     live_keys = {(s.underlying, s.expiry) for s in selected if s.expiry >= now.date()}
 
@@ -223,8 +245,8 @@ def series_status(
         grouped: dict[tuple[str, date], list[ContractRow]] = {}
         for c in all_contracts:
             grouped.setdefault((c.underlying, c.expiry), []).append(c)
-        for catalog_name, exp, _path in _scan_minute_files(
-            minute_dir=root, folder_map=folder_map
+        for catalog_name, exp, _path in _scan_series_files(
+            series_root=root, folder_map=folder_map
         ):
             key = (catalog_name, exp)
             if key in by_key:
@@ -248,7 +270,7 @@ def series_status(
         ]
 
     tokens = [c.token for s in series_list for c in s.contracts]
-    fetch_states = list_fetch_states(con, interval="minute", tokens=tokens)
+    fetch_states = list_fetch_states(con, interval=interval, tokens=tokens)
     ranks = rank_mod.load_ranks(con)
 
     rows = [
@@ -257,7 +279,8 @@ def series_status(
             now=now,
             fetch_states=fetch_states,
             live_keys=live_keys,
-            minute_dir=root,
+            series_root=root,
+            interval=interval,
         )
         for s in series_list
     ]
