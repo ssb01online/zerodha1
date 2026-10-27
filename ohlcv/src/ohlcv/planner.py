@@ -102,11 +102,44 @@ def day_partial_rollback(fetched_to: datetime) -> datetime:
     return datetime.combine(prev, SESSION_END, tzinfo=auth.IST)
 
 
-def default_backfill_start(now: datetime) -> datetime:
-    """Start of a 60-day inclusive window ending at now (fits one minute request)."""
+def parse_days_arg(value: str | int | None) -> int | None:
+    """Parse CLI ``--days`` / ``-d``.
+
+    Returns a positive inclusive day count, or ``None`` for ``all``.
+    ``None`` input defaults to :data:`BACKFILL_WINDOW_DAYS`.
+    """
+    if value is None:
+        return BACKFILL_WINDOW_DAYS
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError(f"days must be a positive integer or 'all', got {value}")
+        return value
+    text = str(value).strip().lower()
+    if text == "all":
+        return None
+    try:
+        n = int(text)
+    except ValueError as exc:
+        raise ValueError(f"days must be a positive integer or 'all', got {value!r}") from exc
+    if n <= 0:
+        raise ValueError(f"days must be a positive integer or 'all', got {value}")
+    return n
+
+
+def default_backfill_start(
+    now: datetime,
+    *,
+    backfill_days: int | None = BACKFILL_WINDOW_DAYS,
+) -> datetime:
+    """Start of an inclusive minute backfill window ending at now.
+
+    ``backfill_days=None`` (``--days all``) uses :data:`DAY_BACKFILL_DAYS` as a
+    finite estimate upper bound; fetch tightens from day bars at runtime.
+    """
     now = _as_aware_ist(now)
-    # Inclusive span of BACKFILL_WINDOW_DAYS ⇒ subtract (N - 1) days.
-    return now - timedelta(days=BACKFILL_WINDOW_DAYS - 1)
+    days = DAY_BACKFILL_DAYS if backfill_days is None else backfill_days
+    # Inclusive span of N days ⇒ subtract (N - 1) days.
+    return now - timedelta(days=days - 1)
 
 
 def default_day_backfill_start(now: datetime) -> datetime:
@@ -124,11 +157,13 @@ def contract_range_start(
     *,
     now: datetime,
     interval: IntervalName = "minute",
+    backfill_days: int | None = BACKFILL_WINDOW_DAYS,
 ) -> datetime:
     now = _as_aware_ist(now)
-    default_start = (
-        default_day_backfill_start(now) if interval == "day" else default_backfill_start(now)
-    )
+    if interval == "day":
+        default_start = default_day_backfill_start(now)
+    else:
+        default_start = default_backfill_start(now, backfill_days=backfill_days)
     if state is None or state.fetched_to is None:
         return default_start
     if state.status == "partial":
@@ -161,6 +196,7 @@ def contract_pending_requests(
     now: datetime,
     end: datetime | None = None,
     interval: IntervalName = "minute",
+    backfill_days: int | None = BACKFILL_WINDOW_DAYS,
 ) -> int:
     end = end if end is not None else interval_fetch_end(now, interval)
     if state is not None and state.status == "gave_up":
@@ -170,7 +206,9 @@ def contract_pending_requests(
         if fetched is not None and _as_aware_ist(fetched) >= end:
             return 0
         # done but watermark before end → treat as needing a refresh chunk
-    start = contract_range_start(state, now=now, interval=interval)
+    start = contract_range_start(
+        state, now=now, interval=interval, backfill_days=backfill_days
+    )
     return chunk_count(start, end, chunk_days=chunk_days_for(interval))
 
 
@@ -180,12 +218,17 @@ def series_pending_requests(
     *,
     now: datetime,
     interval: IntervalName = "minute",
+    backfill_days: int | None = BACKFILL_WINDOW_DAYS,
 ) -> int:
     end = interval_fetch_end(now, interval)
     total = 0
     for c in series.contracts:
         total += contract_pending_requests(
-            fetch_states.get(c.token), now=now, end=end, interval=interval
+            fetch_states.get(c.token),
+            now=now,
+            end=end,
+            interval=interval,
+            backfill_days=backfill_days,
         )
     return total
 
@@ -200,11 +243,14 @@ def build_queue(
     underlying_filter: str | None = None,
     limit: int | None = None,
     interval: IntervalName = "minute",
+    backfill_days: int | None = BACKFILL_WINDOW_DAYS,
 ) -> list[QueueItem]:
     """Order: expiry asc, traded_value desc, underlying name; unranked last within expiry."""
     now = _as_aware_ist(now)
     items: list[QueueItem] = []
     per_request = request_seconds()
+    # Day interval ignores minute backfill_days.
+    bf = backfill_days if interval == "minute" else BACKFILL_WINDOW_DAYS
 
     for s in series:
         if expiry_filter is not None and s.expiry != expiry_filter:
@@ -212,7 +258,9 @@ def build_queue(
         if underlying_filter is not None and s.underlying.upper() != underlying_filter.upper():
             continue
         rank = ranks.get(s.underlying)
-        pending = series_pending_requests(s, fetch_states, now=now, interval=interval)
+        pending = series_pending_requests(
+            s, fetch_states, now=now, interval=interval, backfill_days=bf
+        )
         items.append(
             QueueItem(
                 underlying=s.underlying,

@@ -60,11 +60,10 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 | --- | --- | --- |
 | `uv run ohlcv sync` | only if master cache must refresh from Kite | Archive `data/instruments/master.json` → `data/instruments/archive/yyyymmdd.json.gz`; upsert NFO rows into `data/ohlcv/nfo/catalog.duckdb` |
 | `uv run ohlcv rank [--force]` | only if no final snapshot (falls back to FUT day) | Rank underlyings: prefer final quote snapshot (`source=quote`); else nearest-FUT day `volume * close` |
-| `uv run ohlcv queue [--expiry] [--underlying] [--limit] [--interval minute\|day]` | only if sync must refresh master | Print series queue: expiry asc, traded_value desc, unranked last; request/time estimates |
+| `uv run ohlcv queue [--expiry] [--underlying] [--limit] [--interval minute\|day] [-d N\|all]` | only if sync must refresh master | Print series queue: expiry asc, traded_value desc, unranked last; request/time estimates (`-d` for minute only) |
 | `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
 | `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | Phase 2 end-of-day quote snapshot |
-| `uv run ohlcv fetch [--expiry] [--underlying] [--max-series] [--max-minutes] [--dry-run]` | yes (except `--dry-run`) | Phase 3 minute candle download |
-| `uv run ohlcv fetch-day […]` | yes (except `--dry-run`) | Phase 5 day candle download (same flags as `fetch`) |
+| `uv run ohlcv fetch […] [-d N\|all]` | yes (except `--dry-run`) | Day (~2000d) then minute candles; `-d` controls minute window only (default 60) |
 | `uv run ohlcv status [--all] [--expiry] [--underlying] [--interval] [--limit] [--runs]` | no | Phase 4 offline progress report |
 | `uv run ohlcv show UNDERLYING EXPIRY [--interval] [--symbol\|--token] [--tail]` | no | Phase 4/5 inspect one minute or day series file |
 
@@ -93,7 +92,7 @@ End-of-day `quote()` sweep of **all live NFO** contracts (not just nearest-3 exp
 ### When to run
 - On a **trading day after 15:40 IST** (`status=final`). Earlier same-day runs write `status=intraday` and are overwritten later.
 - Weekend / holiday / next-morning runs are **refused** (quote `volume` / `average_price` are cleared; trade date ≠ today). Message: take the snapshot on the session day after close.
-- A missed day cannot be recovered from `quote()`; use Phase 5 `ohlcv fetch-day` for historical day OHLC+OI per series.
+- A missed day cannot be recovered from `quote()`; use `ohlcv fetch` (day pass) for historical day OHLC+OI per series.
 
 ### Layout
 - File: `data/ohlcv/nfo/daily/yyyymmdd.parquet` (atomic write via `_staging/`).
@@ -114,45 +113,54 @@ Activity: `volume`, `average_price`, `traded_value` (`volume * average_price`), 
 
 Trade date = date of the latest `last_trade_time` in the response (must equal IST run date). Close notebooks that hold `catalog.duckdb` before running.
 
-## OHLCV Phase 3 (minute fetch)
+## OHLCV Phase 3 + 5 (combined `fetch`)
 
-Incremental minute candles with OI, one Parquet file per `(underlying, expiry)` series.
+One CLI run downloads **day** candles first (~2000d, one request/contract), then **minute** candles for the same queue. Separate `fetch_state` rows and parquet trees (`day/` vs `minute/`).
 
 ### Command
 ```powershell
-uv run ohlcv fetch [--expiry yyyymmdd] [--underlying NIFTY] [--max-series N] [--max-minutes M] [--dry-run]
+uv run ohlcv fetch [--expiry yyyymmdd] [--underlying NIFTY] [-d N|all] [--max-series N] [--max-minutes M] [--dry-run]
 ```
-- Queue order: expiry ascending, then traded-value rank (from Phase 2 snapshot / FUT day fallback).
-- Finishes one series before starting the next. `--dry-run` prints adjusted request estimates including untraded skips.
+- Queue: union of unfinished series for day **or** minute; order expiry ascending, then traded-value rank.
+- Pass 1 = day (`DAY_BACKFILL_DAYS=2000`); pass 2 = minute with `-d` / `--days` (default **60**, or `all`).
+- `-d=all`: tighten minute start to the earliest **traded** day bar (`volume>0`) from the series day parquet; skip minute when the day file exists and the token has no traded days.
+- Minute API still chunks at **60** calendar days per request when the window is wider.
+- `--dry-run` prints day + minute request estimates (including untraded / no-traded-day skips).
 - Close notebooks that hold `catalog.duckdb` **or** a series parquet before running (Windows file locks).
 
 ### Layout
-- File: `data/ohlcv/nfo/minute/<UNDERLYING>/yyyymmdd.parquet` (expiry in the name; atomic rewrite via `_staging/`).
-- Columns: `underlying`, `expiry`, `token`, `tradingsymbol`, `instrument_type`, `strike`, `lot_size`, `ts`, `open`, `high`, `low`, `close`, `volume`, `oi`.
-- `ts` is naive IST. Rows sorted by `(token, ts)`. Contract columns compress well under that order.
-- Default backfill window = 60 inclusive calendar days → **1** historical request per contract (Phase 0 chunk size).
+- Minute: `data/ohlcv/nfo/minute/<UNDERLYING>/yyyymmdd.parquet`
+- Day: `data/ohlcv/nfo/day/<UNDERLYING>/yyyymmdd.parquet`
+- Columns (both): `underlying`, `expiry`, `token`, `tradingsymbol`, `instrument_type`, `strike`, `lot_size`, `ts`, `open`, `high`, `low`, `close`, `volume`, `oi`.
+- `ts` is naive IST. Rows sorted by `(token, ts)`.
 
 ### `fetch_state` status
 | Status | Meaning |
 | --- | --- |
 | `done` | Watermark at/after session end (or before open); next run is a no-op until new session data is due |
-| `partial` | Fetched during market hours; next run rolls back to 09:15 IST that day and refreshes |
+| `partial` | Fetched during market hours; next run rolls back to 09:15 IST that day (minute) or previous day session end (day) and refreshes |
 | `error` | Request rejected / retries exhausted; watermark unchanged; `attempts` incremented |
 | `gave_up` | Expired contract failed 3 times — treated as finished so the series drops off the unfinished queue |
 
 Watermark `fetched_to` is the **requested** end (not last candle); sparse contracts often have no bar at the last minute.
 
-### Skip rule (no historical call)
-Only when a watermark already exists **and** every remaining weekday in the window has a `daily_snapshots` row with `status=final` listing the token as untraded (`volume=0`). Initial backfill (no `fetch_state`) always fetches. Weekend-only windows do not auto-skip.
+### Skip rules (no historical call)
+- **Quote untraded**: watermark exists **and** every remaining weekday has a `daily_snapshots` `final` row listing the token as `volume=0`.
+- **Day-bar (minute only)**: day parquet present and no `volume>0` days in the needed window (`-d=all` skips with empty traded set even without a minute watermark).
+- Weekend-only windows do not auto-skip via quote snapshots.
+
+### Day pass specifics
+- Before 15:40 IST, `day_fetch_end` is **previous calendar day** (do not store today’s incomplete bar). After close, include today.
+- Day vs `daily/` quote snapshots remain different layouts (see Phase 2 / layout table below).
 
 ### Interrupts / locks
-- Ctrl+C, `--max-minutes`, `--max-series`: finish the current contract, merge + commit that series, then stop.
+- Ctrl+C, `--max-minutes`, `--max-series`: finish the current contract, merge + commit that series, then stop (shared budget across both passes).
 - Session expired (HTTP 403 / `TokenException`): commit fetched contracts in the current series, then exit with `uv run kitetools login`.
 - 5 consecutive `RetryExhausted` across contracts: commit and abort (likely network down).
-- If `os.replace` hits `PermissionError` (file open elsewhere), `fetch_state` is **not** committed; one retry at end of run after 5s; otherwise re-run later (merge is idempotent).
+- If `os.replace` hits `PermissionError` (file open elsewhere), `fetch_state` is **not** committed; one retry at end of pass after 5s; otherwise re-run later (merge is idempotent).
 
 ### Offline check
-`uv run python -m ohlcv.selftest` (includes Phase 3 fake-kite tests).
+`uv run python -m ohlcv.selftest` (includes Phase 3/5 fake-kite tests).
 
 ## OHLCV Phase 4 (status and read)
 
@@ -160,11 +168,10 @@ Offline visibility and Parquet read helpers. No Kite calls; catalog opened **rea
 
 ### Daily routine (after 15:40 IST on a session day)
 1. `uv run ohlcv daily` — quote snapshot + rank
-2. `uv run ohlcv fetch-day` — incremental day download (prefer before minute; use `--max-minutes` to budget)
-3. `uv run ohlcv fetch` — incremental minute download
-4. `uv run ohlcv status` / `status --interval day` — check completion, snapshot gaps, recent runs
+2. `uv run ohlcv fetch` — day then minute (use `--max-minutes` / `-d` to budget)
+3. `uv run ohlcv status` / `status --interval day` — check completion, snapshot gaps, recent runs
 
-If `status`/`show` fail with a catalog lock message, a `daily`/`fetch`/`fetch-day` run (or notebook) still holds `catalog.duckdb`; retry after it finishes. On Windows a read-only open fails while another process holds the write connection. Notebooks using `ohlcv.read` open/close DuckDB per call so they do not keep series Parquet files locked between queries.
+If `status`/`show` fail with a catalog lock message, a `daily`/`fetch` run (or notebook) still holds `catalog.duckdb`; retry after it finishes. On Windows a read-only open fails while another process holds the write connection. Notebooks using `ohlcv.read` open/close DuckDB per call so they do not keep series Parquet files locked between queries.
 
 ### Commands
 | Command | Purpose |
@@ -192,25 +199,16 @@ If `status`/`show` fail with a catalog lock message, a `daily`/`fetch`/`fetch-da
 ### Offline check
 `uv run python -m ohlcv.selftest` (includes Phase 4/5 status/read/day-fetch tests).
 
-## OHLCV Phase 5 (day fetch)
+## Day vs daily layout (Phase 5 data)
 
-Historical day candles with OI, one Parquet file per `(underlying, expiry)` series — same grain as minute.
+Historical day candles (written by the day pass of `ohlcv fetch`) vs quote snapshots:
 
-### Layout vs `daily/`
 | Path | Source | Grain |
 | --- | --- | --- |
 | `data/ohlcv/nfo/daily/yyyymmdd.parquet` | End-of-day `quote()` snapshot | All live NFO on one trade date |
 | `data/ohlcv/nfo/day/<UL>/yyyymmdd.parquet` | `historical_data(..., interval="day")` | One series (expiry in filename) |
 
-### Command
-```powershell
-uv run ohlcv fetch-day [--expiry yyyymmdd] [--underlying NIFTY] [--max-series N] [--max-minutes M] [--dry-run]
-```
-- Queue / skip / interrupt / lock behaviour matches Phase 3 minute fetch.
-- `fetch_state` rows use `interval='day'` (independent of minute watermarks).
-- Backfill window = **2000 inclusive calendar days** (Phase 0 day span ≥2001) → **1** request per contract for full available history.
-- Before 15:40 IST, `day_fetch_end` is **previous calendar day** (do not store today’s incomplete bar). After close, include today.
-- Columns / sort / atomic `_staging/` rewrite: same as minute.
+`fetch_state` rows use `interval='day'` independent of minute watermarks. Day backfill = **2000** inclusive calendar days → typically **1** request per contract.
 
 ## Portfolio data (verified 2026-10-25 sample `data/samples/20261025-121155`)
 APIs: `holdings()`, `positions()` → `{net, day}`, `mf_holdings()`. No historical portfolio or demat txn API.

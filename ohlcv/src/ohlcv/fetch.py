@@ -230,6 +230,108 @@ def can_skip_untraded(
     return True
 
 
+def traded_day_dates(
+    underlying: str,
+    expiry: date,
+    token: int,
+    *,
+    day_dir: Path | None = None,
+    cache: dict[tuple[str, date, int], set[date] | None] | None = None,
+) -> set[date] | None:
+    """Calendar dates with day-bar volume > 0 for ``token``.
+
+    Returns ``None`` when the series day parquet is missing or the token has
+    no rows yet (unknown — do not day-skip). Returns an empty set when the
+    token has day rows but none with ``volume > 0``.
+    """
+    key = (underlying, expiry, token)
+    if cache is not None and key in cache:
+        return cache[key]
+    root = day_dir if day_dir is not None else DAY_DIR
+    path = series_path(root, underlying, expiry)
+    if not path.is_file():
+        if cache is not None:
+            cache[key] = None
+        return None
+    con = duckdb.connect()
+    try:
+        any_row = con.execute(
+            "SELECT COUNT(*) FROM read_parquet(?) WHERE token = ?",
+            [str(path), token],
+        ).fetchone()
+        if not any_row or int(any_row[0]) == 0:
+            result: set[date] | None = None
+        else:
+            rows = con.execute(
+                """
+                SELECT DISTINCT CAST(ts AS DATE) AS d
+                FROM read_parquet(?)
+                WHERE token = ? AND volume > 0
+                ORDER BY d
+                """,
+                [str(path), token],
+            ).fetchall()
+            result = {
+                r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0]))
+                for r in rows
+            }
+    except Exception:
+        result = None
+    finally:
+        con.close()
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+def _minute_start_from_traded(
+    start: datetime,
+    traded: set[date] | None,
+    *,
+    backfill_days: int | None,
+) -> datetime:
+    """Tighten minute window start using traded day bars when ``--days all``."""
+    start = _as_aware_ist(start)
+    if backfill_days is not None or not traded:
+        return start
+    first = min(traded)
+    day_start = datetime.combine(first, planner.SESSION_START, tzinfo=auth.IST)
+    return max(start, day_start)
+
+
+def can_skip_no_traded_days(
+    start: datetime,
+    end: datetime,
+    traded: set[date] | None,
+    *,
+    backfill_days: int | None,
+    has_watermark: bool,
+) -> bool:
+    """Skip minute fetch when day bars show no volume in the needed window.
+
+    - ``--days all``: skip when traded set is known empty (token has day rows,
+      all volume 0); no watermark required.
+    - ``--days N``: skip only with an existing watermark when no traded day
+      overlaps the remaining window (empty traded set counts as no overlap).
+    - Unknown (``traded is None``): never skip via this rule.
+    """
+    if traded is None:
+        return False
+    start = _as_aware_ist(start)
+    end = _as_aware_ist(end)
+    if backfill_days is None:
+        return len(traded) == 0
+    if not has_watermark:
+        return False
+    if not traded:
+        return True
+    first = start.date()
+    if start.time() >= SESSION_END:
+        first = first + timedelta(days=1)
+    last = end.date()
+    return not any(first <= d <= last for d in traded)
+
+
 def _chunk_windows(
     start: datetime,
     end: datetime,
@@ -477,13 +579,23 @@ def process_contract(
     spool_writer: csv.DictWriter,
     today: date,
     interval: IntervalName = "minute",
+    backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
+    traded_days: set[date] | None = None,
 ) -> ContractOutcome:
     """Fetch one contract's window into the spool. May raise SessionExpired / FetchAborted."""
     end = contract_end(now, contract.expiry, interval=interval)
-    start = planner.contract_range_start(state, now=now, interval=interval)
+    start = planner.contract_range_start(
+        state,
+        now=now,
+        interval=interval,
+        backfill_days=backfill_days if interval == "minute" else planner.BACKFILL_WINDOW_DAYS,
+    )
+    if interval == "minute":
+        start = _minute_start_from_traded(start, traded_days, backfill_days=backfill_days)
     prev_attempts = state.attempts if state is not None else 0
     prev_rows = state.rows_total if state is not None else 0
     prev_fetched = state.fetched_to if state is not None else None
+    has_watermark = state is not None and state.fetched_to is not None
 
     if end <= start:
         # Nothing to fetch — keep watermark at max(prev, end).
@@ -499,8 +611,26 @@ def process_contract(
             fetched=False,
         )
 
-    # Skip rule: only when a watermark already exists.
-    if state is not None and state.fetched_to is not None:
+    if interval == "minute" and can_skip_no_traded_days(
+        start,
+        end,
+        traded_days,
+        backfill_days=backfill_days,
+        has_watermark=has_watermark,
+    ):
+        return ContractOutcome(
+            token=contract.token,
+            status=classify_status(end, now, interval=interval),
+            fetched_to=_as_naive(end),
+            rows=prev_rows,
+            attempts=prev_attempts,
+            last_error=None,
+            skipped=True,
+            fetched=False,
+        )
+
+    # Untraded skip: only when a watermark already exists.
+    if has_watermark:
         if can_skip_untraded(con, contract.token, start, end, untraded_cache=untraded_cache):
             return ContractOutcome(
                 token=contract.token,
@@ -649,8 +779,11 @@ def process_series(
     interval: IntervalName = "minute",
     series_root: Path | None = None,
     minute_dir: Path | None = None,
+    day_dir: Path | None = None,
     staging_dir: Path = STAGING_DIR,
     untraded_cache: dict[date, set[int] | None] | None = None,
+    traded_days_cache: dict[tuple[str, date, int], set[date] | None] | None = None,
+    backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
     should_stop: Callable[[], str | None] | None = None,
     on_contract: Callable[[ContractProgress], None] | None = None,
     series_index: int = 1,
@@ -660,6 +793,8 @@ def process_series(
     t0 = time.monotonic()
     today = _as_aware_ist(now).date()
     cache = untraded_cache if untraded_cache is not None else {}
+    traded_cache = traded_days_cache if traded_days_cache is not None else {}
+    day_root = day_dir if day_dir is not None else DAY_DIR
     root = series_root if series_root is not None else (
         minute_dir if minute_dir is not None else series_root_for(interval)
     )
@@ -687,6 +822,15 @@ def process_series(
                     interrupt_reason = reason
                     break
             state = fetch_states.get(contract.token)
+            traded: set[date] | None = None
+            if interval == "minute":
+                traded = traded_day_dates(
+                    series.underlying,
+                    series.expiry,
+                    contract.token,
+                    day_dir=day_root,
+                    cache=traded_cache,
+                )
             try:
                 outcome = process_contract(
                     client,
@@ -698,6 +842,8 @@ def process_series(
                     spool_writer=writer,
                     today=today,
                     interval=interval,
+                    backfill_days=backfill_days,
+                    traded_days=traded,
                 )
             except SessionExpired as exc:
                 session_exc = exc
@@ -837,20 +983,50 @@ def count_skippable(
     *,
     now: datetime,
     untraded_cache: dict[date, set[int] | None] | None = None,
+    traded_days_cache: dict[tuple[str, date, int], set[date] | None] | None = None,
     interval: IntervalName = "minute",
+    backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
+    day_dir: Path | None = None,
 ) -> int:
-    """How many contracts would be skipped by the untraded rule (for dry-run)."""
+    """How many contracts would be skipped by untraded / no-traded-day rules (dry-run)."""
     cache = untraded_cache if untraded_cache is not None else {}
+    traded_cache = traded_days_cache if traded_days_cache is not None else {}
+    day_root = day_dir if day_dir is not None else DAY_DIR
     n = 0
     for c in series.contracts:
         state = fetch_states.get(c.token)
-        if state is None or state.fetched_to is None:
-            continue
-        if state.status == "gave_up":
+        if state is not None and state.status == "gave_up":
             continue
         end = contract_end(now, c.expiry, interval=interval)
-        start = planner.contract_range_start(state, now=now, interval=interval)
+        start = planner.contract_range_start(
+            state,
+            now=now,
+            interval=interval,
+            backfill_days=backfill_days if interval == "minute" else planner.BACKFILL_WINDOW_DAYS,
+        )
+        traded: set[date] | None = None
+        if interval == "minute":
+            traded = traded_day_dates(
+                series.underlying,
+                series.expiry,
+                c.token,
+                day_dir=day_root,
+                cache=traded_cache,
+            )
+            start = _minute_start_from_traded(start, traded, backfill_days=backfill_days)
         if end <= start:
+            continue
+        has_watermark = state is not None and state.fetched_to is not None
+        if interval == "minute" and can_skip_no_traded_days(
+            start,
+            end,
+            traded,
+            backfill_days=backfill_days,
+            has_watermark=has_watermark,
+        ):
+            n += 1
+            continue
+        if not has_watermark:
             continue
         if can_skip_untraded(con, c.token, start, end, untraded_cache=cache):
             n += 1
@@ -869,24 +1045,39 @@ def run_fetch(
     interval: IntervalName = "minute",
     series_root: Path | None = None,
     minute_dir: Path | None = None,
+    day_dir: Path | None = None,
     staging_dir: Path = STAGING_DIR,
+    backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
     on_series: Callable[[int, int, SeriesResult], None] | None = None,
     on_contract: Callable[[ContractProgress], None] | None = None,
     on_series_start: Callable[[int, int, Series], None] | None = None,
     interrupt: InterruptController | None = None,
+    deadline_monotonic: float | None = None,
 ) -> FetchRunResult:
-    """Process queue series in order. Handles Ctrl+C, budgets, lock retries."""
+    """Process queue series in order. Handles Ctrl+C, budgets, lock retries.
+
+    ``deadline_monotonic`` shares a wall-clock budget across multiple passes
+    (day then minute). When set, it overrides deriving a deadline from
+    ``max_minutes`` alone.
+    """
     now = now if now is not None else datetime.now(auth.IST)
     now = _as_aware_ist(now)
     root = series_root if series_root is not None else (
         minute_dir if minute_dir is not None else series_root_for(interval)
     )
+    day_root = day_dir if day_dir is not None else DAY_DIR
     own_interrupt = interrupt is None
     ctrl = interrupt if interrupt is not None else InterruptController()
     if own_interrupt:
         ctrl.install()
-    deadline = None if max_minutes is None else time.monotonic() + max_minutes * 60.0
+    if deadline_monotonic is not None:
+        deadline = deadline_monotonic
+    elif max_minutes is None:
+        deadline = None
+    else:
+        deadline = time.monotonic() + max_minutes * 60.0
     untraded_cache: dict[date, set[int] | None] = {}
+    traded_days_cache: dict[tuple[str, date, int], set[date] | None] = {}
     results: list[SeriesResult] = []
     locked: list[tuple[str, date, Series, list[ContractOutcome], Path]] = []
     series_list = list(queue_series)
@@ -919,8 +1110,11 @@ def run_fetch(
                     now=now,
                     interval=interval,
                     series_root=root,
+                    day_dir=day_root,
                     staging_dir=staging_dir,
                     untraded_cache=untraded_cache,
+                    traded_days_cache=traded_days_cache,
+                    backfill_days=backfill_days,
                     should_stop=should_stop,
                     on_contract=on_contract,
                     series_index=idx,

@@ -494,6 +494,39 @@ def test_queue_order_and_chunks() -> None:
     _assert(day_items[0].pending_requests == 2, f"day nifty pending={day_items[0].pending_requests}")
     _assert(day_items[1].pending_requests == 1, "day reliance 1 req")
 
+    # --days parsing and wider minute windows
+    _assert(planner.parse_days_arg(None) == 60, "default days")
+    _assert(planner.parse_days_arg("60") == 60, "str 60")
+    _assert(planner.parse_days_arg(120) == 120, "int 120")
+    _assert(planner.parse_days_arg("all") is None, "all")
+    _assert(planner.parse_days_arg("ALL") is None, "ALL")
+    try:
+        planner.parse_days_arg(0)
+        _assert(False, "expected ValueError for 0")
+    except ValueError:
+        pass
+    try:
+        planner.parse_days_arg("nope")
+        _assert(False, "expected ValueError for nope")
+    except ValueError:
+        pass
+    start_120 = planner.default_backfill_start(now, backfill_days=120)
+    _assert(
+        (end.date() - start_120.date()).days + 1 == 120,
+        "120d inclusive span",
+    )
+    _assert(planner.chunk_count(start_120, end) == 2, "120d = 2 minute chunks")
+    start_all = planner.default_backfill_start(now, backfill_days=None)
+    _assert(
+        (end.date() - start_all.date()).days + 1 == planner.DAY_BACKFILL_DAYS,
+        "all estimate uses DAY_BACKFILL_DAYS",
+    )
+    items_120 = planner.build_queue(
+        series, ranks, {}, now, interval="minute", backfill_days=120
+    )
+    # No states → each contract 2 chunks
+    _assert(items_120[0].pending_requests == 4, f"nifty 120d pending={items_120[0].pending_requests}")
+
 
 def _quote_payload(
     token: int,
@@ -1122,6 +1155,182 @@ def test_fetch_day_backfill_and_rerun() -> None:
 
             loaded = read_mod.day_series("NIFTY", expiry, day_dir=day_dir)
             _assert(len(loaded) == 10, f"day_series rows={len(loaded)}")
+        finally:
+            con.close()
+
+
+def test_fetch_minute_days_all_skips_without_traded_days() -> None:
+    """--days all with day parquet present but volume=0 → skip minute (no hist calls)."""
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        raise AssertionError(f"unexpected historical call interval={interval}")
+
+    client, kite, _clock = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        day_dir = root / "day"
+        minute_dir = root / "minute"
+        staging = root / "staging"
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="NIFTY", expiry=expiry, tokens=[40], seen_on=now.date()
+            )
+            # Write day parquet with zero volume for token 40.
+            dest = fetch_mod.series_path(day_dir, "NIFTY", expiry)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dcon = duckdb.connect()
+            try:
+                dcon.execute(
+                    """
+                    COPY (
+                        SELECT
+                            'NIFTY' AS underlying,
+                            DATE '2026-10-24' AS expiry,
+                            40::BIGINT AS token,
+                            'X' AS tradingsymbol,
+                            'CE' AS instrument_type,
+                            100.0::DOUBLE AS strike,
+                            75::INTEGER AS lot_size,
+                            TIMESTAMP '2026-10-24 00:00:00' AS ts,
+                            1.0::DOUBLE AS open,
+                            1.0::DOUBLE AS high,
+                            1.0::DOUBLE AS low,
+                            1.0::DOUBLE AS close,
+                            0::BIGINT AS volume,
+                            0::BIGINT AS oi
+                    ) TO ? (FORMAT parquet, COMPRESSION zstd)
+                    """,
+                    [str(dest)],
+                )
+            finally:
+                dcon.close()
+            traded = fetch_mod.traded_day_dates("NIFTY", expiry, 40, day_dir=day_dir)
+            _assert(traded == set(), f"traded={traded}")
+
+            states: dict[int, catalog.FetchState] = {}
+            result = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                states,
+                now=now,
+                interval="minute",
+                series_root=minute_dir,
+                day_dir=day_dir,
+                staging_dir=staging,
+                backfill_days=None,
+            )
+            _assert(kite.calls == 0, f"hist calls={kite.calls}")
+            _assert(result.skipped == 1, f"skipped={result.skipped}")
+            _assert(result.fetched == 0, "fetched")
+            st = catalog.get_fetch_state(con, 40, "minute")
+            _assert(st is not None and st.status == "done", f"status={st}")
+        finally:
+            con.close()
+
+
+def test_fetch_minute_days_wide_multi_chunk() -> None:
+    """backfill_days=120 yields two 60d historical requests per contract."""
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+    spans: list[tuple[Any, Any]] = []
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        _assert(interval == "minute", f"interval={interval}")
+        spans.append((from_date, to_date))
+        return _synth_candles(token, from_date, to_date, n=2, price=1.0)
+
+    client, kite, _clock = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="NIFTY", expiry=expiry, tokens=[41], seen_on=now.date()
+            )
+            result = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                {},
+                now=now,
+                interval="minute",
+                series_root=root / "minute",
+                staging_dir=root / "staging",
+                backfill_days=120,
+            )
+            _assert(result.fetched == 1, f"fetched={result.fetched}")
+            _assert(kite.calls == 2, f"hist calls={kite.calls}")
+            _assert(len(spans) == 2, f"spans={len(spans)}")
+        finally:
+            con.close()
+
+
+def test_fetch_combined_day_then_minute_order() -> None:
+    """run_fetch day pass then minute pass: all day hist calls precede minute calls."""
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    expiry = date(2026, 10, 27)
+    call_intervals: list[str] = []
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        call_intervals.append(interval)
+        if interval == "day":
+            return _synth_day_candles(token, from_date, to_date, n=3, price=float(token))
+        return _synth_candles(token, from_date, to_date, n=2, price=float(token))
+
+    client, kite, _clock = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        day_dir = root / "day"
+        minute_dir = root / "minute"
+        staging = root / "staging"
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="NIFTY", expiry=expiry, tokens=[50, 51], seen_on=now.date()
+            )
+            queue = [series]
+            day_states: dict[int, catalog.FetchState] = {}
+            minute_states: dict[int, catalog.FetchState] = {}
+            run_day = fetch_mod.run_fetch(
+                client,
+                con,
+                queue,
+                day_states,
+                now=now,
+                interval="day",
+                series_root=day_dir,
+                day_dir=day_dir,
+                staging_dir=staging,
+            )
+            run_min = fetch_mod.run_fetch(
+                client,
+                con,
+                queue,
+                minute_states,
+                now=now,
+                interval="minute",
+                series_root=minute_dir,
+                day_dir=day_dir,
+                staging_dir=staging,
+                backfill_days=60,
+            )
+            _assert(run_day.contracts_fetched == 2, f"day fetched={run_day.contracts_fetched}")
+            _assert(run_min.contracts_fetched == 2, f"min fetched={run_min.contracts_fetched}")
+            _assert(kite.calls == 4, f"calls={kite.calls}")
+            _assert(
+                call_intervals == ["day", "day", "minute", "minute"],
+                f"order={call_intervals}",
+            )
+            # Day-informed: traded days readable after day pass
+            traded = fetch_mod.traded_day_dates("NIFTY", expiry, 50, day_dir=day_dir)
+            _assert(traded is not None and len(traded) > 0, f"traded={traded}")
         finally:
             con.close()
 
@@ -2166,6 +2375,9 @@ def main() -> None:
         test_snapshot_rejects_weekend_and_batch_failure,
         test_snapshot_missing_keys_and_rank,
         test_fetch_day_backfill_and_rerun,
+        test_fetch_minute_days_all_skips_without_traded_days,
+        test_fetch_minute_days_wide_multi_chunk,
+        test_fetch_combined_day_then_minute_order,
         test_fetch_day_excludes_today_before_close,
         test_fetch_backfill_and_rerun,
         test_fetch_partial_rollback_and_dedupe,

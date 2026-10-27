@@ -456,7 +456,19 @@ def _cmd_daily_show(args: argparse.Namespace) -> None:
             con.close()
 
 
-def _cmd_fetch_interval(args: argparse.Namespace, *, interval: str) -> None:
+def _merge_series_by_key(*groups: list) -> list:
+    """Union Series lists by (underlying, expiry), preserving first-seen contract set."""
+    by_key: dict[tuple[str, date], object] = {}
+    for group in groups:
+        for s in group:
+            by_key.setdefault((s.underlying, s.expiry), s)
+    return list(by_key.values())
+
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    """Day candles (~2000d) then minute candles (--days window) for the same queue."""
+    import time as time_mod
+
     from . import catalog
     from . import fetch as fetch_mod
     from . import planner
@@ -464,17 +476,15 @@ def _cmd_fetch_interval(args: argparse.Namespace, *, interval: str) -> None:
     from . import universe
     from .client import KiteClient, SessionExpired
     from .paths import CATALOG_PATH, DAY_DIR, MINUTE_DIR, ymd as paths_ymd
-    from .planner import IntervalName
     from .progress import InterruptController, ProgressReporter, setup_run_logging
 
-    if interval not in ("minute", "day"):
-        raise SystemExit(f"unsupported interval: {interval}")
-    iv: IntervalName = interval  # type: ignore[assignment]
-    run_name = "fetch-day" if iv == "day" else "fetch"
-    series_root = DAY_DIR if iv == "day" else MINUTE_DIR
-    dir_label = "Day dir" if iv == "day" else "Minute dir"
+    try:
+        backfill_days = planner.parse_days_arg(getattr(args, "days", None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    days_label = "all" if backfill_days is None else str(backfill_days)
 
-    log_path = setup_run_logging(run_name, log_file=_optional_log_path(args))
+    log_path = setup_run_logging("fetch", log_file=_optional_log_path(args))
     reporter = ProgressReporter(logger=logging.getLogger("ohlcv"))
     interrupt = InterruptController()
     interrupt.install(on_soft_stop=reporter.soft_stop_announced)
@@ -490,7 +500,7 @@ def _cmd_fetch_interval(args: argparse.Namespace, *, interval: str) -> None:
 
         client = None
         catalog.ensure_schema(con)
-        run_id = catalog.start_run(con, run_name, started_at=started.replace(tzinfo=None))
+        run_id = catalog.start_run(con, "fetch", started_at=started.replace(tzinfo=None))
         try:
             count, archive_path = _run_sync(con)
         except (auth.NotLoggedIn, TokenException) as exc:
@@ -513,71 +523,102 @@ def _cmd_fetch_interval(args: argparse.Namespace, *, interval: str) -> None:
             raise SystemExit(str(exc)) from exc
 
         reporter.note(f"Synced {count} NFO contracts (archive {archive_path})")
-        series = universe.select_series(con, interval=iv)
+        series_day = universe.select_series(con, interval="day")
+        series_min = universe.select_series(con, interval="minute")
+        series = _merge_series_by_key(series_day, series_min)
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
-        fetch_states = catalog.list_fetch_states(con, interval=iv, tokens=tokens)
+        day_states = catalog.list_fetch_states(con, interval="day", tokens=tokens)
+        minute_states = catalog.list_fetch_states(con, interval="minute", tokens=tokens)
         now = datetime.now(auth.IST)
-        items = planner.build_queue(
+
+        # Queue order from ranks; pending counts summed for dry-run display.
+        day_items = planner.build_queue(
             series,
             ranks,
-            fetch_states,
+            day_states,
             now,
             expiry_filter=expiry_filter,
             underlying_filter=args.underlying,
             limit=args.max_series,
-            interval=iv,
+            interval="day",
         )
         series_by_key = {(s.underlying, s.expiry): s for s in series}
         queue_series = [
             series_by_key[(item.underlying, item.expiry)]
-            for item in items
+            for item in day_items
             if (item.underlying, item.expiry) in series_by_key
         ]
+        minute_items = planner.build_queue(
+            queue_series,
+            ranks,
+            minute_states,
+            now,
+            interval="minute",
+            backfill_days=backfill_days,
+        )
+        minute_by_key = {(i.underlying, i.expiry): i for i in minute_items}
 
         if args.dry_run:
             skip_cache: dict = {}
+            traded_cache: dict = {}
             print()
             print(
                 f"{'expiry':<10} {'underlying':<16} {'contracts':>9} "
-                f"{'requests':>9} {'skip~':>6} {'est_min':>8}"
+                f"{'day_req':>8} {'min_req':>8} {'skip~':>6} {'est_min':>8}"
             )
-            print("-" * 68)
+            print("-" * 78)
             total_req = 0
             total_sec = 0.0
             total_skip = 0
-            for item, s in zip(items, queue_series):
-                skip_n = fetch_mod.count_skippable(
+            for day_item, s in zip(day_items, queue_series):
+                min_item = minute_by_key.get((day_item.underlying, day_item.expiry))
+                min_pending = min_item.pending_requests if min_item else 0
+                day_skip = fetch_mod.count_skippable(
                     con,
                     s,
-                    fetch_states,
+                    day_states,
                     now=now,
                     untraded_cache=skip_cache,
-                    interval=iv,
+                    interval="day",
                 )
-                # Approximate: each skip removes one pending request.
-                adj_req = max(0, item.pending_requests - skip_n)
+                min_skip = fetch_mod.count_skippable(
+                    con,
+                    s,
+                    minute_states,
+                    now=now,
+                    untraded_cache=skip_cache,
+                    traded_days_cache=traded_cache,
+                    interval="minute",
+                    backfill_days=backfill_days,
+                    day_dir=DAY_DIR,
+                )
+                adj_day = max(0, day_item.pending_requests - day_skip)
+                adj_min = max(0, min_pending - min_skip)
+                adj_req = adj_day + adj_min
                 adj_sec = adj_req * planner.request_seconds()
+                skip_n = day_skip + min_skip
                 total_req += adj_req
                 total_sec += adj_sec
                 total_skip += skip_n
                 print(
-                    f"{paths_ymd(item.expiry):<10} {item.underlying:<16} {item.contracts:>9} "
-                    f"{adj_req:>9} {skip_n:>6} {adj_sec / 60:>8.1f}"
+                    f"{paths_ymd(day_item.expiry):<10} {day_item.underlying:<16} "
+                    f"{day_item.contracts:>9} {adj_day:>8} {adj_min:>8} "
+                    f"{skip_n:>6} {adj_sec / 60:>8.1f}"
                 )
             catalog.finish_run(
                 con,
                 run_id,
                 finished_at=datetime.now(auth.IST).replace(tzinfo=None),
                 note=(
-                    f"dry_run interval={iv} series={len(items)} requests~={total_req} "
-                    f"skip~={total_skip}"
+                    f"dry_run days={days_label} series={len(day_items)} "
+                    f"requests~={total_req} skip~={total_skip}"
                 ),
             )
             print()
             print(
-                f"Dry run ({iv}): {len(items)} series, ~{total_req} requests "
-                f"(~{total_skip} untraded skips), ~{total_sec / 60:.1f} min"
+                f"Dry run (day then minute, --days={days_label}): {len(day_items)} series, "
+                f"~{total_req} requests (~{total_skip} skips), ~{total_sec / 60:.1f} min"
             )
             print(f"Catalog: {CATALOG_PATH}")
             print(f"Log: {log_path}")
@@ -597,10 +638,16 @@ def _cmd_fetch_interval(args: argparse.Namespace, *, interval: str) -> None:
 
         client = KiteClient(kite)
         contracts_total = sum(len(s.contracts) for s in queue_series)
-        reporter.set_totals(contracts_total=contracts_total)
+        # Heartbeat totals count both passes (day + minute) over the same contracts.
+        reporter.set_totals(contracts_total=contracts_total * 2)
         reporter.note(
-            f"Fetch queue ({iv}): {len(queue_series)} series, {contracts_total} contracts"
+            f"Fetch queue: {len(queue_series)} series, {contracts_total} contracts "
+            f"(day ~{planner.DAY_BACKFILL_DAYS}d then minute --days={days_label})"
         )
+
+        deadline = None
+        if args.max_minutes is not None:
+            deadline = time_mod.monotonic() + float(args.max_minutes) * 60.0
 
         def _on_series_start(idx: int, total: int, s: universe.Series) -> None:
             reporter.series_start(
@@ -627,22 +674,47 @@ def _cmd_fetch_interval(args: argparse.Namespace, *, interval: str) -> None:
                 stop_reason=result.stop_reason,
             )
 
+        run_day = None
+        run_min = None
         try:
-            run = fetch_mod.run_fetch(
+            reporter.note("Pass 1/2: day candles")
+            run_day = fetch_mod.run_fetch(
                 client,
                 con,
                 queue_series,
-                fetch_states,
+                day_states,
                 now=now,
-                max_series=args.max_series,
+                max_series=None,  # already applied when building queue
                 max_minutes=args.max_minutes,
-                interval=iv,
-                series_root=series_root,
+                interval="day",
+                series_root=DAY_DIR,
+                day_dir=DAY_DIR,
                 on_series=_on_series,
                 on_contract=reporter.contract,
                 on_series_start=_on_series_start,
                 interrupt=interrupt,
+                deadline_monotonic=deadline,
             )
+            if run_day.stopped_reason is None:
+                reporter.note("Pass 2/2: minute candles")
+                run_min = fetch_mod.run_fetch(
+                    client,
+                    con,
+                    queue_series,
+                    minute_states,
+                    now=now,
+                    max_series=None,
+                    max_minutes=args.max_minutes,
+                    interval="minute",
+                    series_root=MINUTE_DIR,
+                    day_dir=DAY_DIR,
+                    backfill_days=backfill_days,
+                    on_series=_on_series,
+                    on_contract=reporter.contract,
+                    on_series_start=_on_series_start,
+                    interrupt=interrupt,
+                    deadline_monotonic=deadline,
+                )
         except SessionExpired as exc:
             catalog.finish_run(
                 con,
@@ -655,61 +727,77 @@ def _cmd_fetch_interval(args: argparse.Namespace, *, interval: str) -> None:
             )
             _login_exit(exc)
 
+        def _sum_attr(attr: str) -> int:
+            total = 0
+            for run in (run_day, run_min):
+                if run is not None:
+                    total += getattr(run, attr)
+            return total
+
+        locked = []
+        if run_day is not None:
+            locked.extend(run_day.locked)
+        if run_min is not None:
+            locked.extend(run_min.locked)
+        stopped = None
+        if run_day is not None and run_day.stopped_reason:
+            stopped = run_day.stopped_reason
+        elif run_min is not None and run_min.stopped_reason:
+            stopped = run_min.stopped_reason
+
         finished = datetime.now(auth.IST).replace(tzinfo=None)
         note_parts = [
-            f"interval={iv}",
-            f"series_done={run.series_done}",
-            f"fetched={run.contracts_fetched}",
-            f"skipped={run.contracts_skipped}",
-            f"rows={run.rows_written}",
-            f"errors={run.errors}",
-            f"gave_up={run.gave_up}",
+            f"days={days_label}",
+            f"series={len(queue_series)}",
+            f"day_done={run_day.series_done if run_day else 0}",
+            f"min_done={run_min.series_done if run_min else 0}",
+            f"fetched={_sum_attr('contracts_fetched')}",
+            f"skipped={_sum_attr('contracts_skipped')}",
+            f"rows={_sum_attr('rows_written')}",
+            f"errors={_sum_attr('errors')}",
+            f"gave_up={_sum_attr('gave_up')}",
         ]
-        if run.locked:
+        if locked:
             note_parts.append(
-                "locked="
-                + ",".join(f"{u}:{paths_ymd(e)}" for u, e in run.locked)
+                "locked=" + ",".join(f"{u}:{paths_ymd(e)}" for u, e in locked)
             )
-        if run.stopped_reason:
-            note_parts.append(f"stopped={run.stopped_reason}")
+        if stopped:
+            note_parts.append(f"stopped={stopped}")
         catalog.finish_run(
             con,
             run_id,
             finished_at=finished,
             requests=client.counters.requests,
             retries=client.counters.retries,
-            errors=client.counters.errors + run.errors,
+            errors=client.counters.errors + _sum_attr("errors"),
             note=" ".join(note_parts),
         )
 
         reporter.clear_heartbeat()
         print()
         print(
-            f"Done ({iv}): {run.series_done} series, fetched={run.contracts_fetched}, "
-            f"skipped={run.contracts_skipped}, rows={run.rows_written:,}, "
-            f"errors={run.errors}, gave_up={run.gave_up}"
+            f"Done (day+minute, --days={days_label}): "
+            f"day_series={run_day.series_done if run_day else 0}, "
+            f"min_series={run_min.series_done if run_min else 0}, "
+            f"fetched={_sum_attr('contracts_fetched')}, "
+            f"skipped={_sum_attr('contracts_skipped')}, "
+            f"rows={_sum_attr('rows_written'):,}, "
+            f"errors={_sum_attr('errors')}, gave_up={_sum_attr('gave_up')}"
         )
-        if run.locked:
-            print(f"Locked files ({len(run.locked)}): close notebooks and re-run")
-            for u, e in run.locked:
+        if locked:
+            print(f"Locked files ({len(locked)}): close notebooks and re-run")
+            for u, e in locked:
                 print(f"  {u} {paths_ymd(e)}")
-        if run.stopped_reason:
-            print(f"Stopped: {run.stopped_reason}")
-        print(f"{dir_label}: {series_root}")
+        if stopped:
+            print(f"Stopped: {stopped}")
+        print(f"Day dir: {DAY_DIR}")
+        print(f"Minute dir: {MINUTE_DIR}")
         print(f"Catalog: {CATALOG_PATH}")
         print(f"Log: {log_path}")
     finally:
         interrupt.restore()
         if con is not None:
             con.close()
-
-
-def cmd_fetch(args: argparse.Namespace) -> None:
-    _cmd_fetch_interval(args, interval="minute")
-
-
-def cmd_fetch_day(args: argparse.Namespace) -> None:
-    _cmd_fetch_interval(args, interval="day")
 
 
 def _catalog_ro():
@@ -1083,6 +1171,13 @@ def cmd_queue(args: argparse.Namespace) -> None:
         interval = getattr(args, "interval", "minute") or "minute"
         if interval not in ("minute", "day"):
             raise SystemExit(f"unsupported --interval: {interval}")
+        try:
+            backfill_days = planner.parse_days_arg(getattr(args, "days", None))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if interval == "day":
+            backfill_days = planner.BACKFILL_WINDOW_DAYS  # ignored for day estimates
+        days_label = "all" if backfill_days is None else str(backfill_days)
         series = universe.select_series(con, interval=interval)
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
@@ -1097,17 +1192,21 @@ def cmd_queue(args: argparse.Namespace) -> None:
             underlying_filter=args.underlying,
             limit=args.limit,
             interval=interval,
+            backfill_days=backfill_days,
         )
 
         catalog.finish_run(
             con,
             run_id,
             finished_at=datetime.now(auth.IST).replace(tzinfo=None),
-            note=f"interval={interval} series={len(items)} contracts_synced={count}",
+            note=(
+                f"interval={interval} days={days_label} series={len(items)} "
+                f"contracts_synced={count}"
+            ),
         )
 
         print(f"Synced {count} NFO contracts (archive {archive_path})")
-        print(f"Interval: {interval}")
+        print(f"Interval: {interval}" + (f"  --days={days_label}" if interval == "minute" else ""))
         if not ranks:
             print("Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering")
         print()
@@ -1156,7 +1255,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ohlcv",
         description=(
-            "NFO OHLCV tools (probe, sync, rank, queue, daily, fetch, fetch-day, status, show)."
+            "NFO OHLCV tools (probe, sync, rank, queue, daily, fetch, status, show)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1221,6 +1320,13 @@ def main() -> None:
         default="minute",
         help="Candle interval for pending-request estimates (default: minute).",
     )
+    p_queue.add_argument(
+        "-d",
+        "--days",
+        default="60",
+        metavar="N|all",
+        help="Minute backfill window for estimates (default: 60). Ignored when --interval day.",
+    )
     p_queue.set_defaults(func=cmd_queue)
 
     p_daily = sub.add_parser(
@@ -1250,7 +1356,10 @@ def main() -> None:
 
     p_fetch = sub.add_parser(
         "fetch",
-        help="Fetch minute candles for queued NFO series (expiry-first, incremental).",
+        help=(
+            "Fetch day (~2000d) then minute candles for queued NFO series "
+            "(expiry-first, incremental)."
+        ),
     )
     p_fetch.add_argument(
         "--expiry",
@@ -1263,6 +1372,16 @@ def main() -> None:
         help="Filter to one underlying name (e.g. NIFTY).",
     )
     p_fetch.add_argument(
+        "-d",
+        "--days",
+        default="60",
+        metavar="N|all",
+        help=(
+            "Minute backfill window in inclusive calendar days (default: 60), "
+            "or 'all' to bound from traded day bars after the day pass."
+        ),
+    )
+    p_fetch.add_argument(
         "--max-series",
         type=int,
         default=None,
@@ -1272,7 +1391,7 @@ def main() -> None:
         "--max-minutes",
         type=float,
         default=None,
-        help="Stop after about M minutes (finishes current contract, then commits).",
+        help="Stop after about M minutes across both passes (finishes current contract).",
     )
     p_fetch.add_argument(
         "--dry-run",
@@ -1286,45 +1405,6 @@ def main() -> None:
         help="Write run log to PATH (default: data/ohlcv/nfo/logs/fetch_YYYYMMDD_HHMMSS.log).",
     )
     p_fetch.set_defaults(func=cmd_fetch)
-
-    p_fetch_day = sub.add_parser(
-        "fetch-day",
-        help="Fetch day candles for queued NFO series (full history ~2000d, incremental).",
-    )
-    p_fetch_day.add_argument(
-        "--expiry",
-        default=None,
-        help="Filter to one expiry (yyyymmdd or YYYY-MM-DD).",
-    )
-    p_fetch_day.add_argument(
-        "--underlying",
-        default=None,
-        help="Filter to one underlying name (e.g. NIFTY).",
-    )
-    p_fetch_day.add_argument(
-        "--max-series",
-        type=int,
-        default=None,
-        help="Process at most N series then stop (commits progress).",
-    )
-    p_fetch_day.add_argument(
-        "--max-minutes",
-        type=float,
-        default=None,
-        help="Stop after about M minutes (finishes current contract, then commits).",
-    )
-    p_fetch_day.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print queue and skip estimates without calling historical_data().",
-    )
-    p_fetch_day.add_argument(
-        "--log-file",
-        default=None,
-        metavar="PATH",
-        help="Write run log to PATH (default: data/ohlcv/nfo/logs/fetch-day_YYYYMMDD_HHMMSS.log).",
-    )
-    p_fetch_day.set_defaults(func=cmd_fetch_day)
 
     p_status = sub.add_parser(
         "status",
