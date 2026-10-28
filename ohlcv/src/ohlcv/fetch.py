@@ -35,6 +35,7 @@ from .paths import (
     MINUTE_DIR,
     STAGING_DIR,
     ensure_dir,
+    paths_for,
     sanitize_underlying,
     series_path,
     ymd,
@@ -233,7 +234,9 @@ def can_skip_untraded(
                 untraded_cache[day] = None
             else:
                 try:
-                    untraded_cache[day] = untraded_tokens(day)
+                    untraded_cache[day] = untraded_tokens(
+                        day, dest_dir=paths_for(profile.id).daily_dir
+                    )
                 except FileNotFoundError:
                     untraded_cache[day] = None
         cached = untraded_cache[day]

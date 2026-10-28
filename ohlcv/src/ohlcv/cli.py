@@ -189,11 +189,15 @@ def cmd_rank(args: argparse.Namespace) -> None:
     from . import catalog
     from . import rank as rank_mod
     from .client import KiteClient, SessionExpired
-    from .paths import CATALOG_PATH
+    from .markets import get_market
+    from .paths import paths_for
 
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    mpaths = paths_for(market_id)
     started = datetime.now(auth.IST)
     try:
-        con = catalog.connect()
+        con = catalog.connect(mpaths.catalog_path)
     except catalog.CatalogLocked as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -202,8 +206,10 @@ def cmd_rank(args: argparse.Namespace) -> None:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "rank", started_at=started.replace(tzinfo=None))
         try:
-            count, archive_path = _run_sync(con)
-            print(f"Synced {count} NFO contracts (archive {archive_path})")
+            count, archive_path = _run_sync(con, market_id=market_id)
+            print(
+                f"Synced {count} {profile.exchange} contracts (archive {archive_path})"
+            )
             # Prefer final snapshot (no Kite). Fall back to FUT day candles if needed.
             snap = catalog.latest_snapshot(con, status="final")
             need_kite = snap is None or args.force
@@ -222,9 +228,20 @@ def cmd_rank(args: argparse.Namespace) -> None:
                 client = KiteClient(kite)
             # When force and a final snap exists, re-rank from the snap (still no hist).
             if args.force and snap is not None:
-                result = rank_mod.rank_from_snapshot(con, snap.trade_date)
+                result = rank_mod.rank_from_snapshot(
+                    con,
+                    snap.trade_date,
+                    market=market_id,
+                    dest_dir=mpaths.daily_dir,
+                )
             else:
-                result = rank_mod.refresh_rank(client, con, force=args.force)
+                result = rank_mod.refresh_rank(
+                    client,
+                    con,
+                    force=args.force,
+                    market=market_id,
+                    dest_dir=mpaths.daily_dir,
+                )
         except SessionExpired as exc:
             catalog.finish_run(
                 con,
@@ -279,7 +296,7 @@ def cmd_rank(args: argparse.Namespace) -> None:
                 print(f"  {err}", file=sys.stderr)
 
         _print_ranks(con)
-        print(f"Catalog: {CATALOG_PATH}")
+        print(f"Catalog: {mpaths.catalog_path}")
     finally:
         con.close()
 
@@ -289,14 +306,23 @@ def cmd_daily(args: argparse.Namespace) -> None:
     from . import rank as rank_mod
     from . import snapshot
     from .client import KiteClient, RetryExhausted, SessionExpired
-    from .paths import CATALOG_PATH, DAILY_DIR
+    from .markets import get_market
+    from .paths import paths_for
     from .progress import InterruptController, ProgressReporter, setup_run_logging
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    mpaths = paths_for(market_id)
 
     if args.show is not None:
         _cmd_daily_show(args)
         return
 
-    log_path = setup_run_logging("daily", log_file=_optional_log_path(args))
+    log_path = setup_run_logging(
+        "daily",
+        log_file=_optional_log_path(args),
+        logs_dir=mpaths.logs_dir,
+    )
     reporter = ProgressReporter(logger=logging.getLogger("ohlcv"))
     interrupt = InterruptController()
     interrupt.install(on_soft_stop=reporter.soft_stop_announced)
@@ -305,7 +331,7 @@ def cmd_daily(args: argparse.Namespace) -> None:
     con = None
     try:
         try:
-            con = catalog.connect()
+            con = catalog.connect(mpaths.catalog_path)
         except catalog.CatalogLocked as exc:
             raise SystemExit(str(exc)) from exc
 
@@ -313,8 +339,10 @@ def cmd_daily(args: argparse.Namespace) -> None:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "daily", started_at=started.replace(tzinfo=None))
         try:
-            count, archive_path = _run_sync(con)
-            reporter.note(f"Synced {count} NFO contracts (archive {archive_path})")
+            count, archive_path = _run_sync(con, market_id=market_id)
+            reporter.note(
+                f"Synced {count} {profile.exchange} contracts (archive {archive_path})"
+            )
             contracts = snapshot.live_contracts(con)
             dry = snapshot.estimate_dry_run(contracts)
             if args.dry_run:
@@ -326,9 +354,10 @@ def cmd_daily(args: argparse.Namespace) -> None:
                 )
                 print(
                     f"Dry run: {dry.contracts} contracts, {dry.batches} quote batches, "
-                    f"~{dry.estimated_seconds / 60:.1f} min"
+                    f"~{dry.estimated_seconds / 60:.1f} min "
+                    f"(session_end {profile.session_end.strftime('%H:%M')} IST)"
                 )
-                print(f"Catalog: {CATALOG_PATH}")
+                print(f"Catalog: {mpaths.catalog_path}")
                 print(f"Log: {log_path}")
                 return
 
@@ -359,6 +388,7 @@ def cmd_daily(args: argparse.Namespace) -> None:
             result = snapshot.take_snapshot(
                 client,
                 contracts,
+                market=market_id,
                 should_stop=interrupt.should_stop,
                 on_batch=_on_batch,
             )
@@ -376,7 +406,12 @@ def cmd_daily(args: argparse.Namespace) -> None:
                     path=str(result.path),
                 ),
             )
-            rank_result = rank_mod.rank_from_snapshot(con, result.trade_date)
+            rank_result = rank_mod.rank_from_snapshot(
+                con,
+                result.trade_date,
+                market=market_id,
+                dest_dir=mpaths.daily_dir,
+            )
         except snapshot.SnapshotRejected as exc:
             catalog.finish_run(
                 con,
@@ -445,8 +480,8 @@ def cmd_daily(args: argparse.Namespace) -> None:
             f"requests={client.counters.requests if client else 0})"
         )
         _print_ranks(con)
-        print(f"Daily dir: {DAILY_DIR}")
-        print(f"Catalog: {CATALOG_PATH}")
+        print(f"Daily dir: {mpaths.daily_dir}")
+        print(f"Catalog: {mpaths.catalog_path}")
         print(f"Log: {log_path}")
     finally:
         interrupt.restore()
@@ -457,14 +492,19 @@ def cmd_daily(args: argparse.Namespace) -> None:
 def _cmd_daily_show(args: argparse.Namespace) -> None:
     from . import catalog
     from . import read as read_mod
-    from .paths import CATALOG_PATH, DAILY_DIR
+    from .paths import paths_for
+
+    market_id = _market_id(args)
+    mpaths = paths_for(market_id)
+    daily_dir = mpaths.daily_dir
+    catalog_path = mpaths.catalog_path
 
     meta = None
     con = None
     try:
-        if CATALOG_PATH.is_file():
+        if catalog_path.is_file():
             try:
-                con = catalog.connect()
+                con = catalog.connect(catalog_path)
             except catalog.CatalogLocked as exc:
                 raise SystemExit(str(exc)) from exc
             catalog.ensure_schema(con)
@@ -477,7 +517,7 @@ def _cmd_daily_show(args: argparse.Namespace) -> None:
             if con is not None:
                 meta = catalog.latest_snapshot(con)
             if meta is None:
-                files = sorted(DAILY_DIR.glob("*.parquet")) if DAILY_DIR.is_dir() else []
+                files = sorted(daily_dir.glob("*.parquet")) if daily_dir.is_dir() else []
                 if not files:
                     raise SystemExit("no daily snapshots recorded")
                 trade_date = _parse_ymd(files[-1].stem)
@@ -491,14 +531,14 @@ def _cmd_daily_show(args: argparse.Namespace) -> None:
                 f"missing={meta.missing}"
             )
 
-        rows = read_mod.daily(trade_date)
+        rows = read_mod.daily(trade_date, dest_dir=daily_dir)
         traded = sum(1 for r in rows if r.get("traded") or (r.get("volume") or 0) > 0)
         total_vol = sum(int(r.get("volume") or 0) for r in rows)
         by_ul: dict[str, float] = {}
         for r in rows:
             ul = str(r["underlying"])
             by_ul[ul] = by_ul.get(ul, 0.0) + float(r.get("traded_value") or 0.0)
-        print(f"File: {read_mod.daily_path(trade_date)}")
+        print(f"File: {read_mod.daily_path(trade_date, dest_dir=daily_dir)}")
         print(f"Rows: {len(rows)} traded={traded} volume={total_vol:,}")
         print()
         print(f"{'#':<4} {'underlying':<16} {'traded_value':>16}")
@@ -508,12 +548,89 @@ def _cmd_daily_show(args: argparse.Namespace) -> None:
             start=1,
         ):
             print(f"{i:<4} {ul:<16} {tv:>16,.0f}")
-        print(f"Catalog: {CATALOG_PATH}")
+        print(f"Catalog: {catalog_path}")
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
     finally:
         if con is not None:
             con.close()
+
+
+def cmd_continuous(args: argparse.Namespace) -> None:
+    from datetime import timedelta
+
+    from . import catalog
+    from . import continuous as cont_mod
+    from .client import KiteClient, RetryExhausted, SessionExpired
+    from .markets import get_market
+    from .paths import paths_for
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    mpaths = paths_for(market_id)
+    underlying = (args.underlying or "").strip().upper()
+    from_date = _parse_ymd(args.from_date) if args.from_date else None
+    to_date = _parse_ymd(args.to_date) if args.to_date else None
+
+    try:
+        con = catalog.connect(mpaths.catalog_path)
+    except catalog.CatalogLocked as exc:
+        raise SystemExit(str(exc)) from exc
+
+    try:
+        catalog.ensure_schema(con)
+        fut = cont_mod.nearest_live_fut(con, underlying)
+        if fut is None:
+            raise SystemExit(
+                f"no live FUT for {underlying!r} on {profile.exchange}; "
+                f"run: uv run ohlcv sync --market {market_id}"
+            )
+        end = (
+            to_date
+            if to_date is not None
+            else datetime.now(auth.IST).date() - timedelta(days=1)
+        )
+        start = (
+            from_date
+            if from_date is not None
+            else end - timedelta(days=cont_mod.DEFAULT_LOOKBACK_DAYS - 1)
+        )
+        dest = cont_mod.continuous_path(market_id, underlying)
+        if args.dry_run:
+            print(
+                f"Dry run: {profile.exchange} {fut.tradingsymbol} token={fut.token} "
+                f"continuous day {start}..{end} -> {dest}"
+            )
+            return
+
+        try:
+            kite = auth.get_kite()
+        except (auth.NotLoggedIn, TokenException) as exc:
+            _login_exit(exc)
+        client = KiteClient(kite)
+        try:
+            result = cont_mod.fetch_continuous(
+                client,
+                con,
+                underlying,
+                market=market_id,
+                from_date=from_date,
+                to_date=to_date,
+            )
+        except cont_mod.ContinuousRejected as exc:
+            raise SystemExit(str(exc)) from exc
+        except RetryExhausted as exc:
+            raise SystemExit(f"historical retries exhausted: {exc}") from exc
+        except SessionExpired as exc:
+            _login_exit(exc)
+        print(
+            f"Continuous {result.underlying} ({result.tradingsymbol} token={result.token}) "
+            f"{ymd(result.from_date)}..{ymd(result.to_date)} rows={result.rows}"
+        )
+        print(f"Wrote {result.path}")
+        print(f"Catalog: {mpaths.catalog_path}")
+    finally:
+        con.close()
 
 
 def _merge_series_by_key(*groups: list) -> list:
@@ -1332,10 +1449,8 @@ def cmd_queue(args: argparse.Namespace) -> None:
         print(f"Interval: {interval}" + (f"  --days={days_label}" if interval == "minute" else ""))
         if not ranks:
             print(
-                "Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering "
-                "(rank/daily remain NFO-only)"
-                if market_id != "nfo"
-                else "Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering"
+                f"Note: no ranks yet - run `uv run ohlcv rank --market {market_id}` "
+                "for traded-value ordering"
             )
         print()
         print(
@@ -1383,8 +1498,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ohlcv",
         description=(
-            "OHLCV tools (probe, sync, rank, queue, daily, fetch, status, show). "
-            "Use --market nfo|mcx|cds on sync/queue/fetch/status/show (default nfo)."
+            "OHLCV tools (probe, sync, rank, queue, daily, continuous, fetch, "
+            "status, show). Use --market nfo|mcx|cds (default nfo)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1420,8 +1535,12 @@ def main() -> None:
 
     p_rank = sub.add_parser(
         "rank",
-        help="Rank underlyings from final quote snapshot or FUT day candles.",
+        help=(
+            "Rank underlyings from final quote snapshot or FUT day candles "
+            "(per --market)."
+        ),
     )
+    _add_market_arg(p_rank)
     p_rank.add_argument(
         "--force",
         action="store_true",
@@ -1468,8 +1587,12 @@ def main() -> None:
 
     p_daily = sub.add_parser(
         "daily",
-        help="End-of-day quote() snapshot of all live NFO contracts (run after 15:40 IST).",
+        help=(
+            "End-of-day quote() snapshot of all live contracts for --market "
+            "(after that market's session_end IST)."
+        ),
     )
+    _add_market_arg(p_daily)
     p_daily.add_argument(
         "--dry-run",
         action="store_true",
@@ -1487,9 +1610,45 @@ def main() -> None:
         "--log-file",
         default=None,
         metavar="PATH",
-        help="Write run log to PATH (default: data/ohlcv/nfo/logs/daily_YYYYMMDD_HHMMSS.log).",
+        help=(
+            "Write run log to PATH "
+            "(default: data/ohlcv/<market>/logs/daily_YYYYMMDD_HHMMSS.log)."
+        ),
     )
     p_daily.set_defaults(func=cmd_daily)
+
+    p_cont = sub.add_parser(
+        "continuous",
+        help=(
+            "Fetch continuous day candles for an underlying's nearest live FUT "
+            "(writes data/ohlcv/<market>/continuous/<UNDERLYING>.parquet)."
+        ),
+    )
+    _add_market_arg(p_cont)
+    p_cont.add_argument(
+        "underlying",
+        help="Underlying name (e.g. NIFTY, GOLD, USDINR).",
+    )
+    p_cont.add_argument(
+        "--from",
+        dest="from_date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Start date (default: ~2000 calendar days before --to).",
+    )
+    p_cont.add_argument(
+        "--to",
+        dest="to_date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="End date (default: yesterday IST).",
+    )
+    p_cont.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print token and date range without calling historical_data().",
+    )
+    p_cont.set_defaults(func=cmd_continuous)
 
     p_fetch = sub.add_parser(
         "fetch",

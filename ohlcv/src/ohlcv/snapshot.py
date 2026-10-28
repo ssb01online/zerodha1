@@ -1,4 +1,4 @@
-"""End-of-day quote() snapshot of all live NFO contracts."""
+"""End-of-day quote() snapshot of all live contracts for a market."""
 
 from __future__ import annotations
 
@@ -16,8 +16,9 @@ from kitetools import auth
 
 from .catalog import ContractRow, list_contracts
 from .client import KiteClient, RetryExhausted
-from .paths import DAILY_DIR, STAGING_DIR, ensure_dir, ymd
-from .universe import SESSION_END
+from .markets import MarketProfile
+from .paths import DAILY_DIR, STAGING_DIR, ensure_dir, paths_for, ymd
+from .universe import resolve_market
 
 QUOTE_BATCH_SIZE = 500
 QUOTE_PACE_S = 1.0
@@ -59,7 +60,7 @@ def live_contracts(
     *,
     seen_on: date | None = None,
 ) -> list[ContractRow]:
-    """NFO contracts whose last_seen matches today's master sync date."""
+    """Contracts whose last_seen matches today's master sync date."""
     seen_on = seen_on if seen_on is not None else _today_ist()
     return [c for c in list_contracts(con) if c.last_seen == seen_on]
 
@@ -74,13 +75,18 @@ def estimate_dry_run(contracts: Sequence[ContractRow]) -> SnapshotDryRun:
     )
 
 
-def snapshot_status(now: datetime | None = None) -> str:
+def snapshot_status(
+    now: datetime | None = None,
+    *,
+    market: MarketProfile | str | None = None,
+) -> str:
+    profile = resolve_market(market)
     now = now if now is not None else _now_ist()
     if now.tzinfo is None:
         now = now.replace(tzinfo=auth.IST)
     else:
         now = now.astimezone(auth.IST)
-    session_end = datetime.combine(now.date(), SESSION_END, tzinfo=auth.IST)
+    session_end = datetime.combine(now.date(), profile.session_end, tzinfo=auth.IST)
     return "final" if now >= session_end else "intraday"
 
 
@@ -271,6 +277,7 @@ def fetch_quotes(
     client: KiteClient,
     contracts: Sequence[ContractRow],
     *,
+    market: MarketProfile | str | None = None,
     should_stop: Callable[[], str | None] | None = None,
     on_batch: Callable[[int, int, int, int], None] | None = None,
 ) -> tuple[dict[int, dict[str, Any]], int]:
@@ -278,6 +285,7 @@ def fetch_quotes(
 
     ``on_batch(batch_index, batch_total, contracts_done, contracts_total)`` is optional.
     """
+    profile = resolve_market(market)
     by_token: dict[int, dict[str, Any]] = {}
     total = len(contracts)
     batch_total = (total + QUOTE_BATCH_SIZE - 1) // QUOTE_BATCH_SIZE if total else 0
@@ -287,7 +295,7 @@ def fetch_quotes(
             if reason is not None:
                 raise SnapshotRejected(f"stopped: {reason}")
         batch = contracts[i : i + QUOTE_BATCH_SIZE]
-        keys = [f"NFO:{c.tradingsymbol}" for c in batch]
+        keys = [f"{profile.exchange}:{c.tradingsymbol}" for c in batch]
         data = client.quote(keys)
         for q in data.values():
             token = q.get("instrument_token")
@@ -304,6 +312,7 @@ def take_snapshot(
     client: KiteClient,
     contracts: Sequence[ContractRow],
     *,
+    market: MarketProfile | str | None = None,
     now: datetime | None = None,
     run_date: date | None = None,
     dest_dir: Path | None = None,
@@ -312,8 +321,9 @@ def take_snapshot(
     on_batch: Callable[[int, int, int, int], None] | None = None,
 ) -> SnapshotResult:
     """Fetch quotes, validate session, write daily/yyyymmdd.parquet."""
+    profile = resolve_market(market)
     if not contracts:
-        raise SnapshotRejected("no live NFO contracts to snapshot")
+        raise SnapshotRejected(f"no live {profile.exchange} contracts to snapshot")
 
     now = now if now is not None else _now_ist()
     if now.tzinfo is None:
@@ -321,11 +331,14 @@ def take_snapshot(
     else:
         now = now.astimezone(auth.IST)
     run_date = run_date if run_date is not None else now.date()
-    dest_dir = dest_dir if dest_dir is not None else DAILY_DIR
+    mpaths = paths_for(profile.id)
+    dest_dir = dest_dir if dest_dir is not None else mpaths.daily_dir
+    staging_dir = staging_dir if staging_dir is not None else mpaths.staging_dir
 
     by_token, missing = fetch_quotes(
         client,
         contracts,
+        market=profile,
         should_stop=should_stop,
         on_batch=on_batch,
     )
@@ -359,7 +372,7 @@ def take_snapshot(
             "take the snapshot on the session day after close."
         )
 
-    status = snapshot_status(now)
+    status = snapshot_status(now, market=profile)
     dest = dest_dir / f"{ymd(trade_date)}.parquet"
     _write_parquet(rows, dest, staging_dir=staging_dir)
     taken_at = now.replace(tzinfo=None)

@@ -21,7 +21,7 @@
 - `historical_data(instrument_token, from_date, to_date, interval, continuous=False, oi=False)`; intervals: minute, 3minute, 5minute, 10minute, 15minute, 30minute, 60minute, day.
 - Candle = `[timestamp, open, high, low, close, volume(, oi)]`, timestamps in IST (+0530). SDK returns dicts (`date`, `open`, `high`, `low`, `close`, `volume`, optional `oi`).
 - Instrument master only lists live contracts; F&O tokens change every expiry. Cache `instruments()` daily to keep tokens for expired contracts.
-- `continuous=1` works only for NFO/MCX futures and returns day candles only.
+- `continuous=1` works for NFO/MCX/CDS futures and returns day candles only (minute+continuous → InputException).
 - Max date range (verified Phase 0 probe `data/ohlcv/nfo/_probe/20261025-213003.json`, token NIFTY 50):
   - **minute: 60 days** (API error text: `interval exceeds max limit: 60 days`). Inclusive calendar span of 61 days still returned OK once; design chunk size = **60**.
   - **day: ≥2001 days** (all probe spans succeeded; true upper bound not hit).
@@ -107,7 +107,6 @@ CLI: `uv run ohlcv fetch|status|show|queue --market nfo|mcx|cds` (default `nfo`)
 - `fetch` writes day/minute parquet under `data/ohlcv/<market>/` and updates that market’s `catalog.duckdb` / logs.
 - Same day-then-minute fetch as NFO (minute ≤60d chunks, day ~2000d) for whatever contracts are in the catalog/queue.
 - `status` / `show` open the per-market catalog and series roots.
-- **Still NFO-only:** `rank`, `daily` quote snapshots (untraded-token skip is a no-op without snapshots).
 - Offline: `uv run python -m ohlcv.selftest` (includes MCX session / chunk / fetch tests).
 
 ## OHLCV multi-market options (Phase 4)
@@ -119,7 +118,6 @@ CLI: `--types all|fut|opt` on `sync` / `queue` / `fetch` / `status` (default `al
 - **Dual nearest-3 universe** per underlying: nearest 3 **FUT** expiry dates ∪ nearest 3 **CE/PE** expiry dates, then unfinished expired. Weekly option dates no longer crowd monthly FUT out of the live set (GOLD-style).
 - Shared expiry → one mixed series (NFO-like). Mismatched FUT vs option expiries → separate series under the same underlying.
 - No strike/ATM thinning — use `--underlying` / `--expiry` / `--max-series` for dense chains (~16k MCX option rows after full sync).
-- `rank` / `daily` remain NFO-only.
 - Offline: `uv run python -m ohlcv.selftest` (sync options, dual-pool, `--types` queue filter).
 
 Example:
@@ -130,6 +128,16 @@ uv run ohlcv fetch --market mcx --types opt --underlying GOLD --max-series 3
 uv run ohlcv fetch --market mcx --types fut
 ```
 
+## OHLCV multi-market ops polish (Phase 5)
+
+CLI: `uv run ohlcv daily|rank|continuous --market nfo|mcx|cds` (default `nfo`).
+
+- `daily`: end-of-session `quote()` of all live catalog rows (`last_seen == today`); quote keys use `{EXCHANGE}:{tradingsymbol}`; `final` vs `intraday` uses that market’s `session_end` (NFO 15:40, CDS 17:00, MCX 23:30); writes `data/ohlcv/<market>/daily/yyyymmdd.parquet` and ranks from the snapshot.
+- `rank`: same prefer-snapshot / FUT-day fallback per market catalog + `daily/` dir.
+- Fetch untraded-token skip reads `paths_for(market).daily_dir` (no longer hard-wired to NFO).
+- `continuous UNDERLYING`: nearest live FUT + `historical(..., continuous=True, interval=day)` → `data/ohlcv/<market>/continuous/<UNDERLYING>.parquet` (separate from per-expiry `day/`).
+- Offline: `uv run python -m ohlcv.selftest`.
+
 ## OHLCV Phase 1 (NFO foundation + download queue)
 
 Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
@@ -138,10 +146,11 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 | Command | Needs login | Purpose |
 | --- | --- | --- |
 | `uv run ohlcv sync [--market nfo\|mcx\|cds] [--types all\|fut\|opt]` | only if master cache must refresh from Kite | Archive master → `data/instruments/archive/`; upsert into `data/ohlcv/<market>/catalog.duckdb` (NFO all with expiry; MCX/CDS FUT+CE+PE by default) |
-| `uv run ohlcv rank [--force]` | only if no final snapshot (falls back to FUT day) | Rank underlyings (**NFO only**): prefer final quote snapshot; else nearest-FUT day |
+| `uv run ohlcv rank [--market] [--force]` | only if no final snapshot (falls back to FUT day) | Rank underlyings: prefer final quote snapshot; else nearest-FUT day |
 | `uv run ohlcv queue [--market] [--types] [--expiry] [--underlying] [--limit] [--interval minute\|day] [-d N\|all]` | only if sync must refresh master | Print series queue for market: expiry asc, traded_value desc, unranked last; request/time estimates (`-d` for minute only) |
 | `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
-| `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | End-of-day quote snapshot (**NFO only**) |
+| `uv run ohlcv daily [--market] [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | End-of-session quote snapshot (after market `session_end`) |
+| `uv run ohlcv continuous UNDERLYING [--market] [--from] [--to] [--dry-run]` | yes (except `--dry-run`) | Continuous day candles for nearest live FUT → `continuous/<UNDERLYING>.parquet` |
 | `uv run ohlcv fetch [--market] [--types] […] [-d N\|all]` | yes (except `--dry-run`) | Day (~2000d) then minute candles; `-d` controls minute window only (default 60) |
 | `uv run ohlcv status [--market] [--types] [--all] [--expiry] [--underlying] [--interval] [--limit] [--runs]` | no | Offline progress report |
 | `uv run ohlcv show [--market] UNDERLYING EXPIRY [--interval] [--symbol\|--token] [--tail]` | no | Inspect one minute or day series file |
@@ -164,19 +173,19 @@ Single-writer: only one process should open the catalog for writes; a lock error
 - Time ≈ `requests * max(0.34s pace, 0.19s Phase-0 median latency)`.
 - Partial watermarks roll back to 09:15 IST of that day before counting chunks.
 
-## OHLCV Phase 2 (daily quote snapshot)
+## OHLCV Phase 2 / 5 (daily quote snapshot)
 
-End-of-day `quote()` sweep of **all live NFO** contracts (not just nearest-3 expiries).
+End-of-session `quote()` sweep of **all live** contracts in that market’s catalog (`last_seen == today`), not just nearest-3 expiries. Use `--market nfo|mcx|cds`.
 
 ### When to run
-- On a **trading day after 15:40 IST** (`status=final`). Earlier same-day runs write `status=intraday` and are overwritten later.
+- On a **trading day after that market’s `session_end` IST** (`status=final`): NFO 15:40, CDS 17:00, MCX 23:30. Earlier same-day runs write `status=intraday` and are overwritten later.
 - Weekend / holiday / next-morning runs are **refused** (quote `volume` / `average_price` are cleared; trade date ≠ today). Message: take the snapshot on the session day after close.
 - A missed day cannot be recovered from `quote()`; use `ohlcv fetch` (day pass) for historical day OHLC+OI per series.
 
 ### Layout
-- File: `data/ohlcv/nfo/daily/yyyymmdd.parquet` (atomic write via `_staging/`).
+- File: `data/ohlcv/<market>/daily/yyyymmdd.parquet` (atomic write via `_staging/`).
 - Catalog row: `daily_snapshots` (one per `trade_date`; rerun overwrites).
-- Helper for Phase 3: `snapshot.untraded_tokens(trade_date)` → tokens with `volume == 0`.
+- Helper: `snapshot.untraded_tokens(trade_date, dest_dir=...)` → tokens with `volume == 0`.
 
 ### Columns
 Contract: `trade_date`, `token`, `underlying`, `expiry`, `tradingsymbol`, `instrument_type`, `strike`, `lot_size`.
@@ -186,7 +195,7 @@ Activity: `volume`, `average_price`, `traded_value` (`volume * average_price`), 
 ### Commands
 | Command | Purpose |
 | --- | --- |
-| `uv run ohlcv daily` | Sync → quote all live NFO (~500/batch, 1 req/s) → write parquet → record snapshot → rank (`source=quote`) |
+| `uv run ohlcv daily [--market]` | Sync → quote all live contracts (~500/batch, 1 req/s) → write parquet → record snapshot → rank (`source=quote`) |
 | `uv run ohlcv daily --dry-run` | Contract/batch/time estimate; no quote calls |
 | `uv run ohlcv daily --show [yyyymmdd]` | Offline summary of an existing snapshot (default: latest) |
 
@@ -279,14 +288,15 @@ If `status`/`show` fail with a catalog lock message, a `daily`/`fetch` run (or n
 ### Offline check
 `uv run python -m ohlcv.selftest` (includes Phase 4/5 status/read/day-fetch tests).
 
-## Day vs daily layout (Phase 5 data)
+## Day vs daily vs continuous layout
 
-Historical day candles (written by the day pass of `ohlcv fetch`) vs quote snapshots:
+Historical day candles (written by the day pass of `ohlcv fetch`) vs quote snapshots vs continuous underlying series:
 
 | Path | Source | Grain |
 | --- | --- | --- |
-| `data/ohlcv/nfo/daily/yyyymmdd.parquet` | End-of-day `quote()` snapshot | All live NFO on one trade date |
-| `data/ohlcv/nfo/day/<UL>/yyyymmdd.parquet` | `historical_data(..., interval="day")` | One series (expiry in filename) |
+| `data/ohlcv/<market>/daily/yyyymmdd.parquet` | End-of-session `quote()` snapshot | All live contracts on one trade date |
+| `data/ohlcv/<market>/day/<UL>/yyyymmdd.parquet` | `historical_data(..., interval="day")` | One series (expiry in filename) |
+| `data/ohlcv/<market>/continuous/<UL>.parquet` | `historical_data(..., continuous=True, interval="day")` | One underlying (nearest live FUT token) |
 
 `fetch_state` rows use `interval='day'` independent of minute watermarks. Day backfill = **2000** inclusive calendar days → typically **1** request per contract.
 

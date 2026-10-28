@@ -1,4 +1,4 @@
-"""Offline self-tests for ohlcv Phases 1–4. No Kite login required.
+"""Offline self-tests for ohlcv Phases 1–5. No Kite login required.
 
 Run: uv run python -m ohlcv.selftest
 """
@@ -24,6 +24,7 @@ from kitetools import auth
 
 from . import archive as archive_mod
 from . import catalog
+from . import continuous as continuous_mod
 from . import fetch as fetch_mod
 from . import planner
 from . import rank as rank_mod
@@ -163,6 +164,7 @@ def test_markets_and_paths_for() -> None:
     _assert(nfo_paths.root.name == "nfo", f"nfo root={nfo_paths.root}")
     _assert(mcx_paths.root.name == "mcx" and mcx_paths.catalog_path.name == "catalog.duckdb", "mcx paths")
     _assert(cds_paths.probe_dir.name == "_probe" and "cds" in cds_paths.probe_dir.parts, "cds probe")
+    _assert(mcx_paths.continuous_dir.name == "continuous", "mcx continuous_dir")
     _assert(OHLCV_DIR == nfo_paths.root, "OHLCV_DIR is nfo alias")
     _assert(CATALOG_PATH == nfo_paths.catalog_path, "CATALOG_PATH is nfo alias")
     _assert(universe_mod.SESSION_END == nfo.session_end, "universe SESSION_END from NFO")
@@ -989,6 +991,230 @@ def test_snapshot_status_boundary() -> None:
     _assert(snapshot.snapshot_status(before) == "intraday", "before 15:40")
     _assert(snapshot.snapshot_status(at) == "final", "at 15:40")
     _assert(snapshot.snapshot_status(after) == "final", "after 15:40")
+
+    mcx_before = datetime.combine(day, datetime.strptime("23:29", "%H:%M").time(), tzinfo=auth.IST)
+    mcx_at = datetime.combine(day, datetime.strptime("23:30", "%H:%M").time(), tzinfo=auth.IST)
+    _assert(snapshot.snapshot_status(mcx_before, market="mcx") == "intraday", "mcx before 23:30")
+    _assert(snapshot.snapshot_status(mcx_at, market="mcx") == "final", "mcx at 23:30")
+    cds_before = datetime.combine(day, datetime.strptime("16:59", "%H:%M").time(), tzinfo=auth.IST)
+    cds_at = datetime.combine(day, datetime.strptime("17:00", "%H:%M").time(), tzinfo=auth.IST)
+    _assert(snapshot.snapshot_status(cds_before, market="cds") == "intraday", "cds before 17:00")
+    _assert(snapshot.snapshot_status(cds_at, market="cds") == "final", "cds at 17:00")
+
+
+def test_snapshot_mcx_quote_prefix_and_rank() -> None:
+    """MCX snapshot uses MCX: quote keys and ranks from market daily_dir."""
+    trade_day = date(2026, 10, 27)
+    ltt = "2026-10-27T23:20:00+05:30"
+    contracts = [
+        catalog.ContractRow(101, "GOLD", trade_day, "GOLD26DECFUT", "FUT", 0.0, 1),
+        catalog.ContractRow(102, "GOLD", trade_day, "GOLDCE", "CE", 144000.0, 1),
+    ]
+    seen_keys: list[str] = []
+
+    def handler(instruments: list[str]) -> dict[str, Any]:
+        seen_keys.extend(instruments)
+        out: dict[str, Any] = {}
+        for key in instruments:
+            _assert(key.startswith("MCX:"), f"expected MCX prefix, got {key}")
+            sym = key.split(":", 1)[1]
+            if sym == "GOLD26DECFUT":
+                out[key] = _quote_payload(
+                    101,
+                    sym,
+                    last_trade_time=ltt,
+                    volume=10,
+                    last_price=144000.0,
+                    ohlc_close=143000.0,
+                    average_price=143500.0,
+                )
+            else:
+                out[key] = _quote_payload(
+                    102,
+                    sym,
+                    last_trade_time=ltt,
+                    volume=0,
+                    last_price=100.0,
+                    ohlc_close=90.0,
+                    average_price=0.0,
+                )
+        return out
+
+    kite = FakeKite(handler=handler)
+    client = KiteClient(kite, quote_interval=0.0, clock=FakeClock(), rng=random.Random(0))  # type: ignore[arg-type]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        daily_dir = root / "daily"
+        staging = root / "staging"
+        now = datetime(2026, 10, 27, 23, 45, 0, tzinfo=auth.IST)
+        result = snapshot.take_snapshot(
+            client,
+            contracts,
+            market="mcx",
+            now=now,
+            run_date=trade_day,
+            dest_dir=daily_dir,
+            staging_dir=staging,
+        )
+        _assert(result.status == "final", f"status={result.status}")
+        _assert(all(k.startswith("MCX:") for k in seen_keys), f"keys={seen_keys}")
+        untraded = snapshot.untraded_tokens(trade_day, dest_dir=daily_dir)
+        _assert(untraded == {102}, f"untraded={untraded}")
+
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            rr = rank_mod.rank_from_snapshot(
+                con, trade_day, market="mcx", dest_dir=daily_dir
+            )
+            _assert(rr.upserted == 1 and rr.source == "quote", f"rank={rr}")
+            ranks = rank_mod.load_ranks(con)
+            _assert("GOLD" in ranks, "GOLD ranked")
+            _assert(ranks["GOLD"].traded_value == 10 * 143500.0, "traded_value")
+        finally:
+            con.close()
+
+
+def test_continuous_nearest_fut_and_write() -> None:
+    today = date(2026, 10, 28)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            raised = False
+            try:
+                continuous_mod.nearest_live_fut(con, "GOLD", seen_on=today)
+            except Exception:
+                raised = True
+            _assert(
+                continuous_mod.nearest_live_fut(con, "GOLD", seen_on=today) is None,
+                "no live FUT",
+            )
+            _assert(not raised, "nearest returns None not raise")
+
+            catalog.upsert_contracts(
+                con,
+                [
+                    catalog.ContractRow(
+                        501, "GOLD", date(2026, 12, 4), "GOLD26DECFUT", "FUT", 0.0, 1
+                    ),
+                    catalog.ContractRow(
+                        502, "GOLD", date(2027, 2, 5), "GOLD27FEBFUT", "FUT", 0.0, 1
+                    ),
+                    catalog.ContractRow(
+                        503, "GOLD", date(2026, 10, 30), "GOLDCE", "CE", 144000.0, 1
+                    ),
+                ],
+                seen_on=today,
+            )
+            fut = continuous_mod.nearest_live_fut(con, "GOLD", seen_on=today)
+            _assert(fut is not None and fut.token == 501, f"nearest={fut}")
+
+            def hist_handler(
+                token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any
+            ) -> list:
+                _assert(kwargs.get("continuous") is True, "continuous flag")
+                _assert(interval == "day", "day interval")
+                _assert(token == 501, f"token={token}")
+                return [
+                    {
+                        "date": datetime(2026, 10, 1, tzinfo=auth.IST),
+                        "open": 1.0,
+                        "high": 2.0,
+                        "low": 0.5,
+                        "close": 1.5,
+                        "volume": 10,
+                        "oi": 100,
+                    },
+                    {
+                        "date": datetime(2026, 10, 2, tzinfo=auth.IST),
+                        "open": 1.5,
+                        "high": 2.5,
+                        "low": 1.0,
+                        "close": 2.0,
+                        "volume": 20,
+                        "oi": 110,
+                    },
+                ]
+
+            client, _, _ = _make_client(hist_handler)
+            dest = root / "continuous" / "GOLD.parquet"
+            result = continuous_mod.fetch_continuous(
+                client,
+                con,
+                "GOLD",
+                market="mcx",
+                from_date=date(2026, 10, 1),
+                to_date=date(2026, 10, 2),
+                seen_on=today,
+                dest_path=dest,
+            )
+            _assert(result.rows == 2 and result.path.is_file(), f"result={result}")
+            _assert(result.tradingsymbol == "GOLD26DECFUT", "symbol")
+
+            rejected = False
+            try:
+                continuous_mod.fetch_continuous(
+                    client,
+                    con,
+                    "SILVER",
+                    market="mcx",
+                    seen_on=today,
+                    dest_path=root / "continuous" / "SILVER.parquet",
+                )
+            except continuous_mod.ContinuousRejected:
+                rejected = True
+            _assert(rejected, "missing underlying rejected")
+        finally:
+            con.close()
+
+
+def test_can_skip_untraded_uses_market_daily_dir() -> None:
+    """fetch.can_skip_untraded reads paths_for(market).daily_dir (not NFO alias)."""
+    now = datetime(2026, 10, 23, 18, 0, 0, tzinfo=auth.IST)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # Pretend MCX daily lives under this temp root.
+        mcx_daily = root / "ohlcv" / "mcx" / "daily"
+        fake_paths = paths_for("mcx")
+        # Build a MarketPaths-like stand-in via mock of paths_for.
+        from .paths import MarketPaths
+
+        stub = MarketPaths(
+            root=root / "ohlcv" / "mcx",
+            probe_dir=root / "ohlcv" / "mcx" / "_probe",
+            daily_dir=mcx_daily,
+            day_dir=root / "ohlcv" / "mcx" / "day",
+            minute_dir=root / "ohlcv" / "mcx" / "minute",
+            continuous_dir=root / "ohlcv" / "mcx" / "continuous",
+            staging_dir=root / "ohlcv" / "mcx" / "_staging",
+            logs_dir=root / "ohlcv" / "mcx" / "logs",
+            catalog_path=root / "ohlcv" / "mcx" / "catalog.duckdb",
+        )
+        con = catalog.connect(root / "c.duckdb")
+        try:
+            catalog.ensure_schema(con)
+            expiry = date(2026, 10, 27)
+            for day, vol in ((date(2026, 10, 22), 0), (date(2026, 10, 23), 0)):
+                rows = [_snap_row(77, "GOLD", expiry, day, volume=vol)]
+                _write_final_snapshot(con, day, rows, mcx_daily)
+
+            cache: dict[date, set[int] | None] = {}
+            # Watermark at MCX session_end so first pending weekday is Thu 22.
+            with mock.patch.object(fetch_mod, "paths_for", return_value=stub):
+                ok = fetch_mod.can_skip_untraded(
+                    con,
+                    77,
+                    datetime(2026, 10, 21, 23, 30, 0),
+                    datetime(2026, 10, 23, 23, 30, 0),
+                    untraded_cache=cache,
+                    market="mcx",
+                )
+            _assert(ok is True, f"skip={ok} cache={cache}")
+            _assert(fake_paths.daily_dir.name == "daily", "sanity real paths")
+        finally:
+            con.close()
 
 
 def test_snapshot_happy_path_and_fields() -> None:
@@ -2692,6 +2918,9 @@ def main() -> None:
         test_queue_order_and_chunks,
         test_catalog_v1_to_v2_migration,
         test_snapshot_status_boundary,
+        test_snapshot_mcx_quote_prefix_and_rank,
+        test_continuous_nearest_fut_and_write,
+        test_can_skip_untraded_uses_market_daily_dir,
         test_snapshot_happy_path_and_fields,
         test_snapshot_rejects_weekend_and_batch_failure,
         test_snapshot_missing_keys_and_rank,

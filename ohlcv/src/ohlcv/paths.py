@@ -22,6 +22,7 @@ class MarketPaths:
     daily_dir: Path
     day_dir: Path
     minute_dir: Path
+    continuous_dir: Path
     staging_dir: Path
     logs_dir: Path
     catalog_path: Path
@@ -37,6 +38,7 @@ def paths_for(market_id: str) -> MarketPaths:
         daily_dir=root / "daily",
         day_dir=root / "day",
         minute_dir=root / "minute",
+        continuous_dir=root / "continuous",
         staging_dir=root / "_staging",
         logs_dir=root / "logs",
         catalog_path=root / "catalog.duckdb",

@@ -20,8 +20,9 @@ from .catalog import (
     upsert_underlying_ranks,
 )
 from .client import KiteClient, RequestRejected, RetryExhausted
-from .paths import DAILY_DIR, ymd
-from .universe import nearest_fut_tokens
+from .markets import MarketProfile
+from .paths import DAILY_DIR, paths_for, ymd
+from .universe import nearest_fut_tokens, resolve_market
 
 RANK_LOOKBACK_DAYS = 10
 
@@ -70,10 +71,17 @@ def rank_from_snapshot(
     con: duckdb.DuckDBPyConnection,
     trade_date: date,
     *,
+    market: MarketProfile | str | None = None,
     dest_dir: Path | None = None,
 ) -> RankRefreshResult:
     """Rank underlyings from daily/yyyymmdd.parquet (sum of volume * average_price)."""
-    root = dest_dir if dest_dir is not None else DAILY_DIR
+    profile = resolve_market(market)
+    if dest_dir is not None:
+        root = dest_dir
+    elif market is not None:
+        root = paths_for(profile.id).daily_dir
+    else:
+        root = DAILY_DIR
     path = root / f"{ymd(trade_date)}.parquet"
     if not path.is_file():
         return RankRefreshResult(
@@ -224,6 +232,7 @@ def refresh_rank(
     today: date | None = None,
     *,
     force: bool = False,
+    market: MarketProfile | str | None = None,
     dest_dir: Path | None = None,
 ) -> RankRefreshResult:
     """Prefer a final quote snapshot; else fall back to nearest-FUT day candles.
@@ -232,6 +241,9 @@ def refresh_rank(
     When a final snapshot exists for the latest session, no Kite calls are made
     (client may be None).
     """
+    profile = resolve_market(market)
+    if dest_dir is None and market is not None:
+        dest_dir = paths_for(profile.id).daily_dir
     today = today if today is not None else _today_ist()
     existing_date = latest_rank_trade_date(con)
     if (
@@ -249,7 +261,9 @@ def refresh_rank(
 
     snap = latest_snapshot(con, status="final")
     if snap is not None and snap.trade_date >= today - timedelta(days=RANK_LOOKBACK_DAYS):
-        return rank_from_snapshot(con, snap.trade_date, dest_dir=dest_dir)
+        return rank_from_snapshot(
+            con, snap.trade_date, market=market, dest_dir=dest_dir
+        )
 
     if client is None:
         return RankRefreshResult(

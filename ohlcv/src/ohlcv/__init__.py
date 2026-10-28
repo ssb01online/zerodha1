@@ -1,8 +1,7 @@
 """OHLCV download, storage, and query (NFO + MCX/CDS markets).
 
-NFO: full pipeline (probe, sync, rank, queue, daily, fetch, status, show).
-MCX/CDS: sync/queue/fetch/status/show for FUT+options (--market, --types).
-Rank/daily remain NFO-only.
+CLI: probe, sync, rank, queue, daily, continuous, fetch, status, show.
+Use --market nfo|mcx|cds (default nfo) on market-scoped commands.
 """
 
 import kitetools  # noqa: F401 — inject system SSL trust before any HTTPS
