@@ -13,6 +13,7 @@ from pathlib import Path
 from . import query
 from .cache import clear_rows_override, set_rows_override
 from .models import Instrument
+from .scope import IN_SCOPE_EXCHANGES, in_scope
 
 
 class Failure(Exception):
@@ -46,7 +47,11 @@ def _inst(
         tick_size=0.05,
         lot_size=lot_size,
         instrument_type=itype,
-        segment=exchange if exchange != "NFO" else f"NFO-{itype}",
+        segment=(
+            f"{exchange}-{itype}"
+            if exchange in ("NFO", "MCX", "CDS") and itype in ("FUT", "CE", "PE")
+            else exchange
+        ),
         exchange=exchange,
     )
 
@@ -106,7 +111,34 @@ def _fixture_rows() -> list[Instrument]:
             expiry=exp,
             lot_size=175,
         ),
+        _inst(
+            30,
+            exchange="MCX",
+            symbol="GOLD26DECFUT",
+            name="GOLD",
+            itype="FUT",
+            expiry=date(2026, 12, 4),
+            lot_size=1,
+        ),
+        _inst(
+            40,
+            exchange="CDS",
+            symbol="USDINR26OCTFUT",
+            name="USDINR",
+            itype="FUT",
+            expiry=exp,
+            lot_size=1,
+        ),
     ]
+
+
+def test_scope_includes_mcx_cds() -> None:
+    _assert(IN_SCOPE_EXCHANGES == frozenset({"NSE", "BSE", "NFO", "MCX", "CDS"}), "scope set")
+    _assert(in_scope("MCX") and in_scope("mcx"), "mcx in scope")
+    _assert(in_scope("CDS") and in_scope("cds"), "cds in scope")
+    _assert(not in_scope("BFO"), "bfo still out of scope")
+    _assert(not in_scope(None), "none out of scope")
+    print("  ok scope_includes_mcx_cds")
 
 
 def test_search_pagination_and_filters() -> None:
@@ -123,8 +155,14 @@ def test_search_pagination_and_filters() -> None:
         _assert(nse["total"] == 1, f"nse infy={nse['total']}")
         _assert(nse["items"][0]["instrument_token"] == 1, "wrong token")
         m = query.meta()
-        _assert(m["total"] == 8, f"meta total={m['total']}")
+        _assert(m["total"] == 10, f"meta total={m['total']}")
         _assert(m["by_exchange"].get("NFO") == 5, f"nfo count={m['by_exchange']}")
+        _assert(m["by_exchange"].get("MCX") == 1, f"mcx count={m['by_exchange']}")
+        _assert(m["by_exchange"].get("CDS") == 1, f"cds count={m['by_exchange']}")
+        mcx = query.search(q="GOLD", exchange="MCX")
+        _assert(mcx["total"] == 1, f"mcx gold={mcx['total']}")
+        cds = query.search(q="USDINR", exchange="CDS")
+        _assert(cds["total"] == 1, f"cds usdinr={cds['total']}")
     finally:
         clear_rows_override()
         query.invalidate_indexes()
@@ -177,7 +215,7 @@ def test_api_routes() -> None:
 
         r = client.get("/api/instruments/meta")
         _assert(r.status_code == 200, f"meta={r.status_code}")
-        _assert(r.json()["total"] == 8, f"meta body={r.json()}")
+        _assert(r.json()["total"] == 10, f"meta body={r.json()}")
 
         r = client.get("/api/instruments/search", params={"q": "INFY", "limit": 10})
         _assert(r.status_code == 200, f"search={r.status_code}")
@@ -224,7 +262,7 @@ def test_mounted_on_portfolio_app() -> None:
             client = TestClient(app, raise_server_exceptions=False)
             r = client.get("/api/instruments/meta")
             _assert(r.status_code == 200, f"mounted meta={r.status_code} {r.text}")
-            _assert(r.json()["total"] == 8, r.json())
+            _assert(r.json()["total"] == 10, r.json())
             health = client.get("/api/health")
             _assert(health.status_code == 200, health.text)
             _assert("instruments_as_of" in health.json(), health.json())
@@ -237,6 +275,7 @@ def test_mounted_on_portfolio_app() -> None:
 def main() -> int:
     print("instruments.selftest")
     tests = [
+        test_scope_includes_mcx_cds,
         test_search_pagination_and_filters,
         test_by_token_and_chain,
         test_api_routes,

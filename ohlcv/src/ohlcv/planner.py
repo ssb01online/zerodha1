@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal, Mapping
 
 from kitetools import auth
 
 from .catalog import FetchState, UnderlyingRank
+from .markets import NFO
 from .universe import SESSION_END, Series
 
 IntervalName = Literal["minute", "day"]
@@ -21,7 +22,9 @@ DAY_CHUNK_DAYS = 2000
 # Phase 0 median historical latency ~0.19s; pace floor is 0.34s → use max(pace, median).
 HIST_PACE_S = 0.34
 HIST_MEDIAN_LATENCY_S = 0.19
-SESSION_START = time(9, 15)
+# NFO aliases — Phase 3 will take session from MarketProfile per market.
+SESSION_START = NFO.session_start
+# SESSION_END still imported/re-exported from universe (NFO profile).
 
 
 @dataclass(frozen=True)

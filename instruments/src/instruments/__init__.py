@@ -1,6 +1,6 @@
-"""Daily Kite instruments cache (NSE/BSE/NFO), token lookup, and browser query API.
+"""Daily Kite instruments cache (NSE/BSE/NFO/MCX/CDS), token lookup, and browser query API.
 
-TODO (future): live quotes, MF/CDS/MCX/BFO, NSE/BSE scrip pairing.
+TODO (future): live quotes, MF/BFO, NSE/BSE scrip pairing.
 """
 
 import kitetools  # noqa: F401 — inject system SSL trust before any HTTPS

@@ -1,4 +1,4 @@
-"""NFO series universe: sync contracts and select active/unfinished series."""
+"""Series universe: sync contracts and select active/unfinished series per market."""
 
 from __future__ import annotations
 
@@ -19,10 +19,11 @@ from .catalog import (
     list_fetch_states,
     upsert_contracts,
 )
+from .markets import MarketProfile, NFO, get_market
 
 NEAREST_EXPIRIES = 3
-# Session end cushion: liquid NFO often prints through 15:39 IST (Phase 0 probe).
-SESSION_END = time(15, 40)
+# NFO alias — existing imports (planner/snapshot/fetch) keep working.
+SESSION_END = NFO.session_end
 
 
 @dataclass(frozen=True)
@@ -40,22 +41,38 @@ def _today_ist() -> date:
     return datetime.now(auth.IST).date()
 
 
-def _expiry_session_end(expiry: date) -> datetime:
+def resolve_market(market: MarketProfile | str | None) -> MarketProfile:
+    if market is None:
+        return NFO
+    if isinstance(market, MarketProfile):
+        return market
+    return get_market(market)
+
+
+def _expiry_session_end(expiry: date, session_end: time) -> datetime:
     """Timezone-aware IST datetime for end of expiry-day session."""
-    return datetime.combine(expiry, SESSION_END, tzinfo=auth.IST)
+    return datetime.combine(expiry, session_end, tzinfo=auth.IST)
 
 
 def sync_contracts(
     con: duckdb.DuckDBPyConnection,
     *,
+    market: MarketProfile | str | None = None,
     seen_on: date | None = None,
 ) -> int:
-    """Upsert all NFO rows from the instruments master into catalog.contracts."""
+    """Upsert in-scope contracts for ``market`` from the instruments master.
+
+    NFO: all rows with expiry (FUT + options). MCX/CDS: FUT only (Phase 2).
+    """
+    profile = resolve_market(market)
     ensure_cache()
     today = seen_on if seen_on is not None else _today_ist()
+    allowed = profile.sync_instrument_types
     rows: list[ContractRow] = []
     for inst in iter_instruments():
-        if inst.exchange != "NFO" or inst.expiry is None:
+        if inst.exchange != profile.exchange or inst.expiry is None:
+            continue
+        if allowed is not None and inst.instrument_type not in allowed:
             continue
         name = (inst.name or "").strip()
         if not name:
@@ -102,11 +119,12 @@ def _series_fetch_incomplete(
     contracts: list[ContractRow],
     fetch_states: dict[int, FetchState],
     expiry: date,
+    session_end: time,
 ) -> bool:
     """True if any contract is missing fetch_state, not done/gave_up, or watermark before session end."""
-    session_end = _expiry_session_end(expiry)
+    end = _expiry_session_end(expiry, session_end)
     # Compare naive vs aware carefully: catalog may store naive timestamps.
-    session_end_naive = session_end.replace(tzinfo=None)
+    session_end_naive = end.replace(tzinfo=None)
 
     for c in contracts:
         state = fetch_states.get(c.token)
@@ -121,7 +139,7 @@ def _series_fetch_incomplete(
             return True
         fetched = state.fetched_to
         if getattr(fetched, "tzinfo", None) is not None:
-            if fetched < session_end:
+            if fetched < end:
                 return True
         else:
             if fetched < session_end_naive:
@@ -134,8 +152,10 @@ def select_series(
     today: date | None = None,
     *,
     interval: str = "minute",
+    market: MarketProfile | str | None = None,
 ) -> list[Series]:
     """Live nearest-3 expiries per underlying, plus unfinished expired series from catalog."""
+    profile = resolve_market(market)
     today = today if today is not None else _today_ist()
     all_contracts = list_contracts(con)
     grouped = _group_by_series(all_contracts)
@@ -152,7 +172,7 @@ def select_series(
             continue
         if (underlying, expiry) in live_keys:
             continue
-        if _series_fetch_incomplete(contracts, fetch_states, expiry):
+        if _series_fetch_incomplete(contracts, fetch_states, expiry, profile.session_end):
             unfinished.append(
                 Series(
                     underlying=underlying,

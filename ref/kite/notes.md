@@ -51,16 +51,66 @@ Phase 3 fetch decision from this probe:
 - Take `quote()` daily snapshots on a **trading day after close** (weekend volume is cleared).
 - Pending: `ohlcv probe --expired` on/after 2026-10-28 for watch_list tokens (NIFTY/RELIANCE 2026-10-27 series).
 
-## OHLCV Phase 1 (foundation + download queue)
+## Historical probe MCX/CDS (Phase 0)
+
+CLI: `uv run python -m ohlcv.probe_mcx_cds` (reports under `data/ohlcv/mcx/_probe/`, `data/ohlcv/cds/_probe/`, combined `data/ohlcv/_probe/mcx_cds_*.json`).
+
+Verified 2026-10-28 (Wednesday, IST) against live Kite (`20261028-180557`):
+
+| Check | MCX | CDS |
+| --- | --- | --- |
+| Live instruments | ~16 089 (FUT 174, CE/PE ~7 952 each, 11 INDICES as `EQ`) | ~8 973 (FUT 155, CE/PE ~4 409 each); segments `CDS-FUT` / `CDS-OPT` |
+| Top underlyings | GOLD, SILVER, SILVERM, CRUDEOIL, … | USDINR, EURINR, GBPINR, JPYINR (+ G-Sec names) |
+| Minute max span | **60 days** (same InputException; 61 inclusive OK once) | same |
+| Day max span | ≥2001 days | same |
+| OI on FUT | Present minute + day | Present minute + day |
+| Session (liquid FUT) | **09:00–23:29** IST; ~870 minute rows/day (GOLD) | **09:00–16:59** IST; ~480 minute rows/day (USDINR) |
+| MCX indices hist | `MCXGOLDEX` minute only **09:15–15:29** (~303 rows) — truncated vs FUT evening session | n/a (no CDS indices) |
+| `continuous=1` day | Works on FUT (~1407 bars / 2000 calendar days on GOLD) | **Also works** on USDINR FUT (~1331 bars) — docs only mention NFO/MCX |
+| `continuous=1` minute | `InputException: invalid interval for continuous data` | same |
+| Contract-only day | Shorter than continuous (GOLD26DECFUT listed ~2025-12-16) | USDINR26OCTFUT ~1y of day bars |
+| Pre-listing | Empty list, not error (`GOLD27OCTFUT`) | Far contract may still be empty |
+| Day vs minute vol/OI | Do not require equality (same as NFO) | same |
+| Options minute | Liquid GOLD/CRUDEOIL CE: full MCX hours + OI; FUT expiry ≠ option expiry (GOLD FUT monthly vs CE weekly) | Illiquid far OTM can return 0 rows |
+| Quote (after CDS close) | Keys return; many `volume`/`average_price` 0; `last_trade_time` epoch when never traded | same |
+
+Implications for downloaders:
+- Reuse NFO chunking (minute ≤60d, day ~2000d) but **do not** reuse NFO `09:15–15:40` session bounds.
+- Expand `instruments` scope to include `MCX` and `CDS` before catalog sync.
+- Prefer per-market data roots (`data/ohlcv/mcx/`, `data/ohlcv/cds/`).
+- Archive instruments daily if minute history after expiry is required (no continuous minute).
+- Treat MCX index historical as equity-hours only unless re-verified later.
+
+## OHLCV multi-market foundation (Phase 1)
+
+- `instruments.scope.IN_SCOPE_EXCHANGES` includes **MCX** and **CDS** (plus NSE/BSE/NFO). Next `ensure_cache()` refresh rewrites `data/instruments/master.json` with those rows; until then the on-disk master may still be NSE/BSE/NFO-only.
+- `ohlcv.markets.MarketProfile` registry: `nfo` (09:15–15:40), `mcx` (09:00–23:30), `cds` (09:00–17:00); all `continuous_day=True`. Helpers: `get_market`, `get_market_by_exchange`.
+- `ohlcv.paths.paths_for(market_id)` → `data/ohlcv/<id>/` (`catalog.duckdb`, `day/`, `minute/`, …). Module aliases `OHLCV_DIR` / `CATALOG_PATH` / … remain **NFO**.
+- NFO `SESSION_START` / `SESSION_END` sourced from the NFO profile (behaviour unchanged).
+- Offline: `uv run python -m instruments.selftest`, `uv run python -m ohlcv.selftest`.
+
+## OHLCV multi-market catalog + sync (Phase 2)
+
+CLI: `uv run ohlcv sync|queue --market nfo|mcx|cds` (default `nfo`).
+
+- `MarketProfile.sync_instrument_types`: NFO `None` (all rows with expiry); MCX/CDS `{"FUT"}` only.
+- Per-market catalog: `data/ohlcv/<market>/catalog.duckdb` (same schema as NFO).
+- `universe.sync_contracts(..., market=)` filters by exchange + sync types; `select_series(..., market=)` uses that market’s `session_end` for unfinished-expired checks.
+- Shared instruments archive still under `data/instruments/archive/` (master must include MCX/CDS after a refresh).
+- Universe v1 unchanged: nearest **3** live expiries per underlying + unfinished expired.
+- Rank / daily / fetch / status / show remain **NFO-only** until Phase 3+ (queue may show unranked MCX/CDS series).
+- Offline: `uv run python -m ohlcv.selftest` (includes `test_sync_mcx_cds_fut_only`).
+
+## OHLCV Phase 1 (NFO foundation + download queue)
 
 Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 
 ### Commands
 | Command | Needs login | Purpose |
 | --- | --- | --- |
-| `uv run ohlcv sync` | only if master cache must refresh from Kite | Archive `data/instruments/master.json` → `data/instruments/archive/yyyymmdd.json.gz`; upsert NFO rows into `data/ohlcv/nfo/catalog.duckdb` |
+| `uv run ohlcv sync [--market nfo\|mcx\|cds]` | only if master cache must refresh from Kite | Archive master → `data/instruments/archive/`; upsert into `data/ohlcv/<market>/catalog.duckdb` (NFO all expiry types; MCX/CDS FUT) |
 | `uv run ohlcv rank [--force]` | only if no final snapshot (falls back to FUT day) | Rank underlyings: prefer final quote snapshot (`source=quote`); else nearest-FUT day `volume * close` |
-| `uv run ohlcv queue [--expiry] [--underlying] [--limit] [--interval minute\|day] [-d N\|all]` | only if sync must refresh master | Print series queue: expiry asc, traded_value desc, unranked last; request/time estimates (`-d` for minute only) |
+| `uv run ohlcv queue [--market] [--expiry] [--underlying] [--limit] [--interval minute\|day] [-d N\|all]` | only if sync must refresh master | Print series queue for market: expiry asc, traded_value desc, unranked last; request/time estimates (`-d` for minute only) |
 | `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
 | `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | Phase 2 end-of-day quote snapshot |
 | `uv run ohlcv fetch […] [-d N\|all]` | yes (except `--dry-run`) | Day (~2000d) then minute candles; `-d` controls minute window only (default 60) |

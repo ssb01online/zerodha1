@@ -1,20 +1,58 @@
-"""Paths under data/ohlcv/nfo/ and yyyymmdd helpers."""
+"""Paths under data/ohlcv/<market>/ and yyyymmdd helpers.
+
+Module-level OHLCV_DIR / CATALOG_PATH / … remain NFO aliases for existing callers.
+Use paths_for(market_id) for MCX/CDS (Phase 2+).
+"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
 from kitetools.config import DATA_DIR
 
-OHLCV_DIR = DATA_DIR / "ohlcv" / "nfo"
-PROBE_DIR = OHLCV_DIR / "_probe"
-DAILY_DIR = OHLCV_DIR / "daily"
-DAY_DIR = OHLCV_DIR / "day"
-MINUTE_DIR = OHLCV_DIR / "minute"
-STAGING_DIR = OHLCV_DIR / "_staging"
-LOGS_DIR = OHLCV_DIR / "logs"
-CATALOG_PATH = OHLCV_DIR / "catalog.duckdb"
+from .markets import get_market
+
+
+@dataclass(frozen=True)
+class MarketPaths:
+    root: Path
+    probe_dir: Path
+    daily_dir: Path
+    day_dir: Path
+    minute_dir: Path
+    staging_dir: Path
+    logs_dir: Path
+    catalog_path: Path
+
+
+def paths_for(market_id: str) -> MarketPaths:
+    """Resolve on-disk layout for a market id (nfo / mcx / cds)."""
+    profile = get_market(market_id)
+    root = DATA_DIR / "ohlcv" / profile.id
+    return MarketPaths(
+        root=root,
+        probe_dir=root / "_probe",
+        daily_dir=root / "daily",
+        day_dir=root / "day",
+        minute_dir=root / "minute",
+        staging_dir=root / "_staging",
+        logs_dir=root / "logs",
+        catalog_path=root / "catalog.duckdb",
+    )
+
+
+# NFO defaults — existing sync/fetch/cli imports keep working unchanged.
+_NFO = paths_for("nfo")
+OHLCV_DIR = _NFO.root
+PROBE_DIR = _NFO.probe_dir
+DAILY_DIR = _NFO.daily_dir
+DAY_DIR = _NFO.day_dir
+MINUTE_DIR = _NFO.minute_dir
+STAGING_DIR = _NFO.staging_dir
+LOGS_DIR = _NFO.logs_dir
+CATALOG_PATH = _NFO.catalog_path
 ARCHIVE_DIR = DATA_DIR / "instruments" / "archive"
 
 

@@ -1,4 +1,4 @@
-"""Daily IST cache of full Kite instruments (NSE/BSE/NFO) plus slim token lookup."""
+"""Daily IST cache of full Kite instruments (NSE/BSE/NFO/MCX/CDS) plus slim token lookup."""
 
 from __future__ import annotations
 

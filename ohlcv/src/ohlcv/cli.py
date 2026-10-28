@@ -35,6 +35,19 @@ def _optional_log_path(args: argparse.Namespace) -> Path | None:
     return Path(raw)
 
 
+def _market_id(args: argparse.Namespace) -> str:
+    return (getattr(args, "market", None) or "nfo").strip().lower()
+
+
+def _add_market_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--market",
+        choices=("nfo", "mcx", "cds"),
+        default="nfo",
+        help="Exchange market root under data/ohlcv/<market>/ (default: nfo).",
+    )
+
+
 def cmd_probe(args: argparse.Namespace) -> None:
     from . import probe
 
@@ -45,7 +58,7 @@ def cmd_probe(args: argparse.Namespace) -> None:
     print(f"Wrote {path}", file=sys.stderr)
 
 
-def _run_sync(con) -> tuple[int, object]:
+def _run_sync(con, market_id: str = "nfo") -> tuple[int, object]:
     from . import archive as archive_mod
     from . import universe
 
@@ -53,24 +66,29 @@ def _run_sync(con) -> tuple[int, object]:
 
     ensure_cache()
     archive_path = archive_mod.ensure_archive()
-    count = universe.sync_contracts(con)
+    count = universe.sync_contracts(con, market=market_id)
     return count, archive_path
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
     from . import catalog
-    from .paths import CATALOG_PATH
+    from .markets import get_market
+    from .paths import paths_for
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    catalog_path = paths_for(market_id).catalog_path
 
     started = datetime.now(auth.IST)
     try:
-        con = catalog.connect()
+        con = catalog.connect(catalog_path)
     except catalog.CatalogLocked as exc:
         raise SystemExit(str(exc)) from exc
     try:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "sync", started_at=started.replace(tzinfo=None))
         try:
-            count, archive_path = _run_sync(con)
+            count, archive_path = _run_sync(con, market_id=market_id)
         except FileNotFoundError as exc:
             catalog.finish_run(
                 con,
@@ -94,11 +112,17 @@ def cmd_sync(args: argparse.Namespace) -> None:
             con,
             run_id,
             finished_at=finished,
-            note=f"contracts={count} archive={archive_path}",
+            note=f"market={market_id} contracts={count} archive={archive_path}",
         )
-        print(f"Synced {count} NFO contracts")
+        types = (
+            "all with expiry"
+            if profile.sync_instrument_types is None
+            else "+".join(sorted(profile.sync_instrument_types))
+        )
+        print(f"Synced {count} {profile.exchange} contracts ({types})")
+        print(f"Market: {market_id}")
         print(f"Archive: {archive_path}")
-        print(f"Catalog: {CATALOG_PATH}")
+        print(f"Catalog: {catalog_path}")
     finally:
         con.close()
 
@@ -1136,19 +1160,24 @@ def cmd_queue(args: argparse.Namespace) -> None:
     from . import planner
     from . import rank as rank_mod
     from . import universe
-    from .paths import CATALOG_PATH
+    from .markets import get_market
+    from .paths import paths_for
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    catalog_path = paths_for(market_id).catalog_path
 
     started = datetime.now(auth.IST)
     expiry_filter = _parse_ymd(args.expiry) if args.expiry else None
     try:
-        con = catalog.connect()
+        con = catalog.connect(catalog_path)
     except catalog.CatalogLocked as exc:
         raise SystemExit(str(exc)) from exc
     try:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "queue", started_at=started.replace(tzinfo=None))
         try:
-            count, archive_path = _run_sync(con)
+            count, archive_path = _run_sync(con, market_id=market_id)
         except (auth.NotLoggedIn, TokenException) as exc:
             catalog.finish_run(
                 con,
@@ -1178,7 +1207,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
         if interval == "day":
             backfill_days = planner.BACKFILL_WINDOW_DAYS  # ignored for day estimates
         days_label = "all" if backfill_days is None else str(backfill_days)
-        series = universe.select_series(con, interval=interval)
+        series = universe.select_series(con, interval=interval, market=market_id)
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
         fetch_states = catalog.list_fetch_states(con, interval=interval, tokens=tokens)
@@ -1200,15 +1229,23 @@ def cmd_queue(args: argparse.Namespace) -> None:
             run_id,
             finished_at=datetime.now(auth.IST).replace(tzinfo=None),
             note=(
-                f"interval={interval} days={days_label} series={len(items)} "
-                f"contracts_synced={count}"
+                f"market={market_id} interval={interval} days={days_label} "
+                f"series={len(items)} contracts_synced={count}"
             ),
         )
 
-        print(f"Synced {count} NFO contracts (archive {archive_path})")
+        print(
+            f"Synced {count} {profile.exchange} contracts "
+            f"(market={market_id}, archive {archive_path})"
+        )
         print(f"Interval: {interval}" + (f"  --days={days_label}" if interval == "minute" else ""))
         if not ranks:
-            print("Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering")
+            print(
+                "Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering "
+                "(NFO only until Phase 3+)"
+                if market_id != "nfo"
+                else "Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering"
+            )
         print()
         print(
             f"{'expiry':<10} {'underlying':<16} {'contracts':>9} "
@@ -1246,7 +1283,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
             f"Total: {len(items)} series, {total_contracts} contracts, "
             f"{total_req} requests, ~{total_sec / 60:.1f} min"
         )
-        print(f"Catalog: {CATALOG_PATH}")
+        print(f"Catalog: {catalog_path}")
     finally:
         con.close()
 
@@ -1255,7 +1292,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ohlcv",
         description=(
-            "NFO OHLCV tools (probe, sync, rank, queue, daily, fetch, status, show)."
+            "OHLCV tools (probe, sync, rank, queue, daily, fetch, status, show). "
+            "Use --market nfo|mcx|cds on sync/queue (default nfo)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1279,8 +1317,12 @@ def main() -> None:
 
     p_sync = sub.add_parser(
         "sync",
-        help="Archive instruments master and upsert NFO contracts into catalog.duckdb.",
+        help=(
+            "Archive instruments master and upsert contracts into "
+            "data/ohlcv/<market>/catalog.duckdb (NFO: all with expiry; MCX/CDS: FUT)."
+        ),
     )
+    _add_market_arg(p_sync)
     p_sync.set_defaults(func=cmd_sync)
 
     p_rank = sub.add_parser(
@@ -1298,6 +1340,7 @@ def main() -> None:
         "queue",
         help="Print download queue (expiry asc, traded value desc) with request estimates.",
     )
+    _add_market_arg(p_queue)
     p_queue.add_argument(
         "--expiry",
         default=None,

@@ -37,7 +37,17 @@ from .client import (
     RetryExhausted,
     SessionExpired,
 )
-from .paths import sanitize_underlying, series_path, ymd
+from . import markets as markets_mod
+from . import planner as planner_mod
+from . import universe as universe_mod
+from .paths import (
+    CATALOG_PATH,
+    OHLCV_DIR,
+    paths_for,
+    sanitize_underlying,
+    series_path,
+    ymd,
+)
 from .progress import InterruptController, setup_run_logging
 
 
@@ -59,7 +69,15 @@ def _inst(
     expiry: date | None = None,
     strike: float = 0.0,
     lot_size: int = 1,
+    exchange: str = "NFO",
 ) -> Instrument:
+    exch = exchange.strip().upper()
+    if exch == "NFO":
+        segment = f"NFO-{itype}"
+    elif exch in ("MCX", "CDS") and itype in ("FUT", "CE", "PE"):
+        segment = f"{exch}-{'FUT' if itype == 'FUT' else 'OPT'}"
+    else:
+        segment = exch
     return Instrument(
         instrument_token=token,
         exchange_token=token // 100,
@@ -71,8 +89,8 @@ def _inst(
         tick_size=0.05,
         lot_size=lot_size,
         instrument_type=itype,
-        segment=f"NFO-{itype}",
-        exchange="NFO",
+        segment=segment,
+        exchange=exch,
     )
 
 
@@ -113,6 +131,37 @@ def test_paths() -> None:
     _assert(sanitize_underlying("M&M") == "M_M", "sanitize M&M")
     _assert(sanitize_underlying("BAJAJ-AUTO") == "BAJAJ-AUTO", "sanitize hyphen")
     _assert(sanitize_underlying("  nifty ") == "NIFTY", "sanitize strip/upper")
+
+
+def test_markets_and_paths_for() -> None:
+    nfo = markets_mod.get_market("nfo")
+    mcx = markets_mod.get_market("MCX")
+    cds = markets_mod.get_market_by_exchange("cds")
+    _assert(nfo.exchange == "NFO", "nfo exchange")
+    _assert(mcx.id == "mcx" and mcx.session_start.hour == 9 and mcx.session_end.hour == 23, "mcx session")
+    _assert(cds.id == "cds" and cds.session_end.hour == 17, "cds session")
+    _assert(nfo.continuous_day and mcx.continuous_day and cds.continuous_day, "continuous")
+    _assert(nfo.sync_instrument_types is None, "nfo syncs all expiry types")
+    _assert(mcx.sync_instrument_types == frozenset({"FUT"}), "mcx FUT-only sync")
+    _assert(cds.sync_instrument_types == frozenset({"FUT"}), "cds FUT-only sync")
+    raised = False
+    try:
+        markets_mod.get_market("bfo")
+    except ValueError:
+        raised = True
+    _assert(raised, "unknown market_id raises")
+
+    nfo_paths = paths_for("nfo")
+    mcx_paths = paths_for("mcx")
+    cds_paths = paths_for("cds")
+    _assert(nfo_paths.root.name == "nfo", f"nfo root={nfo_paths.root}")
+    _assert(mcx_paths.root.name == "mcx" and mcx_paths.catalog_path.name == "catalog.duckdb", "mcx paths")
+    _assert(cds_paths.probe_dir.name == "_probe" and "cds" in cds_paths.probe_dir.parts, "cds probe")
+    _assert(OHLCV_DIR == nfo_paths.root, "OHLCV_DIR is nfo alias")
+    _assert(CATALOG_PATH == nfo_paths.catalog_path, "CATALOG_PATH is nfo alias")
+    _assert(universe_mod.SESSION_END == nfo.session_end, "universe SESSION_END from NFO")
+    _assert(planner_mod.SESSION_START == nfo.session_start, "planner SESSION_START from NFO")
+    _assert(planner_mod.SESSION_END == nfo.session_end, "planner SESSION_END from NFO")
 
 
 def test_archive_idempotent() -> None:
@@ -390,6 +439,72 @@ def test_universe_nearest3_and_unfinished() -> None:
                 clear_rows_override()
         finally:
             con.close()
+
+
+def test_sync_mcx_cds_fut_only() -> None:
+    """MCX/CDS sync upserts FUT only; NFO sync still takes options."""
+    today = date(2026, 10, 28)
+    set_rows_override(
+        [
+            _inst(1, symbol="GOLD26DECFUT", name="GOLD", expiry=date(2026, 12, 4), exchange="MCX"),
+            _inst(
+                2,
+                symbol="GOLD26OCTCE",
+                name="GOLD",
+                itype="CE",
+                expiry=date(2026, 10, 30),
+                strike=144000,
+                exchange="MCX",
+            ),
+            _inst(3, symbol="USDINR26NOVFUT", name="USDINR", expiry=date(2026, 11, 26), exchange="CDS"),
+            _inst(
+                4,
+                symbol="USDINR26OCTCE",
+                name="USDINR",
+                itype="CE",
+                expiry=date(2026, 10, 28),
+                strike=88.0,
+                exchange="CDS",
+            ),
+            _inst(5, symbol="NIFTY26NOVFUT", name="NIFTY", expiry=date(2026, 11, 24), exchange="NFO"),
+            _inst(
+                6,
+                symbol="NIFTY26NOVCE",
+                name="NIFTY",
+                itype="CE",
+                expiry=date(2026, 11, 24),
+                strike=24000,
+                exchange="NFO",
+            ),
+        ]
+    )
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            mcx_db = Path(tmp) / "mcx.duckdb"
+            cds_db = Path(tmp) / "cds.duckdb"
+            nfo_db = Path(tmp) / "nfo.duckdb"
+            for label, db, market, expect_tokens in (
+                ("mcx", mcx_db, "mcx", {1}),
+                ("cds", cds_db, "cds", {3}),
+                ("nfo", nfo_db, "nfo", {5, 6}),
+            ):
+                con = catalog.connect(db)
+                try:
+                    catalog.ensure_schema(con)
+                    n = universe.sync_contracts(con, market=market, seen_on=today)
+                    rows = catalog.list_contracts(con)
+                    tokens = {r.token for r in rows}
+                    _assert(n == len(expect_tokens), f"{label} sync count={n}")
+                    _assert(tokens == expect_tokens, f"{label} tokens={tokens}")
+                    series = universe.select_series(con, today=today, market=market)
+                    if label == "mcx":
+                        _assert(len(series) == 1 and series[0].underlying == "GOLD", "mcx series")
+                    if label == "cds":
+                        _assert(len(series) == 1 and series[0].underlying == "USDINR", "cds series")
+                finally:
+                    con.close()
+    finally:
+        clear_rows_override()
 
 
 def test_queue_order_and_chunks() -> None:
@@ -2360,6 +2475,7 @@ def test_catalog_readonly_open() -> None:
 def main() -> None:
     tests = [
         test_paths,
+        test_markets_and_paths_for,
         test_archive_idempotent,
         test_catalog_schema,
         test_limiter_spacing,
@@ -2368,6 +2484,7 @@ def main() -> None:
         test_input_exception_not_retried,
         test_token_exception_session_expired,
         test_universe_nearest3_and_unfinished,
+        test_sync_mcx_cds_fut_only,
         test_queue_order_and_chunks,
         test_catalog_v1_to_v2_migration,
         test_snapshot_status_boundary,

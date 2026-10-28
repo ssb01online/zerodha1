@@ -1,11 +1,9 @@
 """Exchange scope for the instruments cache.
 
-In scope: NSE and BSE equity, NFO futures/options.
+In scope: NSE and BSE equity, NFO / MCX / CDS futures and options.
 
 TODO (future):
 - Mutual funds via kite.mf_instruments()
-- CDS (currency)
-- MCX (commodities)
 - BFO (BSE F&O)
 - NSE/BSE same-scrip pairing for the browser UI
 - Live quotes / LTP enrichment for the browser
@@ -13,7 +11,7 @@ TODO (future):
 
 from __future__ import annotations
 
-IN_SCOPE_EXCHANGES: frozenset[str] = frozenset({"NSE", "BSE", "NFO"})
+IN_SCOPE_EXCHANGES: frozenset[str] = frozenset({"NSE", "BSE", "NFO", "MCX", "CDS"})
 
 
 def in_scope(exchange: str | None) -> bool:
