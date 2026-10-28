@@ -142,8 +142,14 @@ def test_markets_and_paths_for() -> None:
     _assert(cds.id == "cds" and cds.session_end.hour == 17, "cds session")
     _assert(nfo.continuous_day and mcx.continuous_day and cds.continuous_day, "continuous")
     _assert(nfo.sync_instrument_types is None, "nfo syncs all expiry types")
-    _assert(mcx.sync_instrument_types == frozenset({"FUT"}), "mcx FUT-only sync")
-    _assert(cds.sync_instrument_types == frozenset({"FUT"}), "cds FUT-only sync")
+    _assert(
+        mcx.sync_instrument_types == markets_mod.DERIVATIVE_TYPES,
+        "mcx FUT+CE+PE sync",
+    )
+    _assert(
+        cds.sync_instrument_types == markets_mod.DERIVATIVE_TYPES,
+        "cds FUT+CE+PE sync",
+    )
     raised = False
     try:
         markets_mod.get_market("bfo")
@@ -540,8 +546,8 @@ def test_universe_nearest3_and_unfinished() -> None:
             con.close()
 
 
-def test_sync_mcx_cds_fut_only() -> None:
-    """MCX/CDS sync upserts FUT only; NFO sync still takes options."""
+def test_sync_mcx_cds_options_and_types_override() -> None:
+    """MCX/CDS default sync upserts FUT+CE+PE; --types fut override syncs FUT only."""
     today = date(2026, 10, 28)
     set_rows_override(
         [
@@ -583,8 +589,8 @@ def test_sync_mcx_cds_fut_only() -> None:
             cds_db = Path(tmp) / "cds.duckdb"
             nfo_db = Path(tmp) / "nfo.duckdb"
             for label, db, market, expect_tokens in (
-                ("mcx", mcx_db, "mcx", {1}),
-                ("cds", cds_db, "cds", {3}),
+                ("mcx", mcx_db, "mcx", {1, 2}),
+                ("cds", cds_db, "cds", {3, 4}),
                 ("nfo", nfo_db, "nfo", {5, 6}),
             ):
                 con = catalog.connect(db)
@@ -596,14 +602,108 @@ def test_sync_mcx_cds_fut_only() -> None:
                     _assert(n == len(expect_tokens), f"{label} sync count={n}")
                     _assert(tokens == expect_tokens, f"{label} tokens={tokens}")
                     series = universe.select_series(con, today=today, market=market)
+                    keys = {(s.underlying, s.expiry) for s in series}
                     if label == "mcx":
-                        _assert(len(series) == 1 and series[0].underlying == "GOLD", "mcx series")
+                        _assert(("GOLD", date(2026, 12, 4)) in keys, "mcx FUT series")
+                        _assert(("GOLD", date(2026, 10, 30)) in keys, "mcx CE series")
                     if label == "cds":
-                        _assert(len(series) == 1 and series[0].underlying == "USDINR", "cds series")
+                        _assert(("USDINR", date(2026, 11, 26)) in keys, "cds FUT series")
+                        _assert(("USDINR", date(2026, 10, 28)) in keys, "cds CE series")
                 finally:
                     con.close()
+
+            # --types fut override: FUT only (does not delete prior CE rows if re-synced empty —
+            # here we use a fresh DB).
+            fut_db = Path(tmp) / "mcx_fut.duckdb"
+            con = catalog.connect(fut_db)
+            try:
+                catalog.ensure_schema(con)
+                n = universe.sync_contracts(
+                    con,
+                    market="mcx",
+                    seen_on=today,
+                    allowed_types=markets_mod.FUT_TYPES,
+                )
+                tokens = {r.token for r in catalog.list_contracts(con)}
+                _assert(n == 1 and tokens == {1}, f"mcx --types fut tokens={tokens}")
+            finally:
+                con.close()
     finally:
         clear_rows_override()
+
+
+def test_dual_nearest3_fut_and_opt_pools() -> None:
+    """Weekly CE expiries must not crowd a farther monthly FUT out of the live set."""
+    today = date(2026, 10, 28)
+    fut_exp = date(2026, 12, 27)  # ~T+60
+    ce_exps = [
+        date(2026, 11, 4),
+        date(2026, 11, 11),
+        date(2026, 11, 18),
+        date(2026, 11, 25),  # 4th weekly — should be excluded
+    ]
+    rows = [
+        catalog.ContractRow(1, "GOLD", fut_exp, "GOLD26DECFUT", "FUT", 0.0, 1),
+    ]
+    tok = 10
+    for exp in ce_exps:
+        rows.append(
+            catalog.ContractRow(tok, "GOLD", exp, f"GOLDCE{tok}", "CE", 144000.0, 1)
+        )
+        tok += 1
+        rows.append(
+            catalog.ContractRow(tok, "GOLD", exp, f"GOLDPE{tok}", "PE", 144000.0, 1)
+        )
+        tok += 1
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "c.duckdb"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            catalog.upsert_contracts(con, rows, seen_on=today)
+            series = universe.select_series(con, today=today, market="mcx")
+            keys = {(s.underlying, s.expiry) for s in series}
+            _assert(("GOLD", fut_exp) in keys, "monthly FUT kept despite weekly CEs")
+            for exp in ce_exps[:3]:
+                _assert(("GOLD", exp) in keys, f"nearest CE expiry {exp}")
+            _assert(("GOLD", ce_exps[3]) not in keys, "4th weekly CE excluded")
+            _assert(len(keys) == 4, f"expected 1 FUT + 3 CE series, got {keys}")
+
+            opt_only = universe.select_series(
+                con, today=today, market="mcx", types="opt"
+            )
+            opt_keys = {(s.underlying, s.expiry) for s in opt_only}
+            _assert(fut_exp not in {e for _, e in opt_keys}, "opt filter drops FUT expiry")
+            _assert(all(c.instrument_type in ("CE", "PE") for s in opt_only for c in s.contracts), "opt types")
+        finally:
+            con.close()
+
+
+def test_build_queue_types_filter_excludes_fut() -> None:
+    today = date(2026, 10, 25)
+    now = datetime(2026, 10, 25, 18, 0, 0, tzinfo=auth.IST)
+    series = [
+        universe.Series(
+            "GOLD",
+            date(2026, 10, 30),
+            (
+                catalog.ContractRow(1, "GOLD", date(2026, 10, 30), "GFUT", "FUT", 0.0, 1),
+                catalog.ContractRow(2, "GOLD", date(2026, 10, 30), "GCE", "CE", 144000.0, 1),
+                catalog.ContractRow(3, "GOLD", date(2026, 10, 30), "GPE", "PE", 144000.0, 1),
+            ),
+        ),
+    ]
+    items_all = planner.build_queue(series, {}, {}, now, types="all")
+    _assert(len(items_all) == 1 and items_all[0].contracts == 3, "all keeps 3")
+    items_opt = planner.build_queue(series, {}, {}, now, types="opt")
+    _assert(len(items_opt) == 1 and items_opt[0].contracts == 2, "opt drops FUT")
+    items_fut = planner.build_queue(series, {}, {}, now, types="fut")
+    _assert(len(items_fut) == 1 and items_fut[0].contracts == 1, "fut keeps FUT only")
+    filtered = universe.filter_series_by_types(series, "opt")
+    _assert(
+        all(c.instrument_type != "FUT" for c in filtered[0].contracts),
+        "filter_series_by_types drops FUT",
+    )
 
 
 def test_queue_order_and_chunks() -> None:
@@ -2586,7 +2686,9 @@ def main() -> None:
         test_input_exception_not_retried,
         test_token_exception_session_expired,
         test_universe_nearest3_and_unfinished,
-        test_sync_mcx_cds_fut_only,
+        test_sync_mcx_cds_options_and_types_override,
+        test_dual_nearest3_fut_and_opt_pools,
+        test_build_queue_types_filter_excludes_fut,
         test_queue_order_and_chunks,
         test_catalog_v1_to_v2_migration,
         test_snapshot_status_boundary,

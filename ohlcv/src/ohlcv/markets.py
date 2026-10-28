@@ -1,13 +1,19 @@
 """Per-exchange OHLCV market profiles (session hours, sync types, continuous day).
 
 Session end times are cushions after the last observed minute bar (Phase 0 probes).
-``sync_instrument_types``: None = all types with expiry (NFO); frozenset for FUT-only markets.
+``sync_instrument_types``: None = all types with expiry (NFO); frozenset restricts
+upsert (MCX/CDS use FUT+CE+PE so EQ indices stay out).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import time
+
+# Shared FUT + options set for commodity/currency derivatives (excludes EQ indices).
+DERIVATIVE_TYPES: frozenset[str] = frozenset({"FUT", "CE", "PE"})
+FUT_TYPES: frozenset[str] = frozenset({"FUT"})
+OPT_TYPES: frozenset[str] = frozenset({"CE", "PE"})
 
 
 @dataclass(frozen=True)
@@ -35,7 +41,7 @@ MCX = MarketProfile(
     session_start=time(9, 0),
     session_end=time(23, 30),
     continuous_day=True,
-    sync_instrument_types=frozenset({"FUT"}),
+    sync_instrument_types=DERIVATIVE_TYPES,
 )
 CDS = MarketProfile(
     id="cds",
@@ -43,7 +49,7 @@ CDS = MarketProfile(
     session_start=time(9, 0),
     session_end=time(17, 0),
     continuous_day=True,
-    sync_instrument_types=frozenset({"FUT"}),
+    sync_instrument_types=DERIVATIVE_TYPES,
 )
 
 MARKETS: dict[str, MarketProfile] = {

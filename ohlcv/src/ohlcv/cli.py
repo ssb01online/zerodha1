@@ -48,6 +48,29 @@ def _add_market_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_types_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--types",
+        choices=("all", "fut", "opt"),
+        default="all",
+        help=(
+            "Instrument types: all (default), fut (FUT only), or opt (CE+PE). "
+            "Applies to sync upsert and queue/fetch/status contract selection."
+        ),
+    )
+
+
+def _types_arg(args: argparse.Namespace) -> str:
+    return (getattr(args, "types", None) or "all").strip().lower()
+
+
+def _allowed_types_for_sync(types: str):
+    """Map CLI --types to sync allowed_types override (None = profile default)."""
+    from .universe import resolve_types_filter
+
+    return resolve_types_filter(types)
+
+
 def cmd_probe(args: argparse.Namespace) -> None:
     from . import probe
 
@@ -58,7 +81,12 @@ def cmd_probe(args: argparse.Namespace) -> None:
     print(f"Wrote {path}", file=sys.stderr)
 
 
-def _run_sync(con, market_id: str = "nfo") -> tuple[int, object]:
+def _run_sync(
+    con,
+    market_id: str = "nfo",
+    *,
+    types: str = "all",
+) -> tuple[int, object]:
     from . import archive as archive_mod
     from . import universe
 
@@ -66,7 +94,9 @@ def _run_sync(con, market_id: str = "nfo") -> tuple[int, object]:
 
     ensure_cache()
     archive_path = archive_mod.ensure_archive()
-    count = universe.sync_contracts(con, market=market_id)
+    # --types all → None override → use market profile defaults.
+    allowed = _allowed_types_for_sync(types)
+    count = universe.sync_contracts(con, market=market_id, allowed_types=allowed)
     return count, archive_path
 
 
@@ -76,6 +106,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
     from .paths import paths_for
 
     market_id = _market_id(args)
+    types = _types_arg(args)
     profile = get_market(market_id)
     catalog_path = paths_for(market_id).catalog_path
 
@@ -88,7 +119,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "sync", started_at=started.replace(tzinfo=None))
         try:
-            count, archive_path = _run_sync(con, market_id=market_id)
+            count, archive_path = _run_sync(con, market_id=market_id, types=types)
         except FileNotFoundError as exc:
             catalog.finish_run(
                 con,
@@ -112,15 +143,20 @@ def cmd_sync(args: argparse.Namespace) -> None:
             con,
             run_id,
             finished_at=finished,
-            note=f"market={market_id} contracts={count} archive={archive_path}",
+            note=(
+                f"market={market_id} types={types} contracts={count} "
+                f"archive={archive_path}"
+            ),
         )
-        types = (
-            "all with expiry"
-            if profile.sync_instrument_types is None
-            else "+".join(sorted(profile.sync_instrument_types))
-        )
-        print(f"Synced {count} {profile.exchange} contracts ({types})")
-        print(f"Market: {market_id}")
+        allowed = _allowed_types_for_sync(types)
+        if allowed is None and profile.sync_instrument_types is None:
+            types_label = "all with expiry"
+        elif allowed is None:
+            types_label = "+".join(sorted(profile.sync_instrument_types or ()))
+        else:
+            types_label = "+".join(sorted(allowed))
+        print(f"Synced {count} {profile.exchange} contracts ({types_label})")
+        print(f"Market: {market_id}  types: {types}")
         print(f"Archive: {archive_path}")
         print(f"Catalog: {catalog_path}")
     finally:
@@ -504,6 +540,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     from .progress import InterruptController, ProgressReporter, setup_run_logging
 
     market_id = _market_id(args)
+    types = _types_arg(args)
     profile = get_market(market_id)
     mpaths = paths_for(market_id)
     catalog_path = mpaths.catalog_path
@@ -539,7 +576,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "fetch", started_at=started.replace(tzinfo=None))
         try:
-            count, archive_path = _run_sync(con, market_id=market_id)
+            count, archive_path = _run_sync(con, market_id=market_id, types=types)
         except (auth.NotLoggedIn, TokenException) as exc:
             catalog.finish_run(
                 con,
@@ -561,10 +598,14 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 
         reporter.note(
             f"Synced {count} {profile.exchange} contracts "
-            f"(market={market_id}, archive {archive_path})"
+            f"(market={market_id}, types={types}, archive {archive_path})"
         )
-        series_day = universe.select_series(con, interval="day", market=market_id)
-        series_min = universe.select_series(con, interval="minute", market=market_id)
+        series_day = universe.select_series(
+            con, interval="day", market=market_id, types=types
+        )
+        series_min = universe.select_series(
+            con, interval="minute", market=market_id, types=types
+        )
         series = _merge_series_by_key(series_day, series_min)
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
@@ -583,6 +624,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             limit=args.max_series,
             interval="day",
             market=market_id,
+            types=types,
         )
         series_by_key = {(s.underlying, s.expiry): s for s in series}
         queue_series = [
@@ -598,6 +640,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             interval="minute",
             backfill_days=backfill_days,
             market=market_id,
+            types=types,
         )
         minute_by_key = {(i.underlying, i.expiry): i for i in minute_items}
 
@@ -883,6 +926,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     from .paths import paths_for, ymd as paths_ymd
 
     market_id = _market_id(args)
+    types = _types_arg(args)
     mpaths = paths_for(market_id)
     catalog_path = mpaths.catalog_path
     interval = getattr(args, "interval", "minute") or "minute"
@@ -900,8 +944,9 @@ def cmd_status(args: argparse.Namespace) -> None:
             day_dir=mpaths.day_dir,
             minute_dir=mpaths.minute_dir,
             market=market_id,
+            types=types,
         )
-        print(f"Market: {market_id}")
+        print(f"Market: {market_id}  types: {types}")
         print(f"Interval: {interval}")
         if args.limit is not None and args.limit >= 0:
             rows = rows[: args.limit]
@@ -1205,6 +1250,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
     from .paths import paths_for
 
     market_id = _market_id(args)
+    types = _types_arg(args)
     profile = get_market(market_id)
     catalog_path = paths_for(market_id).catalog_path
 
@@ -1218,7 +1264,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "queue", started_at=started.replace(tzinfo=None))
         try:
-            count, archive_path = _run_sync(con, market_id=market_id)
+            count, archive_path = _run_sync(con, market_id=market_id, types=types)
         except (auth.NotLoggedIn, TokenException) as exc:
             catalog.finish_run(
                 con,
@@ -1248,7 +1294,9 @@ def cmd_queue(args: argparse.Namespace) -> None:
         if interval == "day":
             backfill_days = planner.BACKFILL_WINDOW_DAYS  # ignored for day estimates
         days_label = "all" if backfill_days is None else str(backfill_days)
-        series = universe.select_series(con, interval=interval, market=market_id)
+        series = universe.select_series(
+            con, interval=interval, market=market_id, types=types
+        )
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
         fetch_states = catalog.list_fetch_states(con, interval=interval, tokens=tokens)
@@ -1264,6 +1312,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
             interval=interval,
             backfill_days=backfill_days,
             market=market_id,
+            types=types,
         )
 
         catalog.finish_run(
@@ -1271,14 +1320,14 @@ def cmd_queue(args: argparse.Namespace) -> None:
             run_id,
             finished_at=datetime.now(auth.IST).replace(tzinfo=None),
             note=(
-                f"market={market_id} interval={interval} days={days_label} "
-                f"series={len(items)} contracts_synced={count}"
+                f"market={market_id} types={types} interval={interval} "
+                f"days={days_label} series={len(items)} contracts_synced={count}"
             ),
         )
 
         print(
             f"Synced {count} {profile.exchange} contracts "
-            f"(market={market_id}, archive {archive_path})"
+            f"(market={market_id}, types={types}, archive {archive_path})"
         )
         print(f"Interval: {interval}" + (f"  --days={days_label}" if interval == "minute" else ""))
         if not ranks:
@@ -1361,10 +1410,12 @@ def main() -> None:
         "sync",
         help=(
             "Archive instruments master and upsert contracts into "
-            "data/ohlcv/<market>/catalog.duckdb (NFO: all with expiry; MCX/CDS: FUT)."
+            "data/ohlcv/<market>/catalog.duckdb "
+            "(NFO: all with expiry; MCX/CDS: FUT+CE+PE by default)."
         ),
     )
     _add_market_arg(p_sync)
+    _add_types_arg(p_sync)
     p_sync.set_defaults(func=cmd_sync)
 
     p_rank = sub.add_parser(
@@ -1383,6 +1434,7 @@ def main() -> None:
         help="Print download queue (expiry asc, traded value desc) with request estimates.",
     )
     _add_market_arg(p_queue)
+    _add_types_arg(p_queue)
     p_queue.add_argument(
         "--expiry",
         default=None,
@@ -1443,10 +1495,11 @@ def main() -> None:
         "fetch",
         help=(
             "Fetch day (~2000d) then minute candles for queued series "
-            "(expiry-first, incremental). Use --market for MCX/CDS FUT."
+            "(expiry-first, incremental). Use --market / --types for MCX/CDS."
         ),
     )
     _add_market_arg(p_fetch)
+    _add_types_arg(p_fetch)
     p_fetch.add_argument(
         "--expiry",
         default=None,
@@ -1497,6 +1550,7 @@ def main() -> None:
         help="Offline progress report: series completion, snapshot gaps, recent runs.",
     )
     _add_market_arg(p_status)
+    _add_types_arg(p_status)
     p_status.add_argument(
         "--all",
         action="store_true",

@@ -227,8 +227,11 @@ def series_status(
     minute_dir: Path | None = None,
     day_dir: Path | None = None,
     market: MarketProfile | str | None = None,
+    types: str | frozenset[str] | None = None,
 ) -> list[SeriesStatus]:
     """Aggregate fetch_state + file info for the download universe (or all on-disk series)."""
+    from .universe import resolve_types_filter
+
     now = _as_aware_ist(now if now is not None else datetime.now(auth.IST))
     if series_root is not None:
         root = series_root
@@ -239,14 +242,19 @@ def series_status(
     else:
         root = DAY_DIR if interval == "day" else MINUTE_DIR
 
-    selected = select_series(con, today=now.date(), interval=interval, market=market)
+    selected = select_series(
+        con, today=now.date(), interval=interval, market=market, types=types
+    )
     # select_series mixes live + unfinished; mark live as expiry >= today.
     live_keys = {(s.underlying, s.expiry) for s in selected if s.expiry >= now.date()}
 
     by_key: dict[tuple[str, date], Series] = {s.key: s for s in selected}
+    type_filter = resolve_types_filter(types)
 
     if include_all:
         all_contracts = list_contracts(con)
+        if type_filter is not None:
+            all_contracts = [c for c in all_contracts if c.instrument_type in type_filter]
         folder_map = _build_folder_map(all_contracts)
         grouped: dict[tuple[str, date], list[ContractRow]] = {}
         for c in all_contracts:

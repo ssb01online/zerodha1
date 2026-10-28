@@ -10,7 +10,7 @@ from kitetools import auth
 
 from .catalog import FetchState, UnderlyingRank
 from .markets import MarketProfile, NFO, get_market
-from .universe import SESSION_END, Series
+from .universe import SESSION_END, Series, filter_series_by_types
 
 
 def _resolve_market(market: MarketProfile | str | None) -> MarketProfile:
@@ -289,13 +289,18 @@ def build_queue(
     interval: IntervalName = "minute",
     backfill_days: int | None = BACKFILL_WINDOW_DAYS,
     market: MarketProfile | str | None = None,
+    types: str | frozenset[str] | None = None,
 ) -> list[QueueItem]:
-    """Order: expiry asc, traded_value desc, underlying name; unranked last within expiry."""
+    """Order: expiry asc, traded_value desc, underlying name; unranked last within expiry.
+
+    ``types`` (``all|fut|opt``) drops non-matching contracts before estimating pending work.
+    """
     now = _as_aware_ist(now)
     items: list[QueueItem] = []
     per_request = request_seconds()
     # Day interval ignores minute backfill_days.
     bf = backfill_days if interval == "minute" else BACKFILL_WINDOW_DAYS
+    series = filter_series_by_types(series, types)
 
     for s in series:
         if expiry_filter is not None and s.expiry != expiry_filter:

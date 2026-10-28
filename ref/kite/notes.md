@@ -93,12 +93,11 @@ Implications for downloaders:
 
 CLI: `uv run ohlcv sync|queue --market nfo|mcx|cds` (default `nfo`).
 
-- `MarketProfile.sync_instrument_types`: NFO `None` (all rows with expiry); MCX/CDS `{"FUT"}` only.
+- `MarketProfile.sync_instrument_types`: NFO `None` (all rows with expiry); MCX/CDS `{"FUT","CE","PE"}` (Phase 4; was FUT-only in Phase 2).
 - Per-market catalog: `data/ohlcv/<market>/catalog.duckdb` (same schema as NFO).
 - `universe.sync_contracts(..., market=)` filters by exchange + sync types; `select_series(..., market=)` uses that market’s `session_end` for unfinished-expired checks.
 - Shared instruments archive still under `data/instruments/archive/` (master must include MCX/CDS after a refresh).
-- Universe v1 unchanged: nearest **3** live expiries per underlying + unfinished expired.
-- Offline: `uv run python -m ohlcv.selftest` (includes `test_sync_mcx_cds_fut_only`).
+- Offline: `uv run python -m ohlcv.selftest`.
 
 ## OHLCV multi-market fetch (Phase 3)
 
@@ -106,10 +105,30 @@ CLI: `uv run ohlcv fetch|status|show|queue --market nfo|mcx|cds` (default `nfo`)
 
 - Planner/fetch session bounds come from `MarketProfile` (`market=` on `fetch_end`, chunk windows, watermarks, queue estimates).
 - `fetch` writes day/minute parquet under `data/ohlcv/<market>/` and updates that market’s `catalog.duckdb` / logs.
-- MCX/CDS sync remains **FUT-only**; same day-then-minute fetch as NFO (minute ≤60d chunks, day ~2000d).
+- Same day-then-minute fetch as NFO (minute ≤60d chunks, day ~2000d) for whatever contracts are in the catalog/queue.
 - `status` / `show` open the per-market catalog and series roots.
 - **Still NFO-only:** `rank`, `daily` quote snapshots (untraded-token skip is a no-op without snapshots).
 - Offline: `uv run python -m ohlcv.selftest` (includes MCX session / chunk / fetch tests).
+
+## OHLCV multi-market options (Phase 4)
+
+CLI: `--types all|fut|opt` on `sync` / `queue` / `fetch` / `status` (default `all`).
+
+- MCX/CDS default sync upserts **FUT + CE + PE** (EQ indices still excluded).
+- `--types fut` / `--types opt` overrides the upsert set for that run and filters queue/fetch/status contracts (does **not** delete existing catalog rows).
+- **Dual nearest-3 universe** per underlying: nearest 3 **FUT** expiry dates ∪ nearest 3 **CE/PE** expiry dates, then unfinished expired. Weekly option dates no longer crowd monthly FUT out of the live set (GOLD-style).
+- Shared expiry → one mixed series (NFO-like). Mismatched FUT vs option expiries → separate series under the same underlying.
+- No strike/ATM thinning — use `--underlying` / `--expiry` / `--max-series` for dense chains (~16k MCX option rows after full sync).
+- `rank` / `daily` remain NFO-only.
+- Offline: `uv run python -m ohlcv.selftest` (sync options, dual-pool, `--types` queue filter).
+
+Example:
+
+```text
+uv run ohlcv sync --market mcx
+uv run ohlcv fetch --market mcx --types opt --underlying GOLD --max-series 3
+uv run ohlcv fetch --market mcx --types fut
+```
 
 ## OHLCV Phase 1 (NFO foundation + download queue)
 
@@ -118,13 +137,13 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 ### Commands
 | Command | Needs login | Purpose |
 | --- | --- | --- |
-| `uv run ohlcv sync [--market nfo\|mcx\|cds]` | only if master cache must refresh from Kite | Archive master → `data/instruments/archive/`; upsert into `data/ohlcv/<market>/catalog.duckdb` (NFO all expiry types; MCX/CDS FUT) |
+| `uv run ohlcv sync [--market nfo\|mcx\|cds] [--types all\|fut\|opt]` | only if master cache must refresh from Kite | Archive master → `data/instruments/archive/`; upsert into `data/ohlcv/<market>/catalog.duckdb` (NFO all with expiry; MCX/CDS FUT+CE+PE by default) |
 | `uv run ohlcv rank [--force]` | only if no final snapshot (falls back to FUT day) | Rank underlyings (**NFO only**): prefer final quote snapshot; else nearest-FUT day |
-| `uv run ohlcv queue [--market] [--expiry] [--underlying] [--limit] [--interval minute\|day] [-d N\|all]` | only if sync must refresh master | Print series queue for market: expiry asc, traded_value desc, unranked last; request/time estimates (`-d` for minute only) |
+| `uv run ohlcv queue [--market] [--types] [--expiry] [--underlying] [--limit] [--interval minute\|day] [-d N\|all]` | only if sync must refresh master | Print series queue for market: expiry asc, traded_value desc, unranked last; request/time estimates (`-d` for minute only) |
 | `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
 | `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | End-of-day quote snapshot (**NFO only**) |
-| `uv run ohlcv fetch [--market] […] [-d N\|all]` | yes (except `--dry-run`) | Day (~2000d) then minute candles; `-d` controls minute window only (default 60) |
-| `uv run ohlcv status [--market] [--all] [--expiry] [--underlying] [--interval] [--limit] [--runs]` | no | Offline progress report |
+| `uv run ohlcv fetch [--market] [--types] […] [-d N\|all]` | yes (except `--dry-run`) | Day (~2000d) then minute candles; `-d` controls minute window only (default 60) |
+| `uv run ohlcv status [--market] [--types] [--all] [--expiry] [--underlying] [--interval] [--limit] [--runs]` | no | Offline progress report |
 | `uv run ohlcv show [--market] UNDERLYING EXPIRY [--interval] [--symbol\|--token] [--tail]` | no | Inspect one minute or day series file |
 
 ### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=2)
@@ -133,8 +152,8 @@ v1→v2 soft-migrates by creating `daily_snapshots`.
 Single-writer: only one process should open the catalog for writes; a lock error means close notebooks / other `ohlcv` runs.
 
 ### Universe
-- Live: nearest **3** expiries per NFO underlying with `expiry >= today`.
-- Plus **unfinished expired** series still in `contracts` whose `fetch_state` for the requested interval (`minute` or `day`) is missing / not `done` through expiry-day 15:40 IST (so a series can be finished after it drops off the live master).
+- Live: dual nearest-**3** pools per underlying — nearest 3 **FUT** expiries ∪ nearest 3 **CE/PE** expiries with `expiry >= today` (Phase 4; NFO usually shares weekly dates so behaviour matches the old single pool).
+- Plus **unfinished expired** series still in `contracts` whose `fetch_state` for the requested interval (`minute` or `day`) is missing / not `done` through that market’s session end (NFO 15:40 IST) so a series can be finished after it drops off the live master.
 
 ### Ranking
 - Prefer `daily/yyyymmdd.parquet` when a **final** snapshot exists: per-underlying `sum(volume * average_price)`, `source=quote`.
