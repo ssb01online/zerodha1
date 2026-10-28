@@ -164,6 +164,105 @@ def test_markets_and_paths_for() -> None:
     _assert(planner_mod.SESSION_END == nfo.session_end, "planner SESSION_END from NFO")
 
 
+def test_planner_fetch_end_per_market() -> None:
+    """Session bounds come from MarketProfile (NFO default unchanged)."""
+    after_nfo = datetime(2026, 10, 27, 18, 0, 0, tzinfo=auth.IST)
+    during_mcx = datetime(2026, 10, 27, 20, 0, 0, tzinfo=auth.IST)
+    after_cds = datetime(2026, 10, 27, 18, 0, 0, tzinfo=auth.IST)
+
+    nfo_day = planner_mod.day_fetch_end(after_nfo)
+    _assert(nfo_day.hour == 15 and nfo_day.minute == 40, f"nfo day end={nfo_day}")
+    mcx_day = planner_mod.day_fetch_end(during_mcx, market="mcx")
+    _assert(
+        mcx_day.date() == date(2026, 10, 26) and mcx_day.hour == 23 and mcx_day.minute == 30,
+        f"mcx before close excludes today: {mcx_day}",
+    )
+    mcx_after = planner_mod.day_fetch_end(
+        datetime(2026, 10, 27, 23, 45, 0, tzinfo=auth.IST), market="mcx"
+    )
+    _assert(mcx_after.hour == 23 and mcx_after.minute == 30, f"mcx after close={mcx_after}")
+    cds_day = planner_mod.day_fetch_end(after_cds, market="cds")
+    _assert(cds_day.hour == 17 and cds_day.minute == 0, f"cds day end={cds_day}")
+
+    mcx_min = planner_mod.fetch_end(during_mcx, market="mcx")
+    _assert(
+        mcx_min.hour == 19 and mcx_min.minute == 59,
+        f"mcx minute during session floors prior minute: {mcx_min}",
+    )
+    rolled = planner_mod.partial_rollback(
+        datetime(2026, 10, 27, 18, 30, 0, tzinfo=auth.IST), market="mcx"
+    )
+    _assert(rolled.hour == 9 and rolled.minute == 0, f"mcx partial rollback={rolled}")
+    nfo_rolled = planner_mod.partial_rollback(
+        datetime(2026, 10, 27, 12, 30, 0, tzinfo=auth.IST)
+    )
+    _assert(nfo_rolled.hour == 9 and nfo_rolled.minute == 15, f"nfo partial={nfo_rolled}")
+
+
+def test_fetch_chunk_windows_mcx_session() -> None:
+    start = datetime(2026, 10, 20, 9, 0, 0, tzinfo=auth.IST)
+    end = datetime(2026, 10, 22, 23, 30, 0, tzinfo=auth.IST)
+    windows = fetch_mod._chunk_windows(start, end, chunk_days=60, market="mcx")
+    _assert(len(windows) == 1, f"windows={len(windows)}")
+    _assert(windows[0][0] == start, "start preserved")
+    _assert(windows[0][1] == end, f"end={windows[0][1]}")
+    # Intermediate chunk boundary uses MCX session_end / session_start.
+    wide_end = datetime(2026, 12, 20, 23, 30, 0, tzinfo=auth.IST)
+    multi = fetch_mod._chunk_windows(start, wide_end, chunk_days=60, market="mcx")
+    _assert(len(multi) >= 2, f"multi chunks={len(multi)}")
+    mid_end = multi[0][1]
+    _assert(mid_end.hour == 23 and mid_end.minute == 30, f"mcx mid chunk end={mid_end}")
+    _assert(multi[1][0].hour == 9 and multi[1][0].minute == 0, f"mcx next start={multi[1][0]}")
+
+
+def test_fetch_mcx_day_uses_market_session() -> None:
+    """MCX day fetch watermarks to 23:30 and writes under the caller day_dir."""
+    now = datetime(2026, 10, 27, 23, 45, 0, tzinfo=auth.IST)
+    expiry = date(2026, 12, 4)
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        _assert(interval == "day", f"interval={interval}")
+        return _synth_day_candles(token, from_date, to_date, n=3, price=float(token))
+
+    client, kite, _clock = _make_client(handler)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db = root / "c.duckdb"
+        day_dir = root / "day"
+        staging = root / "staging"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            series = _seed_series_contracts(
+                con, underlying="GOLD", expiry=expiry, tokens=[1001], seen_on=now.date()
+            )
+            result = fetch_mod.process_series(
+                client,
+                con,
+                series,
+                {},
+                now=now,
+                interval="day",
+                series_root=day_dir,
+                staging_dir=staging,
+                market="mcx",
+            )
+            _assert(result.fetched == 1, f"fetched={result.fetched}")
+            _assert(result.path is not None and result.path.is_file(), "parquet")
+            st = catalog.get_fetch_state(con, 1001, "day")
+            _assert(st is not None and st.status == "done", f"status={st}")
+            _assert(st.fetched_to is not None, "watermark set")
+            _assert(
+                st.fetched_to.hour == 23 and st.fetched_to.minute == 30,
+                f"mcx wm={st.fetched_to}",
+            )
+            end = fetch_mod.contract_end(now, expiry, interval="day", market="mcx")
+            _assert(end.hour == 23 and end.minute == 30, f"contract_end={end}")
+            _assert(kite.calls == 1, f"calls={kite.calls}")
+        finally:
+            con.close()
+
+
 def test_archive_idempotent() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -2476,6 +2575,9 @@ def main() -> None:
     tests = [
         test_paths,
         test_markets_and_paths_for,
+        test_planner_fetch_end_per_market,
+        test_fetch_chunk_windows_mcx_session,
+        test_fetch_mcx_day_uses_market_session,
         test_archive_idempotent,
         test_catalog_schema,
         test_limiter_spacing,

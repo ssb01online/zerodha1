@@ -20,9 +20,10 @@ from .catalog import (
     list_snapshots,
 )
 from .fetch import contract_end
+from .markets import MarketProfile
 from .paths import DAY_DIR, MINUTE_DIR, sanitize_underlying, ymd
 from .planner import IntervalName
-from .universe import Series, select_series
+from .universe import Series, resolve_market, select_series
 
 
 @dataclass(frozen=True)
@@ -150,9 +151,10 @@ def _status_for_series(
     live_keys: set[tuple[str, date]],
     series_root: Path,
     interval: IntervalName = "minute",
+    market: MarketProfile | str | None = None,
 ) -> SeriesStatus:
     now = _as_aware_ist(now)
-    target_end = contract_end(now, series.expiry, interval=interval)
+    target_end = contract_end(now, series.expiry, interval=interval, market=market)
     done = partial = error = gave_up = missing = complete = 0
     fetched_times: list[datetime] = []
 
@@ -178,7 +180,7 @@ def _status_for_series(
             fetched_times.append(_as_naive(state.fetched_to))
 
     pending = planner.series_pending_requests(
-        series, fetch_states, now=now, interval=interval
+        series, fetch_states, now=now, interval=interval, market=market
     )
     path = read_mod.series_file_path(
         series.underlying, series.expiry, interval=interval, series_root=series_root
@@ -223,17 +225,21 @@ def series_status(
     interval: IntervalName = "minute",
     series_root: Path | None = None,
     minute_dir: Path | None = None,
+    day_dir: Path | None = None,
+    market: MarketProfile | str | None = None,
 ) -> list[SeriesStatus]:
     """Aggregate fetch_state + file info for the download universe (or all on-disk series)."""
     now = _as_aware_ist(now if now is not None else datetime.now(auth.IST))
     if series_root is not None:
         root = series_root
-    elif minute_dir is not None:
+    elif minute_dir is not None and interval == "minute":
         root = minute_dir
+    elif day_dir is not None and interval == "day":
+        root = day_dir
     else:
         root = DAY_DIR if interval == "day" else MINUTE_DIR
 
-    selected = select_series(con, today=now.date(), interval=interval)
+    selected = select_series(con, today=now.date(), interval=interval, market=market)
     # select_series mixes live + unfinished; mark live as expiry >= today.
     live_keys = {(s.underlying, s.expiry) for s in selected if s.expiry >= now.date()}
 
@@ -281,6 +287,7 @@ def series_status(
             live_keys=live_keys,
             series_root=root,
             interval=interval,
+            market=market,
         )
         for s in series_list
     ]
@@ -305,12 +312,14 @@ def snapshot_gaps(
     *,
     today: date | None = None,
     now: datetime | None = None,
+    market: MarketProfile | str | None = None,
 ) -> list[date]:
     """Weekdays from first snapshot through last completed session with no final snapshot.
 
     Market holidays appear here too — callers should label the list accordingly.
     ``now`` defaults to current IST; when set, ``today`` defaults to ``now.date()``.
     """
+    profile = resolve_market(market)
     if now is None:
         now = datetime.now(auth.IST)
     else:
@@ -321,8 +330,8 @@ def snapshot_gaps(
     if not snaps:
         return []
     first = min(s.trade_date for s in snaps)
-    # Last completed session day: if still before 15:40 IST on ``today``, use yesterday.
-    session_end = datetime.combine(today, planner.SESSION_END, tzinfo=auth.IST)
+    # Last completed session day: if still before session_end IST on ``today``, use yesterday.
+    session_end = datetime.combine(today, profile.session_end, tzinfo=auth.IST)
     if now < session_end:
         last = today - timedelta(days=1)
     else:

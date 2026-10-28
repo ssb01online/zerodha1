@@ -223,12 +223,14 @@ def setup_run_logging(
     *,
     log_file: Path | None = None,
     level: int = logging.INFO,
+    logs_dir: Path | None = None,
 ) -> Path:
     """Configure the ``ohlcv`` logger: file (DEBUG) + stderr (INFO, no heartbeat spam)."""
-    ensure_dir(LOGS_DIR)
+    root = logs_dir if logs_dir is not None else LOGS_DIR
+    ensure_dir(root)
     if log_file is None:
         stamp = datetime.now(auth.IST).strftime("%Y%m%d_%H%M%S")
-        log_file = LOGS_DIR / f"{command}_{stamp}.log"
+        log_file = root / f"{command}_{stamp}.log"
     else:
         ensure_dir(log_file.parent)
 

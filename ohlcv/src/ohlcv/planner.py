@@ -9,8 +9,16 @@ from typing import Literal, Mapping
 from kitetools import auth
 
 from .catalog import FetchState, UnderlyingRank
-from .markets import NFO
+from .markets import MarketProfile, NFO, get_market
 from .universe import SESSION_END, Series
+
+
+def _resolve_market(market: MarketProfile | str | None) -> MarketProfile:
+    if market is None:
+        return NFO
+    if isinstance(market, MarketProfile):
+        return market
+    return get_market(market)
 
 IntervalName = Literal["minute", "day"]
 
@@ -22,7 +30,7 @@ DAY_CHUNK_DAYS = 2000
 # Phase 0 median historical latency ~0.19s; pace floor is 0.34s → use max(pace, median).
 HIST_PACE_S = 0.34
 HIST_MEDIAN_LATENCY_S = 0.19
-# NFO aliases — Phase 3 will take session from MarketProfile per market.
+# NFO aliases — prefer market= / profile.session_* in new call sites.
 SESSION_START = NFO.session_start
 # SESSION_END still imported/re-exported from universe (NFO profile).
 
@@ -52,12 +60,17 @@ def _as_aware_ist(dt: datetime) -> datetime:
     return dt.astimezone(auth.IST)
 
 
-def fetch_end(now: datetime) -> datetime:
-    """Last completed minute (or 15:40 IST once the session is over)."""
+def fetch_end(
+    now: datetime,
+    *,
+    market: MarketProfile | str | None = None,
+) -> datetime:
+    """Last completed minute (or session_end IST once the session is over)."""
+    profile = _resolve_market(market)
     now = _as_aware_ist(now)
     day = now.date()
-    session_end = datetime.combine(day, SESSION_END, tzinfo=auth.IST)
-    session_start = datetime.combine(day, SESSION_START, tzinfo=auth.IST)
+    session_end = datetime.combine(day, profile.session_end, tzinfo=auth.IST)
+    session_start = datetime.combine(day, profile.session_start, tzinfo=auth.IST)
     if now >= session_end:
         return session_end
     if now <= session_start:
@@ -72,37 +85,57 @@ def fetch_end(now: datetime) -> datetime:
     return floored
 
 
-def day_fetch_end(now: datetime) -> datetime:
-    """Last complete day bar end (15:40 IST). Before session close, exclude today."""
+def day_fetch_end(
+    now: datetime,
+    *,
+    market: MarketProfile | str | None = None,
+) -> datetime:
+    """Last complete day bar end (session_end IST). Before session close, exclude today."""
+    profile = _resolve_market(market)
     now = _as_aware_ist(now)
     day = now.date()
-    session_end = datetime.combine(day, SESSION_END, tzinfo=auth.IST)
+    session_end = datetime.combine(day, profile.session_end, tzinfo=auth.IST)
     if now >= session_end:
         return session_end
     prev = day - timedelta(days=1)
-    return datetime.combine(prev, SESSION_END, tzinfo=auth.IST)
+    return datetime.combine(prev, profile.session_end, tzinfo=auth.IST)
 
 
-def interval_fetch_end(now: datetime, interval: IntervalName = "minute") -> datetime:
+def interval_fetch_end(
+    now: datetime,
+    interval: IntervalName = "minute",
+    *,
+    market: MarketProfile | str | None = None,
+) -> datetime:
     if interval == "day":
-        return day_fetch_end(now)
-    return fetch_end(now)
+        return day_fetch_end(now, market=market)
+    return fetch_end(now, market=market)
 
 
-def partial_rollback(fetched_to: datetime) -> datetime:
-    """Roll a partial watermark back to 09:15 IST of that day."""
+def partial_rollback(
+    fetched_to: datetime,
+    *,
+    market: MarketProfile | str | None = None,
+) -> datetime:
+    """Roll a partial watermark back to session_start IST of that day."""
+    profile = _resolve_market(market)
     fetched_to = _as_aware_ist(fetched_to)
-    return datetime.combine(fetched_to.date(), SESSION_START, tzinfo=auth.IST)
+    return datetime.combine(fetched_to.date(), profile.session_start, tzinfo=auth.IST)
 
 
-def day_partial_rollback(fetched_to: datetime) -> datetime:
+def day_partial_rollback(
+    fetched_to: datetime,
+    *,
+    market: MarketProfile | str | None = None,
+) -> datetime:
     """Roll a partial day watermark back to session end of the previous calendar day.
 
     Re-fetch includes the watermark's calendar day (incomplete session bar).
     """
+    profile = _resolve_market(market)
     fetched_to = _as_aware_ist(fetched_to)
     prev = fetched_to.date() - timedelta(days=1)
-    return datetime.combine(prev, SESSION_END, tzinfo=auth.IST)
+    return datetime.combine(prev, profile.session_end, tzinfo=auth.IST)
 
 
 def parse_days_arg(value: str | int | None) -> int | None:
@@ -161,6 +194,7 @@ def contract_range_start(
     now: datetime,
     interval: IntervalName = "minute",
     backfill_days: int | None = BACKFILL_WINDOW_DAYS,
+    market: MarketProfile | str | None = None,
 ) -> datetime:
     now = _as_aware_ist(now)
     if interval == "day":
@@ -171,8 +205,8 @@ def contract_range_start(
         return default_start
     if state.status == "partial":
         if interval == "day":
-            return day_partial_rollback(state.fetched_to)
-        return partial_rollback(state.fetched_to)
+            return day_partial_rollback(state.fetched_to, market=market)
+        return partial_rollback(state.fetched_to, market=market)
     if state.status == "done":
         # Already complete for planning purposes — start == end ⇒ 0 chunks.
         return _as_aware_ist(state.fetched_to)
@@ -200,8 +234,9 @@ def contract_pending_requests(
     end: datetime | None = None,
     interval: IntervalName = "minute",
     backfill_days: int | None = BACKFILL_WINDOW_DAYS,
+    market: MarketProfile | str | None = None,
 ) -> int:
-    end = end if end is not None else interval_fetch_end(now, interval)
+    end = end if end is not None else interval_fetch_end(now, interval, market=market)
     if state is not None and state.status == "gave_up":
         return 0
     if state is not None and state.status == "done":
@@ -210,7 +245,11 @@ def contract_pending_requests(
             return 0
         # done but watermark before end → treat as needing a refresh chunk
     start = contract_range_start(
-        state, now=now, interval=interval, backfill_days=backfill_days
+        state,
+        now=now,
+        interval=interval,
+        backfill_days=backfill_days,
+        market=market,
     )
     return chunk_count(start, end, chunk_days=chunk_days_for(interval))
 
@@ -222,8 +261,9 @@ def series_pending_requests(
     now: datetime,
     interval: IntervalName = "minute",
     backfill_days: int | None = BACKFILL_WINDOW_DAYS,
+    market: MarketProfile | str | None = None,
 ) -> int:
-    end = interval_fetch_end(now, interval)
+    end = interval_fetch_end(now, interval, market=market)
     total = 0
     for c in series.contracts:
         total += contract_pending_requests(
@@ -232,6 +272,7 @@ def series_pending_requests(
             end=end,
             interval=interval,
             backfill_days=backfill_days,
+            market=market,
         )
     return total
 
@@ -247,6 +288,7 @@ def build_queue(
     limit: int | None = None,
     interval: IntervalName = "minute",
     backfill_days: int | None = BACKFILL_WINDOW_DAYS,
+    market: MarketProfile | str | None = None,
 ) -> list[QueueItem]:
     """Order: expiry asc, traded_value desc, underlying name; unranked last within expiry."""
     now = _as_aware_ist(now)
@@ -262,7 +304,12 @@ def build_queue(
             continue
         rank = ranks.get(s.underlying)
         pending = series_pending_requests(
-            s, fetch_states, now=now, interval=interval, backfill_days=bf
+            s,
+            fetch_states,
+            now=now,
+            interval=interval,
+            backfill_days=bf,
+            market=market,
         )
         items.append(
             QueueItem(

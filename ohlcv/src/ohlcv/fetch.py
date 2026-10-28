@@ -29,6 +29,7 @@ from .client import (
     RetryExhausted,
     SessionExpired,
 )
+from .markets import MarketProfile
 from .paths import (
     DAY_DIR,
     MINUTE_DIR,
@@ -41,7 +42,7 @@ from .paths import (
 from .planner import IntervalName
 from .progress import ContractProgress, InterruptController
 from .snapshot import untraded_tokens
-from .universe import SESSION_END, Series
+from .universe import Series, resolve_market
 
 # Backward-compatible default (minute fetch).
 INTERVAL = "minute"
@@ -136,8 +137,13 @@ def _as_naive(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None)
 
 
-def expiry_session_end(expiry: date) -> datetime:
-    return datetime.combine(expiry, SESSION_END, tzinfo=auth.IST)
+def expiry_session_end(
+    expiry: date,
+    *,
+    market: MarketProfile | str | None = None,
+) -> datetime:
+    profile = resolve_market(market)
+    return datetime.combine(expiry, profile.session_end, tzinfo=auth.IST)
 
 
 def contract_end(
@@ -145,9 +151,13 @@ def contract_end(
     expiry: date,
     *,
     interval: IntervalName = "minute",
+    market: MarketProfile | str | None = None,
 ) -> datetime:
-    """Last bar end to fetch: min(interval fetch_end(now), expiry 15:40 IST)."""
-    return min(planner.interval_fetch_end(now, interval), expiry_session_end(expiry))
+    """Last bar end to fetch: min(interval fetch_end(now), expiry session_end IST)."""
+    return min(
+        planner.interval_fetch_end(now, interval, market=market),
+        expiry_session_end(expiry, market=market),
+    )
 
 
 def classify_status(
@@ -155,13 +165,15 @@ def classify_status(
     now: datetime,
     *,
     interval: IntervalName = "minute",
+    market: MarketProfile | str | None = None,
 ) -> str:
     """done when end is outside the session window; partial when inside."""
+    profile = resolve_market(market)
     end = _as_aware_ist(end)
     now = _as_aware_ist(now)
     day = end.date()
-    session_start = datetime.combine(day, planner.SESSION_START, tzinfo=auth.IST)
-    session_end = datetime.combine(day, SESSION_END, tzinfo=auth.IST)
+    session_start = datetime.combine(day, profile.session_start, tzinfo=auth.IST)
+    session_end = datetime.combine(day, profile.session_end, tzinfo=auth.IST)
     if interval == "day":
         # Day bars: incomplete only when watermark is today's bar while session still open.
         if now.date() == day and now < session_end and end >= session_end:
@@ -196,17 +208,19 @@ def can_skip_untraded(
     end: datetime,
     *,
     untraded_cache: dict[date, set[int] | None],
+    market: MarketProfile | str | None = None,
 ) -> bool:
     """True when every weekday in the window has a final snapshot listing token as untraded.
 
     Requires an existing watermark (caller must check). Missing snapshot → False (must fetch).
     """
+    profile = resolve_market(market)
     start = _as_aware_ist(start)
     end = _as_aware_ist(end)
     # Days still needed after the watermark. If start is already at/after session
     # end, that calendar day is covered and must not be required again.
     first = start.date()
-    if start.time() >= SESSION_END:
+    if start.time() >= profile.session_end:
         first = first + timedelta(days=1)
     days = _weekdays(first, end.date())
     # No weekdays in the window → no snapshot evidence; do not skip.
@@ -289,13 +303,15 @@ def _minute_start_from_traded(
     traded: set[date] | None,
     *,
     backfill_days: int | None,
+    market: MarketProfile | str | None = None,
 ) -> datetime:
     """Tighten minute window start using traded day bars when ``--days all``."""
+    profile = resolve_market(market)
     start = _as_aware_ist(start)
     if backfill_days is not None or not traded:
         return start
     first = min(traded)
-    day_start = datetime.combine(first, planner.SESSION_START, tzinfo=auth.IST)
+    day_start = datetime.combine(first, profile.session_start, tzinfo=auth.IST)
     return max(start, day_start)
 
 
@@ -306,6 +322,7 @@ def can_skip_no_traded_days(
     *,
     backfill_days: int | None,
     has_watermark: bool,
+    market: MarketProfile | str | None = None,
 ) -> bool:
     """Skip minute fetch when day bars show no volume in the needed window.
 
@@ -317,6 +334,7 @@ def can_skip_no_traded_days(
     """
     if traded is None:
         return False
+    profile = resolve_market(market)
     start = _as_aware_ist(start)
     end = _as_aware_ist(end)
     if backfill_days is None:
@@ -326,7 +344,7 @@ def can_skip_no_traded_days(
     if not traded:
         return True
     first = start.date()
-    if start.time() >= SESSION_END:
+    if start.time() >= profile.session_end:
         first = first + timedelta(days=1)
     last = end.date()
     return not any(first <= d <= last for d in traded)
@@ -337,7 +355,9 @@ def _chunk_windows(
     end: datetime,
     *,
     chunk_days: int = planner.MINUTE_CHUNK_DAYS,
+    market: MarketProfile | str | None = None,
 ) -> list[tuple[datetime, datetime]]:
+    profile = resolve_market(market)
     start = _as_aware_ist(start)
     end = _as_aware_ist(end)
     if end <= start:
@@ -352,14 +372,14 @@ def _chunk_windows(
         if chunk_end_date >= end.date():
             chunk_end = end
         else:
-            chunk_end = datetime.combine(chunk_end_date, SESSION_END, tzinfo=auth.IST)
+            chunk_end = datetime.combine(chunk_end_date, profile.session_end, tzinfo=auth.IST)
         if chunk_end <= cursor:
             break
         windows.append((cursor, chunk_end))
         if chunk_end >= end:
             break
         next_day = chunk_end.date() + timedelta(days=1)
-        cursor = datetime.combine(next_day, planner.SESSION_START, tzinfo=auth.IST)
+        cursor = datetime.combine(next_day, profile.session_start, tzinfo=auth.IST)
     return windows
 
 
@@ -581,17 +601,21 @@ def process_contract(
     interval: IntervalName = "minute",
     backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
     traded_days: set[date] | None = None,
+    market: MarketProfile | str | None = None,
 ) -> ContractOutcome:
     """Fetch one contract's window into the spool. May raise SessionExpired / FetchAborted."""
-    end = contract_end(now, contract.expiry, interval=interval)
+    end = contract_end(now, contract.expiry, interval=interval, market=market)
     start = planner.contract_range_start(
         state,
         now=now,
         interval=interval,
         backfill_days=backfill_days if interval == "minute" else planner.BACKFILL_WINDOW_DAYS,
+        market=market,
     )
     if interval == "minute":
-        start = _minute_start_from_traded(start, traded_days, backfill_days=backfill_days)
+        start = _minute_start_from_traded(
+            start, traded_days, backfill_days=backfill_days, market=market
+        )
     prev_attempts = state.attempts if state is not None else 0
     prev_rows = state.rows_total if state is not None else 0
     prev_fetched = state.fetched_to if state is not None else None
@@ -602,7 +626,7 @@ def process_contract(
         watermark = end if prev_fetched is None else max(_as_aware_ist(prev_fetched), end)
         return ContractOutcome(
             token=contract.token,
-            status=classify_status(watermark, now, interval=interval),
+            status=classify_status(watermark, now, interval=interval, market=market),
             fetched_to=_as_naive(watermark),
             rows=prev_rows,
             attempts=prev_attempts,
@@ -617,10 +641,11 @@ def process_contract(
         traded_days,
         backfill_days=backfill_days,
         has_watermark=has_watermark,
+        market=market,
     ):
         return ContractOutcome(
             token=contract.token,
-            status=classify_status(end, now, interval=interval),
+            status=classify_status(end, now, interval=interval, market=market),
             fetched_to=_as_naive(end),
             rows=prev_rows,
             attempts=prev_attempts,
@@ -631,10 +656,17 @@ def process_contract(
 
     # Untraded skip: only when a watermark already exists.
     if has_watermark:
-        if can_skip_untraded(con, contract.token, start, end, untraded_cache=untraded_cache):
+        if can_skip_untraded(
+            con,
+            contract.token,
+            start,
+            end,
+            untraded_cache=untraded_cache,
+            market=market,
+        ):
             return ContractOutcome(
                 token=contract.token,
-                status=classify_status(end, now, interval=interval),
+                status=classify_status(end, now, interval=interval, market=market),
                 fetched_to=_as_naive(end),
                 rows=prev_rows,
                 attempts=prev_attempts,
@@ -643,7 +675,9 @@ def process_contract(
                 fetched=False,
             )
 
-    windows = _chunk_windows(start, end, chunk_days=planner.chunk_days_for(interval))
+    windows = _chunk_windows(
+        start, end, chunk_days=planner.chunk_days_for(interval), market=market
+    )
     rows_written = 0
     try:
         for win_start, win_end in windows:
@@ -703,7 +737,7 @@ def process_contract(
 
     return ContractOutcome(
         token=contract.token,
-        status=classify_status(end, now, interval=interval),
+        status=classify_status(end, now, interval=interval, market=market),
         fetched_to=_as_naive(end),
         rows=prev_rows + rows_written,
         attempts=prev_attempts + 1,
@@ -788,6 +822,7 @@ def process_series(
     on_contract: Callable[[ContractProgress], None] | None = None,
     series_index: int = 1,
     series_total: int = 1,
+    market: MarketProfile | str | None = None,
 ) -> SeriesResult:
     """Fetch all contracts in one series; merge + commit. Raises SessionExpired after commit attempt."""
     t0 = time.monotonic()
@@ -844,6 +879,7 @@ def process_series(
                     interval=interval,
                     backfill_days=backfill_days,
                     traded_days=traded,
+                    market=market,
                 )
             except SessionExpired as exc:
                 session_exc = exc
@@ -987,6 +1023,7 @@ def count_skippable(
     interval: IntervalName = "minute",
     backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
     day_dir: Path | None = None,
+    market: MarketProfile | str | None = None,
 ) -> int:
     """How many contracts would be skipped by untraded / no-traded-day rules (dry-run)."""
     cache = untraded_cache if untraded_cache is not None else {}
@@ -997,12 +1034,13 @@ def count_skippable(
         state = fetch_states.get(c.token)
         if state is not None and state.status == "gave_up":
             continue
-        end = contract_end(now, c.expiry, interval=interval)
+        end = contract_end(now, c.expiry, interval=interval, market=market)
         start = planner.contract_range_start(
             state,
             now=now,
             interval=interval,
             backfill_days=backfill_days if interval == "minute" else planner.BACKFILL_WINDOW_DAYS,
+            market=market,
         )
         traded: set[date] | None = None
         if interval == "minute":
@@ -1013,7 +1051,9 @@ def count_skippable(
                 day_dir=day_root,
                 cache=traded_cache,
             )
-            start = _minute_start_from_traded(start, traded, backfill_days=backfill_days)
+            start = _minute_start_from_traded(
+                start, traded, backfill_days=backfill_days, market=market
+            )
         if end <= start:
             continue
         has_watermark = state is not None and state.fetched_to is not None
@@ -1023,12 +1063,15 @@ def count_skippable(
             traded,
             backfill_days=backfill_days,
             has_watermark=has_watermark,
+            market=market,
         ):
             n += 1
             continue
         if not has_watermark:
             continue
-        if can_skip_untraded(con, c.token, start, end, untraded_cache=cache):
+        if can_skip_untraded(
+            con, c.token, start, end, untraded_cache=cache, market=market
+        ):
             n += 1
     return n
 
@@ -1053,6 +1096,7 @@ def run_fetch(
     on_series_start: Callable[[int, int, Series], None] | None = None,
     interrupt: InterruptController | None = None,
     deadline_monotonic: float | None = None,
+    market: MarketProfile | str | None = None,
 ) -> FetchRunResult:
     """Process queue series in order. Handles Ctrl+C, budgets, lock retries.
 
@@ -1119,6 +1163,7 @@ def run_fetch(
                     on_contract=on_contract,
                     series_index=idx,
                     series_total=total,
+                    market=market,
                 )
             except SessionExpired as exc:
                 attached = getattr(exc, "result", None)

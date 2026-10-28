@@ -499,8 +499,17 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     from . import rank as rank_mod
     from . import universe
     from .client import KiteClient, SessionExpired
-    from .paths import CATALOG_PATH, DAY_DIR, MINUTE_DIR, ymd as paths_ymd
+    from .markets import get_market
+    from .paths import paths_for, ymd as paths_ymd
     from .progress import InterruptController, ProgressReporter, setup_run_logging
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    mpaths = paths_for(market_id)
+    catalog_path = mpaths.catalog_path
+    day_dir = mpaths.day_dir
+    minute_dir = mpaths.minute_dir
+    staging_dir = mpaths.staging_dir
 
     try:
         backfill_days = planner.parse_days_arg(getattr(args, "days", None))
@@ -508,7 +517,11 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         raise SystemExit(str(exc)) from exc
     days_label = "all" if backfill_days is None else str(backfill_days)
 
-    log_path = setup_run_logging("fetch", log_file=_optional_log_path(args))
+    log_path = setup_run_logging(
+        "fetch",
+        log_file=_optional_log_path(args),
+        logs_dir=mpaths.logs_dir,
+    )
     reporter = ProgressReporter(logger=logging.getLogger("ohlcv"))
     interrupt = InterruptController()
     interrupt.install(on_soft_stop=reporter.soft_stop_announced)
@@ -518,7 +531,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     con = None
     try:
         try:
-            con = catalog.connect()
+            con = catalog.connect(catalog_path)
         except catalog.CatalogLocked as exc:
             raise SystemExit(str(exc)) from exc
 
@@ -526,7 +539,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         catalog.ensure_schema(con)
         run_id = catalog.start_run(con, "fetch", started_at=started.replace(tzinfo=None))
         try:
-            count, archive_path = _run_sync(con)
+            count, archive_path = _run_sync(con, market_id=market_id)
         except (auth.NotLoggedIn, TokenException) as exc:
             catalog.finish_run(
                 con,
@@ -546,9 +559,12 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             )
             raise SystemExit(str(exc)) from exc
 
-        reporter.note(f"Synced {count} NFO contracts (archive {archive_path})")
-        series_day = universe.select_series(con, interval="day")
-        series_min = universe.select_series(con, interval="minute")
+        reporter.note(
+            f"Synced {count} {profile.exchange} contracts "
+            f"(market={market_id}, archive {archive_path})"
+        )
+        series_day = universe.select_series(con, interval="day", market=market_id)
+        series_min = universe.select_series(con, interval="minute", market=market_id)
         series = _merge_series_by_key(series_day, series_min)
         ranks = rank_mod.load_ranks(con)
         tokens = [c.token for s in series for c in s.contracts]
@@ -566,6 +582,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             underlying_filter=args.underlying,
             limit=args.max_series,
             interval="day",
+            market=market_id,
         )
         series_by_key = {(s.underlying, s.expiry): s for s in series}
         queue_series = [
@@ -580,6 +597,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             now,
             interval="minute",
             backfill_days=backfill_days,
+            market=market_id,
         )
         minute_by_key = {(i.underlying, i.expiry): i for i in minute_items}
 
@@ -605,6 +623,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                     now=now,
                     untraded_cache=skip_cache,
                     interval="day",
+                    market=market_id,
                 )
                 min_skip = fetch_mod.count_skippable(
                     con,
@@ -615,7 +634,8 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                     traded_days_cache=traded_cache,
                     interval="minute",
                     backfill_days=backfill_days,
-                    day_dir=DAY_DIR,
+                    day_dir=day_dir,
+                    market=market_id,
                 )
                 adj_day = max(0, day_item.pending_requests - day_skip)
                 adj_min = max(0, min_pending - min_skip)
@@ -635,16 +655,17 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 run_id,
                 finished_at=datetime.now(auth.IST).replace(tzinfo=None),
                 note=(
-                    f"dry_run days={days_label} series={len(day_items)} "
-                    f"requests~={total_req} skip~={total_skip}"
+                    f"dry_run market={market_id} days={days_label} "
+                    f"series={len(day_items)} requests~={total_req} skip~={total_skip}"
                 ),
             )
             print()
             print(
-                f"Dry run (day then minute, --days={days_label}): {len(day_items)} series, "
-                f"~{total_req} requests (~{total_skip} skips), ~{total_sec / 60:.1f} min"
+                f"Dry run (market={market_id}, day then minute, --days={days_label}): "
+                f"{len(day_items)} series, ~{total_req} requests (~{total_skip} skips), "
+                f"~{total_sec / 60:.1f} min"
             )
-            print(f"Catalog: {CATALOG_PATH}")
+            print(f"Catalog: {catalog_path}")
             print(f"Log: {log_path}")
             return
 
@@ -711,13 +732,15 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 max_series=None,  # already applied when building queue
                 max_minutes=args.max_minutes,
                 interval="day",
-                series_root=DAY_DIR,
-                day_dir=DAY_DIR,
+                series_root=day_dir,
+                day_dir=day_dir,
+                staging_dir=staging_dir,
                 on_series=_on_series,
                 on_contract=reporter.contract,
                 on_series_start=_on_series_start,
                 interrupt=interrupt,
                 deadline_monotonic=deadline,
+                market=market_id,
             )
             if run_day.stopped_reason is None:
                 reporter.note("Pass 2/2: minute candles")
@@ -730,14 +753,16 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                     max_series=None,
                     max_minutes=args.max_minutes,
                     interval="minute",
-                    series_root=MINUTE_DIR,
-                    day_dir=DAY_DIR,
+                    series_root=minute_dir,
+                    day_dir=day_dir,
+                    staging_dir=staging_dir,
                     backfill_days=backfill_days,
                     on_series=_on_series,
                     on_contract=reporter.contract,
                     on_series_start=_on_series_start,
                     interrupt=interrupt,
                     deadline_monotonic=deadline,
+                    market=market_id,
                 )
         except SessionExpired as exc:
             catalog.finish_run(
@@ -771,6 +796,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 
         finished = datetime.now(auth.IST).replace(tzinfo=None)
         note_parts = [
+            f"market={market_id}",
             f"days={days_label}",
             f"series={len(queue_series)}",
             f"day_done={run_day.series_done if run_day else 0}",
@@ -814,9 +840,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 print(f"  {u} {paths_ymd(e)}")
         if stopped:
             print(f"Stopped: {stopped}")
-        print(f"Day dir: {DAY_DIR}")
-        print(f"Minute dir: {MINUTE_DIR}")
-        print(f"Catalog: {CATALOG_PATH}")
+        print(f"Market: {market_id}")
+        print(f"Day dir: {day_dir}")
+        print(f"Minute dir: {minute_dir}")
+        print(f"Catalog: {catalog_path}")
         print(f"Log: {log_path}")
     finally:
         interrupt.restore()
@@ -824,12 +851,14 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             con.close()
 
 
-def _catalog_ro():
+def _catalog_ro(catalog_path=None):
     """Open catalog read-only; exit with a clear message on lock."""
     from . import catalog
+    from .paths import CATALOG_PATH
 
+    path = catalog_path if catalog_path is not None else CATALOG_PATH
     try:
-        return catalog.connect(read_only=True)
+        return catalog.connect(path, read_only=True)
     except catalog.CatalogLocked as exc:
         raise SystemExit(
             "a daily/fetch run (or notebook) holds catalog.duckdb; "
@@ -839,11 +868,9 @@ def _catalog_ro():
         # DuckDB raises IOException when the file does not exist under read_only.
         msg = str(exc).lower()
         if "cannot open" in msg or "no such file" in msg or "does not exist" in msg:
-            from .paths import CATALOG_PATH
-
             raise SystemExit(
-                f"catalog not found: {CATALOG_PATH}\n"
-                "Run: uv run ohlcv sync"
+                f"catalog not found: {path}\n"
+                "Run: uv run ohlcv sync --market <nfo|mcx|cds>"
             ) from exc
         raise
 
@@ -853,13 +880,16 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     from . import catalog
     from . import status as status_mod
-    from .paths import CATALOG_PATH, ymd as paths_ymd
+    from .paths import paths_for, ymd as paths_ymd
 
+    market_id = _market_id(args)
+    mpaths = paths_for(market_id)
+    catalog_path = mpaths.catalog_path
     interval = getattr(args, "interval", "minute") or "minute"
     if interval not in ("minute", "day"):
         raise SystemExit(f"unsupported --interval: {interval}")
     expiry_filter = _parse_ymd(args.expiry) if args.expiry else None
-    con = _catalog_ro()
+    con = _catalog_ro(catalog_path)
     try:
         rows = status_mod.series_status(
             con,
@@ -867,7 +897,11 @@ def cmd_status(args: argparse.Namespace) -> None:
             expiry=expiry_filter,
             underlying=args.underlying,
             interval=interval,
+            day_dir=mpaths.day_dir,
+            minute_dir=mpaths.minute_dir,
+            market=market_id,
         )
+        print(f"Market: {market_id}")
         print(f"Interval: {interval}")
         if args.limit is not None and args.limit >= 0:
             rows = rows[: args.limit]
@@ -920,7 +954,7 @@ def cmd_status(args: argparse.Namespace) -> None:
                     f"contracts={s.contracts} traded={s.traded_contracts} "
                     f"missing={s.missing} volume={s.total_volume:,}"
                 )
-        gaps = status_mod.snapshot_gaps(con)
+        gaps = status_mod.snapshot_gaps(con, market=market_id)
         if gaps:
             gap_text = ", ".join(paths_ymd(d) for d in gaps[:20])
             extra = f" (+{len(gaps) - 20} more)" if len(gaps) > 20 else ""
@@ -953,7 +987,7 @@ def cmd_status(args: argparse.Namespace) -> None:
                     f"req={run.requests} retry={run.retries} err={run.errors}"
                     + (f"  {note}" if note else "")
                 )
-        print(f"Catalog: {CATALOG_PATH}")
+        print(f"Catalog: {catalog_path}")
     finally:
         con.close()
 
@@ -962,14 +996,17 @@ def cmd_show(args: argparse.Namespace) -> None:
     from . import catalog
     from . import read as read_mod
     from . import status as status_mod
-    from .paths import CATALOG_PATH, sanitize_underlying, ymd as paths_ymd
+    from .paths import paths_for, sanitize_underlying, ymd as paths_ymd
 
+    market_id = _market_id(args)
+    mpaths = paths_for(market_id)
+    catalog_path = mpaths.catalog_path
     expiry = _parse_ymd(args.expiry)
     underlying = args.underlying.strip()
     if args.symbol and args.token is not None:
         raise SystemExit("use either --symbol or --token, not both")
 
-    con = _catalog_ro()
+    con = _catalog_ro(catalog_path)
     try:
         # Resolve catalog name: accept M&M or M_M.
         contracts = catalog.list_contracts(con, expiry=expiry)
@@ -990,7 +1027,10 @@ def cmd_show(args: argparse.Namespace) -> None:
         interval = getattr(args, "interval", "minute") or "minute"
         if interval not in ("minute", "day"):
             raise SystemExit(f"unsupported --interval: {interval}")
-        path = read_mod.series_file_path(catalog_ul, expiry, interval=interval)
+        series_root = mpaths.day_dir if interval == "day" else mpaths.minute_dir
+        path = read_mod.series_file_path(
+            catalog_ul, expiry, interval=interval, series_root=series_root
+        )
         try:
             file_bytes, file_rows, min_ts, max_ts = read_mod.file_info(path)
         except FileNotFoundError as exc:
@@ -1150,7 +1190,8 @@ def cmd_show(args: argparse.Namespace) -> None:
                     )
         finally:
             duck.close()
-        print(f"Catalog: {CATALOG_PATH}")
+        print(f"Market: {market_id}")
+        print(f"Catalog: {catalog_path}")
     finally:
         con.close()
 
@@ -1222,6 +1263,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
             limit=args.limit,
             interval=interval,
             backfill_days=backfill_days,
+            market=market_id,
         )
 
         catalog.finish_run(
@@ -1242,7 +1284,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
         if not ranks:
             print(
                 "Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering "
-                "(NFO only until Phase 3+)"
+                "(rank/daily remain NFO-only)"
                 if market_id != "nfo"
                 else "Note: no ranks yet - run `uv run ohlcv rank` for traded-value ordering"
             )
@@ -1293,7 +1335,7 @@ def main() -> None:
         prog="ohlcv",
         description=(
             "OHLCV tools (probe, sync, rank, queue, daily, fetch, status, show). "
-            "Use --market nfo|mcx|cds on sync/queue (default nfo)."
+            "Use --market nfo|mcx|cds on sync/queue/fetch/status/show (default nfo)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1400,10 +1442,11 @@ def main() -> None:
     p_fetch = sub.add_parser(
         "fetch",
         help=(
-            "Fetch day (~2000d) then minute candles for queued NFO series "
-            "(expiry-first, incremental)."
+            "Fetch day (~2000d) then minute candles for queued series "
+            "(expiry-first, incremental). Use --market for MCX/CDS FUT."
         ),
     )
+    _add_market_arg(p_fetch)
     p_fetch.add_argument(
         "--expiry",
         default=None,
@@ -1445,7 +1488,7 @@ def main() -> None:
         "--log-file",
         default=None,
         metavar="PATH",
-        help="Write run log to PATH (default: data/ohlcv/nfo/logs/fetch_YYYYMMDD_HHMMSS.log).",
+        help="Write run log to PATH (default: data/ohlcv/<market>/logs/fetch_YYYYMMDD_HHMMSS.log).",
     )
     p_fetch.set_defaults(func=cmd_fetch)
 
@@ -1453,6 +1496,7 @@ def main() -> None:
         "status",
         help="Offline progress report: series completion, snapshot gaps, recent runs.",
     )
+    _add_market_arg(p_status)
     p_status.add_argument(
         "--all",
         action="store_true",
@@ -1492,6 +1536,7 @@ def main() -> None:
         "show",
         help="Inspect one minute/day series file (offline).",
     )
+    _add_market_arg(p_show)
     p_show.add_argument(
         "underlying",
         help="Underlying name (catalog form, e.g. NIFTY or M&M).",

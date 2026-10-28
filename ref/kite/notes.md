@@ -98,8 +98,18 @@ CLI: `uv run ohlcv sync|queue --market nfo|mcx|cds` (default `nfo`).
 - `universe.sync_contracts(..., market=)` filters by exchange + sync types; `select_series(..., market=)` uses that market’s `session_end` for unfinished-expired checks.
 - Shared instruments archive still under `data/instruments/archive/` (master must include MCX/CDS after a refresh).
 - Universe v1 unchanged: nearest **3** live expiries per underlying + unfinished expired.
-- Rank / daily / fetch / status / show remain **NFO-only** until Phase 3+ (queue may show unranked MCX/CDS series).
 - Offline: `uv run python -m ohlcv.selftest` (includes `test_sync_mcx_cds_fut_only`).
+
+## OHLCV multi-market fetch (Phase 3)
+
+CLI: `uv run ohlcv fetch|status|show|queue --market nfo|mcx|cds` (default `nfo`).
+
+- Planner/fetch session bounds come from `MarketProfile` (`market=` on `fetch_end`, chunk windows, watermarks, queue estimates).
+- `fetch` writes day/minute parquet under `data/ohlcv/<market>/` and updates that market’s `catalog.duckdb` / logs.
+- MCX/CDS sync remains **FUT-only**; same day-then-minute fetch as NFO (minute ≤60d chunks, day ~2000d).
+- `status` / `show` open the per-market catalog and series roots.
+- **Still NFO-only:** `rank`, `daily` quote snapshots (untraded-token skip is a no-op without snapshots).
+- Offline: `uv run python -m ohlcv.selftest` (includes MCX session / chunk / fetch tests).
 
 ## OHLCV Phase 1 (NFO foundation + download queue)
 
@@ -109,13 +119,13 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 | Command | Needs login | Purpose |
 | --- | --- | --- |
 | `uv run ohlcv sync [--market nfo\|mcx\|cds]` | only if master cache must refresh from Kite | Archive master → `data/instruments/archive/`; upsert into `data/ohlcv/<market>/catalog.duckdb` (NFO all expiry types; MCX/CDS FUT) |
-| `uv run ohlcv rank [--force]` | only if no final snapshot (falls back to FUT day) | Rank underlyings: prefer final quote snapshot (`source=quote`); else nearest-FUT day `volume * close` |
+| `uv run ohlcv rank [--force]` | only if no final snapshot (falls back to FUT day) | Rank underlyings (**NFO only**): prefer final quote snapshot; else nearest-FUT day |
 | `uv run ohlcv queue [--market] [--expiry] [--underlying] [--limit] [--interval minute\|day] [-d N\|all]` | only if sync must refresh master | Print series queue for market: expiry asc, traded_value desc, unranked last; request/time estimates (`-d` for minute only) |
 | `uv run ohlcv probe` | yes | Phase 0 measurements (unchanged) |
-| `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | Phase 2 end-of-day quote snapshot |
-| `uv run ohlcv fetch […] [-d N\|all]` | yes (except `--dry-run`) | Day (~2000d) then minute candles; `-d` controls minute window only (default 60) |
-| `uv run ohlcv status [--all] [--expiry] [--underlying] [--interval] [--limit] [--runs]` | no | Phase 4 offline progress report |
-| `uv run ohlcv show UNDERLYING EXPIRY [--interval] [--symbol\|--token] [--tail]` | no | Phase 4/5 inspect one minute or day series file |
+| `uv run ohlcv daily [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | End-of-day quote snapshot (**NFO only**) |
+| `uv run ohlcv fetch [--market] […] [-d N\|all]` | yes (except `--dry-run`) | Day (~2000d) then minute candles; `-d` controls minute window only (default 60) |
+| `uv run ohlcv status [--market] [--all] [--expiry] [--underlying] [--interval] [--limit] [--runs]` | no | Offline progress report |
+| `uv run ohlcv show [--market] UNDERLYING EXPIRY [--interval] [--symbol\|--token] [--tail]` | no | Inspect one minute or day series file |
 
 ### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=2)
 Tables: `meta`, `contracts`, `fetch_state` (watermarks; Phase 3 writes), `underlying_rank`, `runs`, `daily_snapshots`.
@@ -169,9 +179,10 @@ One CLI run downloads **day** candles first (~2000d, one request/contract), then
 
 ### Command
 ```powershell
-uv run ohlcv fetch [--expiry yyyymmdd] [--underlying NIFTY] [-d N|all] [--max-series N] [--max-minutes M] [--dry-run]
+uv run ohlcv fetch [--market nfo|mcx|cds] [--expiry yyyymmdd] [--underlying NIFTY] [-d N|all] [--max-series N] [--max-minutes M] [--dry-run]
 ```
 - Queue: union of unfinished series for day **or** minute; order expiry ascending, then traded-value rank.
+- Layout roots: `data/ohlcv/<market>/day|minute|catalog.duckdb` (default market `nfo`).
 - Pass 1 = day (`DAY_BACKFILL_DAYS=2000`); pass 2 = minute with `-d` / `--days` (default **60**, or `all`).
 - `-d=all`: tighten minute start to the earliest **traded** day bar (`volume>0`) from the series day parquet; skip minute when the day file exists and the token has no traded days.
 - Minute API still chunks at **60** calendar days per request when the window is wider.
