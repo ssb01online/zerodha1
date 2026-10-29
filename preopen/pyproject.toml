@@ -1,0 +1,23 @@
+[project]
+name = "preopen"
+version = "0.1.0"
+description = "NSE/BSE equity pre-open quote snapshots and day UI API"
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.1.0",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "instruments",
+    "kitetools",
+]
+
+[project.scripts]
+preopen = "preopen.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+instruments = { workspace = true }
+kitetools = { workspace = true }

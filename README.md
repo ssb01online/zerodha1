@@ -176,7 +176,18 @@ cd ..
 uv run portfolio serve
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765) — routes: `/portfolio` (live), `/snapshots`, `/snapshots/:id`. Health includes `ui_dist_exists`.
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765) — routes: `/portfolio` (live), `/snapshots`, `/snapshots/:id`, `/preopen`, `/instruments`. Health includes `ui_dist_exists`.
+
+### Pre-open equity capture
+
+```powershell
+uv run preopen capture --dry-run          # estimate EQ count / wait
+uv run preopen capture                    # wait until 09:08:30 IST, then quote sweep
+uv run preopen capture --force            # run immediately (skip wait)
+uv run preopen show                       # top rows for latest snapshot
+```
+
+Snapshots land in `data/preopen/`. Browse at `/preopen` after `portfolio serve`.
 
 ### UI — dev (two terminals)
 

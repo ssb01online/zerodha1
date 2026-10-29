@@ -8,6 +8,7 @@ members = [
     "kitetools",
     "ohlcv",
     "portfolio",
+    "preopen",
 ]
 
 [[package]]
@@ -576,6 +577,7 @@ dependencies = [
     { name = "httpx" },
     { name = "instruments" },
     { name = "kitetools" },
+    { name = "preopen" },
     { name = "uvicorn" },
 ]
 
@@ -586,7 +588,29 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "instruments", editable = "instruments" },
     { name = "kitetools", editable = "." },
+    { name = "preopen", editable = "preopen" },
     { name = "uvicorn", specifier = ">=0.32.0" },
+]
+
+[[package]]
+name = "preopen"
+version = "0.1.0"
+source = { editable = "preopen" }
+dependencies = [
+    { name = "duckdb" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "instruments" },
+    { name = "kitetools" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "duckdb", specifier = ">=1.1.0" },
+    { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "httpx", specifier = ">=0.28.0" },
+    { name = "instruments", editable = "instruments" },
+    { name = "kitetools", editable = "." },
 ]
 
 [[package]]

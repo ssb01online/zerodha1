@@ -60,6 +60,12 @@ export default function TopBar() {
           Snapshots
         </NavLink>
         <NavLink
+          to="/preopen"
+          className={({ isActive }) => (isActive ? "active" : undefined)}
+        >
+          Pre-open
+        </NavLink>
+        <NavLink
           to="/instruments"
           className={({ isActive }) => (isActive ? "active" : undefined)}
         >

@@ -9,6 +9,8 @@ import type {
   NfoUnderlyingsResult,
   OptionChainResult,
   PortfolioPayload,
+  PreopenDayPayload,
+  PreopenDaysResult,
   SnapshotsList,
 } from "./types";
 
@@ -136,5 +138,26 @@ export function getNfoChain(
   const sp = new URLSearchParams({ underlying, expiry });
   return apiFetch<OptionChainResult>(
     `/api/instruments/nfo/chain?${sp.toString()}`,
+  );
+}
+
+export function listPreopenDays(): Promise<PreopenDaysResult> {
+  return apiFetch<PreopenDaysResult>("/api/preopen/days");
+}
+
+export function getPreopenDay(
+  ymd: string,
+  params?: {
+    limit?: number;
+    min_value?: number;
+    exchange?: string;
+  },
+): Promise<PreopenDayPayload> {
+  const sp = new URLSearchParams();
+  sp.set("limit", String(params?.limit ?? 50));
+  if (params?.min_value != null) sp.set("min_value", String(params.min_value));
+  if (params?.exchange) sp.set("exchange", params.exchange);
+  return apiFetch<PreopenDayPayload>(
+    `/api/preopen/day/${ymd}?${sp.toString()}`,
   );
 }

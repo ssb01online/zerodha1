@@ -13,6 +13,7 @@ from kiteconnect.exceptions import KiteException
 
 from instruments import api_router as instruments_router
 from instruments import peek_as_of as instruments_peek_as_of
+from preopen import api_router as preopen_router
 
 from .fetch import TokenInvalid, fetch_live
 from .service import (
@@ -71,6 +72,7 @@ def create_app(
     app.state.ui_dist = dist
     app.state.ui_dist_exists = ui_dist_exists
     app.include_router(instruments_router)
+    app.include_router(preopen_router)
 
     @app.exception_handler(TokenInvalid)
     async def token_invalid_handler(_request: Request, exc: TokenInvalid) -> JSONResponse:

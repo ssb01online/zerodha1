@@ -251,3 +251,54 @@ export interface OptionChainResult {
   fut: InstrumentRow | null;
   strikes: OptionChainStrike[];
 }
+
+export interface PreopenDayMeta {
+  trade_date: string;
+  ymd: string;
+  path: string;
+  taken_at: string;
+  rows: number;
+  traded_rows: number;
+  total_traded_value: number;
+}
+
+export interface PreopenDaysResult {
+  count: number;
+  days: PreopenDayMeta[];
+}
+
+export interface PreopenRow {
+  exchange: string;
+  tradingsymbol: string;
+  token: number;
+  name: string;
+  last_price: number | null;
+  average_price: number;
+  volume: number;
+  traded_value: number;
+  ohlc_open: number | null;
+  ohlc_high: number | null;
+  ohlc_low: number | null;
+  ohlc_close: number | null;
+  buy_quantity: number;
+  sell_quantity: number;
+  last_trade_time: string | null;
+  quote_timestamp: string | null;
+  taken_at: string | null;
+}
+
+export interface PreopenDayPayload {
+  trade_date: string;
+  ymd: string;
+  path: string;
+  taken_at: string | null;
+  day_rows: number;
+  day_traded_rows: number;
+  day_total_traded_value: number;
+  filtered_rows: number;
+  filtered_total_traded_value: number;
+  limit: number;
+  min_value: number;
+  exchange: string | null;
+  items: PreopenRow[];
+}

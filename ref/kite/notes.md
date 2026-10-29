@@ -403,3 +403,17 @@ npm run dev
 - Shared SPA + single `portfolio serve` port; domain code in workspace package `instruments` (`cache`, `query`, `api` router).
 - Scope: NSE/BSE equity + NFO. NFO underlying key = dump `name`.
 - TODOs (not in this phase): live LTP/OI quotes, MF (`mf_instruments`), CDS, MCX, BFO, NSE/BSE same-scrip pairing, renaming serve to a generic app name.
+
+## Pre-open equity snapshots
+
+Workspace package `preopen`. Historical candles do **not** include NSE/BSE pre-open; capture must run live after auction match (~09:08 IST).
+
+- Universe: NSE + BSE `EQ` only (F&O excluded).
+- CLI: `uv run preopen capture [--at 09:08:30] [--force] [--dry-run]` — waits until IST `--at` (default 09:08:30), then `quote()` in batches of **500** at **1 req/s**. `--force` skips the wait.
+- Ranking metric: `traded_value = volume * average_price`.
+- Storage: `data/preopen/YYYYMMDD.parquet` + `data/preopen/catalog.duckdb` (`snapshots` index).
+- Show: `uv run preopen show [yyyymmdd] [--limit N]`.
+- API (via `portfolio serve`): `GET /api/preopen/days`, `GET /api/preopen/day/{yyyymmdd}?limit=&exchange=&min_value=`.
+- UI: `/preopen` — day picker, exchange filter, top-N by traded value, day/filtered totals.
+- Offline: `uv run python -m preopen.selftest`.
+- Missed day cannot be backfilled from Kite historical. Start the capture process before 09:08 (e.g. 08:50) or schedule it externally.
