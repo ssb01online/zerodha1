@@ -1,0 +1,21 @@
+[project]
+name = "sessiontray"
+version = "0.1.0"
+description = "Minimal Windows tray icon for Kite access_token validity"
+requires-python = ">=3.13"
+dependencies = [
+    "kitetools",
+    "pystray>=0.19.5",
+    "Pillow>=10.0.0",
+    "winotify>=1.1.0",
+]
+
+[project.scripts]
+sessiontray = "sessiontray.app:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+kitetools = { workspace = true }

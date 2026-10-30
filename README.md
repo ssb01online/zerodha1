@@ -35,7 +35,7 @@ echo $env:UV_SYSTEM_CERTS
 Install [uv](https://docs.astral.sh/uv/) if needed, then from this repo:
 
 ```powershell
-uv sync
+uv sync --all-packages
 ```
 
 ### 3. Kite Connect app + credentials
@@ -119,15 +119,16 @@ Always `import kitetools` (or `from kitetools...`) before other HTTPS clients so
 
 ---
 
-## OHLCV package (NFO candles)
+## OHLCV package (NFO / MCX / CDS candles)
 
-Workspace member for F&O quote snapshots and minute candle downloads. After `uv sync --all-packages`:
+Workspace member for derivative quote snapshots and candle downloads (`--market nfo|mcx|cds`). After `uv sync --all-packages`:
 
 ```powershell
-uv run ohlcv sync          # archive instruments master + upsert NFO contracts into catalog
+uv run ohlcv sync          # archive instruments master + upsert contracts into catalog
 uv run ohlcv rank          # rank underlyings (final quote snapshot, else FUT day)
 uv run ohlcv queue         # print expiry-first download queue with request estimates
-uv run ohlcv daily         # end-of-day quote() snapshot (after 15:40 IST on a session day)
+uv run ohlcv daily         # end-of-day quote() snapshot (after that market's session_end)
+uv run ohlcv eod --dry-run # plan: wait until session_end+30m, then daily+fetch per market
 uv run ohlcv fetch --dry-run
 uv run ohlcv fetch --max-series 1          # smoke: one series
 uv run ohlcv fetch --expiry 20261027       # one expiry, all underlyings
@@ -137,7 +138,38 @@ uv run ohlcv show NIFTY 20261027           # inspect one minute series file
 uv run python -m ohlcv.selftest
 ```
 
-Typical session-day flow after 15:40 IST: `daily` → `fetch` → `status`.
+Typical session-day flow: after each market’s ready time (`session_end` + 30m) run `daily` → `fetch`, or use `ohlcv eod` / Task Scheduler (below).
+
+---
+
+## Automation (Task Scheduler + session tray)
+
+Morning login stays manual (`uv run kitetools login`). After that:
+
+1. **Session tray** (green = valid token, red = expired) — start at logon or manually:
+
+```powershell
+uv run sessiontray
+```
+
+Tray menu: **Login** (new console with `kitetools login`), **Refresh**, **Quit**. Toast fires when the token flips to expired. Single-instance lock under `data/sessiontray.lock`.
+
+2. **EOD download tasks** — machine clock should be **IST**. Register once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\register-scheduled-tasks.ps1
+```
+
+| Task | When (local/IST) | Action |
+| --- | --- | --- |
+| `KiteSessionTray` | At logon | `scripts\sessiontray.cmd` |
+| `OhlcvEodNfo` | Mon–Fri 16:10 | `ohlcv eod --markets nfo --no-wait` |
+| `OhlcvEodCds` | Mon–Fri 17:30 | `ohlcv eod --markets cds --no-wait` |
+| `OhlcvEodMcx` | Daily 00:05 | `ohlcv eod --markets mcx --no-wait` (trade_date = yesterday before 06:00) |
+
+Logs: `data/ohlcv/_eod/`. Remove tasks: `scripts\unregister-scheduled-tasks.ps1`.
+
+Manual long wait (optional): `uv run ohlcv eod` from ~07:00 sleeps until each market is ready.
 
 Read helpers (notebooks / scripts):
 

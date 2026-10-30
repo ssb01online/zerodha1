@@ -79,14 +79,21 @@ def snapshot_status(
     now: datetime | None = None,
     *,
     market: MarketProfile | str | None = None,
+    trade_date: date | None = None,
 ) -> str:
+    """Return ``final`` once ``now`` is at/after that session's ``session_end``.
+
+    ``trade_date`` selects which calendar day's session_end to compare (needed
+    for post-midnight MCX EOD where ``now.date()`` is the next day).
+    """
     profile = resolve_market(market)
     now = now if now is not None else _now_ist()
     if now.tzinfo is None:
         now = now.replace(tzinfo=auth.IST)
     else:
         now = now.astimezone(auth.IST)
-    session_end = datetime.combine(now.date(), profile.session_end, tzinfo=auth.IST)
+    day = trade_date if trade_date is not None else now.date()
+    session_end = datetime.combine(day, profile.session_end, tzinfo=auth.IST)
     return "final" if now >= session_end else "intraday"
 
 
@@ -372,7 +379,7 @@ def take_snapshot(
             "take the snapshot on the session day after close."
         )
 
-    status = snapshot_status(now, market=profile)
+    status = snapshot_status(now, market=profile, trade_date=run_date)
     dest = dest_dir / f"{ymd(trade_date)}.parquet"
     _write_parquet(rows, dest, staging_dir=staging_dir)
     taken_at = now.replace(tzinfo=None)

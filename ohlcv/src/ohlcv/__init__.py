@@ -1,6 +1,6 @@
 """OHLCV download, storage, and query (NFO + MCX/CDS markets).
 
-CLI: probe, sync, rank, queue, daily, continuous, fetch, status, show.
+CLI: probe, sync, rank, queue, daily, continuous, fetch, eod, status, show.
 Use --market nfo|mcx|cds (default nfo) on market-scoped commands.
 """
 

@@ -1494,12 +1494,55 @@ def cmd_queue(args: argparse.Namespace) -> None:
         con.close()
 
 
+def cmd_eod(args: argparse.Namespace) -> None:
+    """Session-gated daily + fetch across markets (wait until ready, or --no-wait)."""
+    from . import eod as eod_mod
+    from . import planner
+    from .client import SessionExpired
+    from .progress import InterruptController
+
+    try:
+        markets = eod_mod.parse_markets_arg(getattr(args, "markets", None))
+        buffer = eod_mod.parse_buffer_arg(getattr(args, "buffer", None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    trade_date = _parse_ymd(args.trade_date) if args.trade_date else None
+    try:
+        backfill_days = planner.parse_days_arg(getattr(args, "days", None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    interrupt = InterruptController()
+    interrupt.install()
+    try:
+        eod_mod.run_eod(
+            markets=markets,
+            trade_date=trade_date,
+            buffer=buffer,
+            no_wait=bool(args.no_wait),
+            force=bool(args.force),
+            dry_run=bool(args.dry_run),
+            max_series=args.max_series,
+            backfill_days=backfill_days,
+            types=_types_arg(args),
+            interrupt=interrupt,
+            should_stop=interrupt.should_stop,
+        )
+    except (auth.NotLoggedIn, TokenException, SessionExpired) as exc:
+        _login_exit(exc)
+    except KeyboardInterrupt as exc:
+        raise SystemExit(f"stopped: {exc}") from exc
+    finally:
+        interrupt.restore()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ohlcv",
         description=(
             "OHLCV tools (probe, sync, rank, queue, daily, continuous, fetch, "
-            "status, show). Use --market nfo|mcx|cds (default nfo)."
+            "eod, status, show). Use --market nfo|mcx|cds (default nfo)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1782,6 +1825,60 @@ def main() -> None:
         help="With --symbol/--token, print the last N bars (default 5).",
     )
     p_show.set_defaults(func=cmd_show)
+
+    p_eod = sub.add_parser(
+        "eod",
+        help=(
+            "End-of-day orchestrator: wait until each market's session_end+buffer, "
+            "then daily snapshot + fetch (expiry-today ∪ unfinished). "
+            "Default markets: nfo,cds,mcx."
+        ),
+    )
+    p_eod.add_argument(
+        "--markets",
+        default="nfo,cds,mcx",
+        help="Comma-separated markets in close order (default: nfo,cds,mcx).",
+    )
+    p_eod.add_argument(
+        "--buffer",
+        default="30m",
+        help="Ready buffer after session_end (default: 30m). Also accepts Nh / Ns / minutes.",
+    )
+    p_eod.add_argument(
+        "--trade-date",
+        default=None,
+        help="Override trade date (yyyymmdd). Default: today IST, or yesterday before 06:00.",
+    )
+    p_eod.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Do not sleep; skip markets that are not past download_ready yet.",
+    )
+    p_eod.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip ready wait (may write intraday daily / partial day candles).",
+    )
+    p_eod.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print plan and queue counts only (no wait, no network download).",
+    )
+    p_eod.add_argument(
+        "--max-series",
+        type=int,
+        default=None,
+        help="Cap series processed per market.",
+    )
+    p_eod.add_argument(
+        "-d",
+        "--days",
+        default="60",
+        metavar="N|all",
+        help="Minute backfill window (default: 60).",
+    )
+    _add_types_arg(p_eod)
+    p_eod.set_defaults(func=cmd_eod)
 
     args = parser.parse_args()
     args.func(args)

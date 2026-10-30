@@ -25,6 +25,7 @@ from kitetools import auth
 from . import archive as archive_mod
 from . import catalog
 from . import continuous as continuous_mod
+from . import eod as eod_mod
 from . import fetch as fetch_mod
 from . import planner
 from . import rank as rank_mod
@@ -1000,6 +1001,116 @@ def test_snapshot_status_boundary() -> None:
     cds_at = datetime.combine(day, datetime.strptime("17:00", "%H:%M").time(), tzinfo=auth.IST)
     _assert(snapshot.snapshot_status(cds_before, market="cds") == "intraday", "cds before 17:00")
     _assert(snapshot.snapshot_status(cds_at, market="cds") == "final", "cds at 17:00")
+
+    # Post-midnight MCX: now is next calendar day; trade_date anchors session_end.
+    next_morning = datetime(2026, 10, 28, 0, 5, 0, tzinfo=auth.IST)
+    _assert(
+        snapshot.snapshot_status(next_morning, market="mcx") == "intraday",
+        "00:05 without trade_date uses today's 23:30",
+    )
+    _assert(
+        snapshot.snapshot_status(next_morning, market="mcx", trade_date=day) == "final",
+        "00:05 with trade_date=prior session is final",
+    )
+
+
+def test_eod_timing_and_plan() -> None:
+    day = date(2026, 10, 27)
+    nfo = markets_mod.get_market("nfo")
+    mcx = markets_mod.get_market("mcx")
+    cds = markets_mod.get_market("cds")
+    buf = timedelta(minutes=30)
+
+    nfo_ready = eod_mod.download_ready(day, nfo, buffer=buf)
+    _assert(nfo_ready == datetime(2026, 10, 27, 16, 10, tzinfo=auth.IST), f"nfo ready={nfo_ready}")
+    cds_ready = eod_mod.download_ready(day, cds, buffer=buf)
+    _assert(cds_ready == datetime(2026, 10, 27, 17, 30, tzinfo=auth.IST), f"cds ready={cds_ready}")
+    mcx_ready = eod_mod.download_ready(day, mcx, buffer=buf)
+    _assert(mcx_ready == datetime(2026, 10, 28, 0, 0, tzinfo=auth.IST), f"mcx ready={mcx_ready}")
+
+    morning = datetime(2026, 10, 27, 7, 0, tzinfo=auth.IST)
+    _assert(eod_mod.resolve_trade_date(morning) == day, "07:00 trade_date=today")
+    pre_reset = datetime(2026, 10, 28, 0, 5, tzinfo=auth.IST)
+    _assert(eod_mod.resolve_trade_date(pre_reset) == day, "00:05 trade_date=yesterday")
+    after_reset = datetime(2026, 10, 28, 6, 0, tzinfo=auth.IST)
+    _assert(eod_mod.resolve_trade_date(after_reset) == date(2026, 10, 28), "06:00 trade_date=today")
+
+    _assert(eod_mod.parse_markets_arg("mcx,nfo") == ["nfo", "mcx"], "order preserved")
+    _assert(eod_mod.parse_buffer_arg("30m") == buf, "buffer 30m")
+    _assert(eod_mod.parse_buffer_arg("1h") == timedelta(hours=1), "buffer 1h")
+
+    plan = eod_mod.build_plan(
+        trade_date=day,
+        markets=["nfo", "cds", "mcx"],
+        buffer=buf,
+        now=morning,
+        catalog_counts={"nfo": (2, 1), "cds": (0, 0), "mcx": (1, 3)},
+    )
+    text = eod_mod.format_plan(plan)
+    _assert("trade_date=20261027" in text, "plan trade_date")
+    _assert("nfo" in text and "16:10" in text, "plan nfo ready")
+    _assert(plan.markets[0].wait_seconds > 0, "nfo wait from 07:00")
+    _assert(plan.markets[0].expiry_today == 2, "nfo expiry count")
+
+    # --no-wait before ready → EodSkipped
+    raised = False
+    try:
+        eod_mod.run_market_eod(
+            "nfo",
+            trade_date=day,
+            now=morning,
+            no_wait=True,
+            dry_run=True,
+        )
+    except eod_mod.EodSkipped:
+        raised = True
+    _assert(raised, "no-wait before ready skips")
+
+    # dry-run after ready (uses on-disk catalog if present; no network)
+    after = datetime(2026, 10, 27, 16, 15, tzinfo=auth.IST)
+    summary = eod_mod.run_market_eod(
+        "nfo",
+        trade_date=day,
+        now=after,
+        no_wait=True,
+        dry_run=True,
+    )
+    _assert(summary.get("dry_run") is True, "dry_run summary")
+    _assert(summary.get("market") == "nfo", "dry_run market")
+    _assert("series" in summary, "dry_run series key")
+
+
+def test_eod_select_series_expiry_and_unfinished() -> None:
+    trade = date(2026, 10, 27)
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "catalog.duckdb"
+        con = catalog.connect(db)
+        try:
+            catalog.ensure_schema(con)
+            catalog.upsert_contracts(
+                con,
+                [
+                    catalog.ContractRow(1, "NIFTY", trade, "NIFTY27OCT", "FUT", 0.0, 50),
+                    catalog.ContractRow(2, "NIFTY", trade, "NIFTY27C", "CE", 25000.0, 50),
+                    catalog.ContractRow(
+                        3, "BANKNIFTY", date(2026, 10, 20), "BN20OCT", "FUT", 0.0, 15
+                    ),
+                    catalog.ContractRow(
+                        4, "NIFTY", date(2026, 11, 3), "NIFTY03NOV", "FUT", 0.0, 50
+                    ),
+                ],
+                seen_on=trade,
+            )
+            # Token 3 unfinished (no fetch_state).
+            series = eod_mod.select_eod_series(con, trade, interval="minute", market="nfo")
+            keys = {(s.underlying, s.expiry) for s in series}
+            _assert((("NIFTY", trade) in keys), "expiry today included")
+            _assert((("BANKNIFTY", date(2026, 10, 20)) in keys), "unfinished included")
+            _assert((("NIFTY", date(2026, 11, 3)) not in keys), "future expiry excluded")
+            exp_n, unf_n = eod_mod.count_eod_buckets(con, trade, market="nfo")
+            _assert(exp_n == 1 and unf_n == 1, f"buckets exp={exp_n} unf={unf_n}")
+        finally:
+            con.close()
 
 
 def test_snapshot_mcx_quote_prefix_and_rank() -> None:
@@ -2918,6 +3029,8 @@ def main() -> None:
         test_queue_order_and_chunks,
         test_catalog_v1_to_v2_migration,
         test_snapshot_status_boundary,
+        test_eod_timing_and_plan,
+        test_eod_select_series_expiry_and_unfinished,
         test_snapshot_mcx_quote_prefix_and_rank,
         test_continuous_nearest_fut_and_write,
         test_can_skip_untraded_uses_market_daily_dir,
