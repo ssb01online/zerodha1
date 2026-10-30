@@ -10,6 +10,7 @@ import threading
 from kitetools.auth import IST
 from kitetools.config import ROOT
 
+from . import catchup as catchup_mod
 from . import lock as lock_mod
 from .status import SessionStatus, check_session
 
@@ -75,11 +76,22 @@ class TrayApp:
             _tooltip(self._status),
             menu=pystray.Menu(
                 pystray.MenuItem("Login", self._on_login, default=True),
+                pystray.MenuItem("Catch up EOD", self._on_catchup),
                 pystray.MenuItem("Refresh", self._on_refresh),
                 pystray.MenuItem("Quit", self._on_quit),
             ),
         )
         self._toasted_expired = False
+
+    def _spawn_catchup(self, *, reason: str) -> None:
+        started, message = catchup_mod.spawn_catchup()
+        if started:
+            _show_toast("EOD catch-up", f"{message} ({reason})")
+        elif "already running" in message.lower():
+            # Quiet skip when a catch-up is already in flight.
+            pass
+        else:
+            _show_toast("EOD catch-up", message)
 
     def _apply(self, status: SessionStatus, *, toast_on_expire: bool) -> None:
         prev_valid = self._status.valid
@@ -91,9 +103,20 @@ class TrayApp:
             self._toasted_expired = True
         if status.valid:
             self._toasted_expired = False
+        if (not prev_valid) and status.valid:
+            self._spawn_catchup(reason="login")
 
     def _on_login(self, icon=None, item=None) -> None:
         _spawn_login()
+
+    def _on_catchup(self, icon=None, item=None) -> None:
+        if not check_session().valid:
+            _show_toast(
+                "EOD catch-up",
+                "No valid Kite token. Use Login first, then Catch up EOD.",
+            )
+            return
+        self._spawn_catchup(reason="menu")
 
     def _on_refresh(self, icon=None, item=None) -> None:
         self._apply(check_session(), toast_on_expire=False)
@@ -114,6 +137,9 @@ class TrayApp:
                 "No valid session. Use tray Login or: uv run kitetools login",
             )
             self._toasted_expired = True
+        # Late-login / restart: token already valid → check missed EOD windows.
+        if self._status.valid:
+            self._spawn_catchup(reason="startup")
         thread = threading.Thread(target=self._poll_loop, name="sessiontray-poll", daemon=True)
         thread.start()
         self._icon.run()
@@ -122,7 +148,11 @@ class TrayApp:
 def main(argv: list[str] | None = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
     if argv in (["-h"], ["--help"]):
-        print("usage: uv run sessiontray\nMinimal tray: green=valid Kite token, red=expired.")
+        print(
+            "usage: uv run sessiontray\n"
+            "Tray: green=valid Kite token, red=expired. "
+            "On login / startup, may spawn ohlcv eod --catch-up for missed markets."
+        )
         return
 
     if not lock_mod.try_acquire():

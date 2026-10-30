@@ -152,7 +152,9 @@ Morning login stays manual (`uv run kitetools login`). After that:
 uv run sessiontray
 ```
 
-Tray menu: **Login** (new console with `kitetools login`), **Refresh**, **Quit**. Toast fires when the token flips to expired. Single-instance lock under `data/sessiontray.lock`.
+Tray menu: **Login** (new console with `kitetools login`), **Catch up EOD**, **Refresh**, **Quit**. Toast fires when the token flips to expired. Single-instance lock under `data/sessiontray.lock`.
+
+On **login** (red→green) and on **tray startup** when the token is already valid, the tray spawns `uv run ohlcv eod --catch-up` in the background. That runs only markets whose `download_ready` time has already passed and that lack a success marker under `data/ohlcv/_eod/{market}-{yyyymmdd}.done` (so a late login after 16:10 still picks up NFO). Catch-up logs: `data/ohlcv/_eod/catchup-*.log`.
 
 2. **EOD download tasks** — machine clock should be **IST**. Register once:
 
@@ -167,9 +169,9 @@ powershell -ExecutionPolicy Bypass -File scripts\register-scheduled-tasks.ps1
 | `OhlcvEodCds` | Mon–Fri 17:30 | `ohlcv eod --markets cds --no-wait` |
 | `OhlcvEodMcx` | Daily 00:05 | `ohlcv eod --markets mcx --no-wait` (trade_date = yesterday before 06:00) |
 
-Logs: `data/ohlcv/_eod/`. Remove tasks: `scripts\unregister-scheduled-tasks.ps1`.
+Logs / done markers: `data/ohlcv/_eod/`. Remove tasks: `scripts\unregister-scheduled-tasks.ps1`.
 
-Manual long wait (optional): `uv run ohlcv eod` from ~07:00 sleeps until each market is ready.
+Manual: `uv run ohlcv eod --catch-up` (missed markets only), or `uv run ohlcv eod` from ~07:00 (sleeps until each market is ready).
 
 Read helpers (notebooks / scripts):
 

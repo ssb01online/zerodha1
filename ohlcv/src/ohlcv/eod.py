@@ -7,9 +7,11 @@ network download for that market.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as dt_time
+from pathlib import Path
 from typing import Callable, Sequence
 
 import duckdb
@@ -25,7 +27,7 @@ from . import universe
 from .catalog import ContractRow
 from .client import KiteClient, RetryExhausted, SessionExpired
 from .markets import MARKETS, MarketProfile, get_market
-from .paths import paths_for, ymd
+from .paths import EOD_DIR, ensure_dir, paths_for, ymd
 from .universe import Series
 
 DEFAULT_READY_BUFFER = timedelta(minutes=30)
@@ -33,6 +35,11 @@ DEFAULT_MARKET_ORDER: tuple[str, ...] = ("nfo", "cds", "mcx")
 # Align with kitetools.auth.TOKEN_RESET — before 06:00 IST, trade_date is yesterday.
 _TRADE_DATE_CUTOFF = dt_time(6, 0)
 HEARTBEAT_S = 300.0
+CATCHUP_LOCK_PATH = EOD_DIR / "catchup.lock"
+
+
+class CatchupInProgress(Exception):
+    """Another ``ohlcv eod --catch-up`` process holds the catch-up lock."""
 
 
 @dataclass(frozen=True)
@@ -84,6 +91,109 @@ def download_ready(
         profile = get_market(profile)
     end = datetime.combine(trade_date, profile.session_end, tzinfo=auth.IST)
     return end + buffer
+
+
+def done_marker_path(market_id: str, trade_date: date, *, eod_dir: Path | None = None) -> Path:
+    """Success marker: ``data/ohlcv/_eod/{market}-{yyyymmdd}.done``."""
+    root = eod_dir if eod_dir is not None else EOD_DIR
+    return root / f"{market_id.lower()}-{ymd(trade_date)}.done"
+
+
+def is_eod_done(
+    market_id: str,
+    trade_date: date,
+    *,
+    eod_dir: Path | None = None,
+) -> bool:
+    return done_marker_path(market_id, trade_date, eod_dir=eod_dir).is_file()
+
+
+def mark_eod_done(
+    market_id: str,
+    trade_date: date,
+    *,
+    eod_dir: Path | None = None,
+    now: datetime | None = None,
+) -> Path:
+    """Write success marker after a completed per-market EOD run."""
+    path = done_marker_path(market_id, trade_date, eod_dir=eod_dir)
+    ensure_dir(path.parent)
+    stamp = _aware_ist(now).strftime("%Y-%m-%d %H:%M:%S %Z")
+    path.write_text(f"done {stamp}\n", encoding="utf-8")
+    return path
+
+
+def missed_markets(
+    *,
+    now: datetime | None = None,
+    trade_date: date | None = None,
+    markets: Sequence[str] | None = None,
+    buffer: timedelta = DEFAULT_READY_BUFFER,
+    eod_dir: Path | None = None,
+) -> list[str]:
+    """Markets past ``download_ready`` that lack a success ``.done`` marker."""
+    now = _aware_ist(now)
+    trade_date = trade_date if trade_date is not None else resolve_trade_date(now)
+    market_ids = list(markets) if markets is not None else list(DEFAULT_MARKET_ORDER)
+    out: list[str] = []
+    for mid in market_ids:
+        ready = download_ready(trade_date, mid, buffer=buffer)
+        if now >= ready and not is_eod_done(mid, trade_date, eod_dir=eod_dir):
+            out.append(mid)
+    return out
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def catchup_lock_held(*, lock_path: Path | None = None) -> bool:
+    """True if another live process owns the catch-up PID lock."""
+    path = lock_path if lock_path is not None else CATCHUP_LOCK_PATH
+    if not path.exists():
+        return False
+    try:
+        old = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    if old == os.getpid():
+        return False
+    return _pid_alive(old)
+
+
+def try_acquire_catchup_lock(*, lock_path: Path | None = None) -> bool:
+    """Return True if this process owns the catch-up lock."""
+    path = lock_path if lock_path is not None else CATCHUP_LOCK_PATH
+    ensure_dir(path.parent)
+    if catchup_lock_held(lock_path=path):
+        return False
+    path.write_text(str(os.getpid()), encoding="utf-8")
+    return True
+
+
+def release_catchup_lock(*, lock_path: Path | None = None) -> None:
+    path = lock_path if lock_path is not None else CATCHUP_LOCK_PATH
+    try:
+        if path.exists():
+            text = path.read_text(encoding="utf-8").strip()
+            if text == str(os.getpid()):
+                path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def parse_markets_arg(text: str | Sequence[str] | None) -> list[str]:
@@ -603,6 +713,9 @@ def _run_market_eod_body(
                 f"{totals.pending_requests} pending"
             )
 
+        marker = mark_eod_done(market_id, trade_date)
+        print(f"  done marker: {marker}")
+
         return {
             "market": market_id,
             "trade_date": trade_date,
@@ -612,9 +725,90 @@ def _run_market_eod_body(
             "minute_fetched": minute_results.contracts_fetched,
             "minute_errors": minute_results.errors,
             "series": len(queue_series),
+            "done_marker": str(marker),
         }
     finally:
         con.close()
+
+
+def run_catchup(
+    *,
+    markets: Sequence[str] | None = None,
+    trade_date: date | None = None,
+    buffer: timedelta = DEFAULT_READY_BUFFER,
+    now: datetime | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+    max_series: int | None = None,
+    backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
+    types: str = "all",
+    sleep: Callable[[float], None] = time.sleep,
+    should_stop: Callable[[], str | None] | None = None,
+    interrupt: object | None = None,
+    eod_dir: Path | None = None,
+    lock_path: Path | None = None,
+) -> list[dict]:
+    """Run EOD only for markets already past ready that lack a ``.done`` marker.
+
+    Acquires ``catchup.lock`` (unless ``dry_run``) so tray/manual catch-ups
+    do not overlap. Does not sleep for readiness.
+    """
+    now = _aware_ist(now)
+    trade_date = trade_date if trade_date is not None else resolve_trade_date(now)
+    candidate = list(markets) if markets is not None else list(DEFAULT_MARKET_ORDER)
+    missed = missed_markets(
+        now=now,
+        trade_date=trade_date,
+        markets=candidate,
+        buffer=buffer,
+        eod_dir=eod_dir,
+    )
+    print(
+        f"catch-up trade_date={ymd(trade_date)} "
+        f"missed={','.join(missed) if missed else '(none)'}"
+    )
+    if not missed:
+        return []
+
+    if dry_run:
+        return run_eod(
+            markets=missed,
+            trade_date=trade_date,
+            buffer=buffer,
+            now=now,
+            no_wait=True,
+            force=force,
+            dry_run=True,
+            max_series=max_series,
+            backfill_days=backfill_days,
+            types=types,
+            sleep=sleep,
+            should_stop=should_stop,
+            interrupt=interrupt,
+        )
+
+    if not try_acquire_catchup_lock(lock_path=lock_path):
+        raise CatchupInProgress(
+            f"catch-up already running (lock {lock_path or CATCHUP_LOCK_PATH})"
+        )
+    try:
+        return run_eod(
+            markets=missed,
+            trade_date=trade_date,
+            buffer=buffer,
+            now=datetime.now(auth.IST),
+            no_wait=True,
+            force=force,
+            dry_run=False,
+            max_series=max_series,
+            backfill_days=backfill_days,
+            types=types,
+            sleep=sleep,
+            should_stop=should_stop,
+            interrupt=interrupt,
+        )
+    finally:
+        release_catchup_lock(lock_path=lock_path)
 
 
 def run_eod(

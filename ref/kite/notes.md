@@ -143,7 +143,9 @@ CLI: `uv run ohlcv daily|rank|continuous --market nfo|mcx|cds` (default `nfo`).
 Project decision (not a Kite API fact):
 
 - `download_ready = session_end + 30m` → NFO **16:10**, CDS **17:30**, MCX **00:00** next calendar day. `session_end` itself stays the watermark / `final` snapshot gate.
-- `uv run ohlcv eod [--markets nfo,cds,mcx] [--buffer 30m] [--no-wait|--force|--dry-run] [--trade-date]`: plan table, optional wait, then per market `sync` → `daily` → fetch (expiry-on-trade_date ∪ unfinished). Before **06:00 IST**, default `trade_date` is yesterday (MCX 00:05 task).
+- `uv run ohlcv eod [--markets nfo,cds,mcx] [--buffer 30m] [--no-wait|--force|--dry-run|--catch-up] [--trade-date]`: plan table, optional wait, then per market `sync` → `daily` → fetch (expiry-on-trade_date ∪ unfinished). Before **06:00 IST**, default `trade_date` is yesterday (MCX 00:05 task).
+- Success marker after each completed market: `data/ohlcv/_eod/{market}-{yyyymmdd}.done`. `--catch-up` runs only markets already past `download_ready` that lack a marker (implies `--no-wait`); uses `catchup.lock` for single-flight.
+- Late login: Task Scheduler still fires at ready time (fails if no token). Tray on invalid→valid or startup-if-valid spawns `ohlcv eod --catch-up` (menu **Catch up EOD** too). Logs: `catchup-*.log` under `_eod/`.
 - `snapshot_status(..., trade_date=)` so post-midnight MCX snapshots still count as `final` for the prior session.
 - Task Scheduler: `scripts/register-scheduled-tasks.ps1` (times assume OS clock = IST; tasks run when user is logged on). Logs under `data/ohlcv/_eod/`.
 - Tray: workspace package `sessiontray` — local token file check only (green/red); toast on expire; menu Login spawns `uv run kitetools login`. No password/TOTP automation.
@@ -162,10 +164,10 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 | `uv run ohlcv daily [--market] [--dry-run\|--show [yyyymmdd]]` | yes (except `--dry-run` / `--show`) | End-of-session quote snapshot (after market `session_end`) |
 | `uv run ohlcv continuous UNDERLYING [--market] [--from] [--to] [--dry-run]` | yes (except `--dry-run`) | Continuous day candles for nearest live FUT → `continuous/<UNDERLYING>.parquet` |
 | `uv run ohlcv fetch [--market] [--types] […] [-d N\|all]` | yes (except `--dry-run`) | Day (~2000d) then minute candles; `-d` controls minute window only (default 60) |
-| `uv run ohlcv eod [--markets] [--buffer] [--no-wait\|--force\|--dry-run] […]` | yes (except `--dry-run`) | Wait until ready, then daily+fetch (expiry-today ∪ unfinished) per market |
+| `uv run ohlcv eod [--markets] [--buffer] [--no-wait\|--force\|--dry-run\|--catch-up] […]` | yes (except `--dry-run`) | Wait until ready, then daily+fetch (expiry-today ∪ unfinished) per market; `--catch-up` = missed ready markets only |
 | `uv run ohlcv status [--market] [--types] [--all] [--expiry] [--underlying] [--interval] [--limit] [--runs]` | no | Offline progress report |
 | `uv run ohlcv show [--market] UNDERLYING EXPIRY [--interval] [--symbol\|--token] [--tail]` | no | Inspect one minute or day series file |
-| `uv run sessiontray` | no (reads token file only) | Tray icon for token validity; Login menu for interactive login |
+| `uv run sessiontray` | no (reads token file only) | Tray icon; Login; Catch up EOD / auto catch-up on login |
 
 ### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=2)
 Tables: `meta`, `contracts`, `fetch_state` (watermarks; Phase 3 writes), `underlying_rank`, `runs`, `daily_snapshots`.

@@ -1080,6 +1080,59 @@ def test_eod_timing_and_plan() -> None:
     _assert("series" in summary, "dry_run series key")
 
 
+def test_eod_done_markers_and_missed_markets() -> None:
+    day = date(2026, 10, 27)
+    buf = timedelta(minutes=30)
+    morning = datetime(2026, 10, 27, 7, 0, tzinfo=auth.IST)
+    after_nfo = datetime(2026, 10, 27, 16, 15, tzinfo=auth.IST)
+    after_cds = datetime(2026, 10, 27, 17, 45, tzinfo=auth.IST)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        eod_dir = Path(tmp) / "_eod"
+        missed = eod_mod.missed_markets(
+            now=morning, trade_date=day, buffer=buf, eod_dir=eod_dir
+        )
+        _assert(missed == [], f"before ready missed={missed}")
+
+        missed = eod_mod.missed_markets(
+            now=after_nfo, trade_date=day, buffer=buf, eod_dir=eod_dir
+        )
+        _assert(missed == ["nfo"], f"after nfo ready missed={missed}")
+
+        path = eod_mod.mark_eod_done("nfo", day, eod_dir=eod_dir, now=after_nfo)
+        _assert(path.is_file(), "done marker written")
+        _assert(eod_mod.is_eod_done("nfo", day, eod_dir=eod_dir), "is_eod_done")
+
+        missed = eod_mod.missed_markets(
+            now=after_nfo, trade_date=day, buffer=buf, eod_dir=eod_dir
+        )
+        _assert(missed == [], f"after marker missed={missed}")
+
+        missed = eod_mod.missed_markets(
+            now=after_cds, trade_date=day, buffer=buf, eod_dir=eod_dir
+        )
+        _assert(missed == ["cds"], f"cds still missed={missed}")
+
+        lock = eod_dir / "catchup.lock"
+        _assert(eod_mod.try_acquire_catchup_lock(lock_path=lock), "acquire catchup lock")
+        _assert(not eod_mod.catchup_lock_held(lock_path=lock), "own lock not held-by-other")
+        eod_mod.release_catchup_lock(lock_path=lock)
+        _assert(eod_mod.try_acquire_catchup_lock(lock_path=lock), "re-acquire")
+        eod_mod.release_catchup_lock(lock_path=lock)
+
+        # dry-run catch-up lists missed without needing a token.
+        summaries = eod_mod.run_catchup(
+            markets=["nfo", "cds", "mcx"],
+            trade_date=day,
+            buffer=buf,
+            now=after_cds,
+            dry_run=True,
+            eod_dir=eod_dir,
+        )
+        _assert(any(s.get("market") == "cds" for s in summaries), "catch-up dry cds")
+        _assert(not any(s.get("market") == "nfo" for s in summaries), "nfo already done")
+
+
 def test_eod_select_series_expiry_and_unfinished() -> None:
     trade = date(2026, 10, 27)
     with tempfile.TemporaryDirectory() as tmp:
@@ -3030,6 +3083,7 @@ def main() -> None:
         test_catalog_v1_to_v2_migration,
         test_snapshot_status_boundary,
         test_eod_timing_and_plan,
+        test_eod_done_markers_and_missed_markets,
         test_eod_select_series_expiry_and_unfinished,
         test_snapshot_mcx_quote_prefix_and_rank,
         test_continuous_nearest_fut_and_write,

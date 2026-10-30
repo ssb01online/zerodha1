@@ -56,6 +56,8 @@ STAGING_DIR = _NFO.staging_dir
 LOGS_DIR = _NFO.logs_dir
 CATALOG_PATH = _NFO.catalog_path
 ARCHIVE_DIR = DATA_DIR / "instruments" / "archive"
+# Cross-market EOD logs + done markers (scheduler + late-login catch-up).
+EOD_DIR = DATA_DIR / "ohlcv" / "_eod"
 
 
 def ymd(value: date | datetime) -> str:

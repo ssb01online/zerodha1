@@ -1513,22 +1513,39 @@ def cmd_eod(args: argparse.Namespace) -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    catch_up = bool(getattr(args, "catch_up", False))
     interrupt = InterruptController()
     interrupt.install()
     try:
-        eod_mod.run_eod(
-            markets=markets,
-            trade_date=trade_date,
-            buffer=buffer,
-            no_wait=bool(args.no_wait),
-            force=bool(args.force),
-            dry_run=bool(args.dry_run),
-            max_series=args.max_series,
-            backfill_days=backfill_days,
-            types=_types_arg(args),
-            interrupt=interrupt,
-            should_stop=interrupt.should_stop,
-        )
+        if catch_up:
+            eod_mod.run_catchup(
+                markets=markets,
+                trade_date=trade_date,
+                buffer=buffer,
+                force=bool(args.force),
+                dry_run=bool(args.dry_run),
+                max_series=args.max_series,
+                backfill_days=backfill_days,
+                types=_types_arg(args),
+                interrupt=interrupt,
+                should_stop=interrupt.should_stop,
+            )
+        else:
+            eod_mod.run_eod(
+                markets=markets,
+                trade_date=trade_date,
+                buffer=buffer,
+                no_wait=bool(args.no_wait),
+                force=bool(args.force),
+                dry_run=bool(args.dry_run),
+                max_series=args.max_series,
+                backfill_days=backfill_days,
+                types=_types_arg(args),
+                interrupt=interrupt,
+                should_stop=interrupt.should_stop,
+            )
+    except eod_mod.CatchupInProgress as exc:
+        raise SystemExit(str(exc)) from exc
     except (auth.NotLoggedIn, TokenException, SessionExpired) as exc:
         _login_exit(exc)
     except KeyboardInterrupt as exc:
@@ -1853,6 +1870,14 @@ def main() -> None:
         "--no-wait",
         action="store_true",
         help="Do not sleep; skip markets that are not past download_ready yet.",
+    )
+    p_eod.add_argument(
+        "--catch-up",
+        action="store_true",
+        help=(
+            "Late-login / missed-window mode: run only markets already past "
+            "download_ready that lack a _eod/*.done marker (implies --no-wait)."
+        ),
     )
     p_eod.add_argument(
         "--force",
