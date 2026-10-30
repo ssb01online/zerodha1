@@ -433,6 +433,8 @@ def run_market_eod(
     should_stop: Callable[[], str | None] | None = None,
     interrupt: object | None = None,
     client: KiteClient | None = None,
+    fetch_cmd: str = "ohlcv eod",
+    fetch_lock_path: Path | None = None,
 ) -> dict:
     """Run sync → daily → fetch for one market. Returns a summary dict."""
     from .progress import InterruptController
@@ -475,6 +477,8 @@ def run_market_eod(
             client=client,
             ctrl=ctrl,
             stop=_stop,
+            fetch_cmd=fetch_cmd,
+            fetch_lock_path=fetch_lock_path,
         )
     finally:
         if own_ctrl:
@@ -501,6 +505,8 @@ def _run_market_eod_body(
     client: KiteClient | None,
     ctrl,
     stop: Callable[[], str | None],
+    fetch_cmd: str = "ohlcv eod",
+    fetch_lock_path: Path | None = None,
 ) -> dict:
     # --no-wait skips not-yet-ready markets (including dry-run). dry-run never sleeps.
     # --force proceeds early (may be intraday).
@@ -560,175 +566,185 @@ def _run_market_eod_body(
         finally:
             con.close()
 
-    ensure_token()
-    con = catalog.connect(mpaths.catalog_path)
+    from . import fetch_lock
+
+    fetch_lock.try_acquire(
+        market_id,
+        cmd=f"{fetch_cmd} --markets {market_id}",
+        lock_path=fetch_lock_path,
+    )
     try:
-        catalog.ensure_schema(con)
-        from . import archive as archive_mod
-        from instruments import ensure_cache
-
-        ensure_cache()
-        archive_mod.ensure_archive()
-        allowed = universe.resolve_types_filter(types)
-        count = universe.sync_contracts(con, market=market_id, allowed_types=allowed)
-        print(f"  synced {count} {profile.exchange} contracts")
-
-        if client is None:
-            client = KiteClient(auth.get_kite())
-
-        calendar_today = datetime.now(auth.IST).date()
-        contracts = snapshot_contracts_for_trade_date(
-            con, trade_date, calendar_today=calendar_today
-        )
+        ensure_token()
+        con = catalog.connect(mpaths.catalog_path)
         try:
-            result = snapshot.take_snapshot(
-                client,
-                contracts,
+            catalog.ensure_schema(con)
+            from . import archive as archive_mod
+            from instruments import ensure_cache
+
+            ensure_cache()
+            archive_mod.ensure_archive()
+            allowed = universe.resolve_types_filter(types)
+            count = universe.sync_contracts(con, market=market_id, allowed_types=allowed)
+            print(f"  synced {count} {profile.exchange} contracts")
+
+            if client is None:
+                client = KiteClient(auth.get_kite())
+
+            calendar_today = datetime.now(auth.IST).date()
+            contracts = snapshot_contracts_for_trade_date(
+                con, trade_date, calendar_today=calendar_today
+            )
+            try:
+                result = snapshot.take_snapshot(
+                    client,
+                    contracts,
+                    market=market_id,
+                    now=datetime.now(auth.IST),
+                    run_date=trade_date,
+                    dest_dir=mpaths.daily_dir,
+                    staging_dir=mpaths.staging_dir,
+                    should_stop=stop,
+                )
+            except snapshot.SnapshotRejected as exc:
+                raise EodNonSession(str(exc)) from exc
+
+            catalog.record_snapshot(
+                con,
+                catalog.DailySnapshotMeta(
+                    trade_date=result.trade_date,
+                    status=result.status,
+                    taken_at=result.taken_at,
+                    contracts=result.contracts,
+                    traded_contracts=result.traded_contracts,
+                    missing=result.missing,
+                    total_volume=result.total_volume,
+                    path=str(result.path),
+                ),
+            )
+            rank_mod.rank_from_snapshot(
+                con,
+                result.trade_date,
                 market=market_id,
-                now=datetime.now(auth.IST),
-                run_date=trade_date,
                 dest_dir=mpaths.daily_dir,
-                staging_dir=mpaths.staging_dir,
-                should_stop=stop,
             )
-        except snapshot.SnapshotRejected as exc:
-            raise EodNonSession(str(exc)) from exc
-
-        catalog.record_snapshot(
-            con,
-            catalog.DailySnapshotMeta(
-                trade_date=result.trade_date,
-                status=result.status,
-                taken_at=result.taken_at,
-                contracts=result.contracts,
-                traded_contracts=result.traded_contracts,
-                missing=result.missing,
-                total_volume=result.total_volume,
-                path=str(result.path),
-            ),
-        )
-        rank_mod.rank_from_snapshot(
-            con,
-            result.trade_date,
-            market=market_id,
-            dest_dir=mpaths.daily_dir,
-        )
-        print(
-            f"  daily {ymd(result.trade_date)} status={result.status} "
-            f"traded={result.traded_contracts}/{result.contracts}"
-        )
-
-        series_day = select_eod_series(
-            con, trade_date, interval="day", market=market_id, types=types
-        )
-        series_min = select_eod_series(
-            con, trade_date, interval="minute", market=market_id, types=types
-        )
-        by_key: dict[tuple[str, date], Series] = {}
-        for s in series_day + series_min:
-            prev = by_key.get(s.key)
-            if prev is None or len(s.contracts) > len(prev.contracts):
-                by_key[s.key] = s
-        series_list = list(by_key.values())
-        ranks = rank_mod.load_ranks(con)
-        tokens = [c.token for s in series_list for c in s.contracts]
-        day_states = catalog.list_fetch_states(con, interval="day", tokens=tokens)
-        minute_states = catalog.list_fetch_states(con, interval="minute", tokens=tokens)
-        fetch_now = datetime.now(auth.IST)
-
-        day_items = planner.build_queue(
-            series_list,
-            ranks,
-            day_states,
-            fetch_now,
-            limit=max_series,
-            interval="day",
-            market=market_id,
-            types=types,
-        )
-        series_by_key = {(s.underlying, s.expiry): s for s in series_list}
-        queue_series = [
-            series_by_key[(item.underlying, item.expiry)]
-            for item in day_items
-            if (item.underlying, item.expiry) in series_by_key
-        ]
-
-        day_results = fetch_mod.run_fetch(
-            client,
-            con,
-            queue_series,
-            day_states,
-            now=fetch_now,
-            max_series=max_series,
-            interval="day",
-            series_root=mpaths.day_dir,
-            day_dir=mpaths.day_dir,
-            staging_dir=mpaths.staging_dir,
-            market=market_id,
-            interrupt=ctrl,
-        )
-        print(
-            f"  day fetch: series={day_results.series_done} "
-            f"fetched={day_results.contracts_fetched} err={day_results.errors}"
-        )
-
-        minute_results = fetch_mod.run_fetch(
-            client,
-            con,
-            queue_series,
-            minute_states,
-            now=datetime.now(auth.IST),
-            max_series=max_series,
-            interval="minute",
-            series_root=mpaths.minute_dir,
-            minute_dir=mpaths.minute_dir,
-            day_dir=mpaths.day_dir,
-            staging_dir=mpaths.staging_dir,
-            backfill_days=backfill_days,
-            market=market_id,
-            interrupt=ctrl,
-        )
-        print(
-            f"  minute fetch: series={minute_results.series_done} "
-            f"fetched={minute_results.contracts_fetched} err={minute_results.errors}"
-        )
-
-        from . import status as status_mod
-
-        rows = status_mod.series_status(
-            con,
-            include_all=False,
-            interval="minute",
-            day_dir=mpaths.day_dir,
-            minute_dir=mpaths.minute_dir,
-            market=market_id,
-            types=types,
-        )
-        eod_keys = {(s.underlying, s.expiry) for s in queue_series}
-        rows = [r for r in rows if (r.underlying, r.expiry) in eod_keys]
-        totals = status_mod.totals(rows) if rows else None
-        if totals is not None:
             print(
-                f"  status: {totals.series} series, {totals.complete_pct:.0f}% complete, "
-                f"{totals.pending_requests} pending"
+                f"  daily {ymd(result.trade_date)} status={result.status} "
+                f"traded={result.traded_contracts}/{result.contracts}"
             )
 
-        marker = mark_eod_done(market_id, trade_date)
-        print(f"  done marker: {marker}")
+            series_day = select_eod_series(
+                con, trade_date, interval="day", market=market_id, types=types
+            )
+            series_min = select_eod_series(
+                con, trade_date, interval="minute", market=market_id, types=types
+            )
+            by_key: dict[tuple[str, date], Series] = {}
+            for s in series_day + series_min:
+                prev = by_key.get(s.key)
+                if prev is None or len(s.contracts) > len(prev.contracts):
+                    by_key[s.key] = s
+            series_list = list(by_key.values())
+            ranks = rank_mod.load_ranks(con)
+            tokens = [c.token for s in series_list for c in s.contracts]
+            day_states = catalog.list_fetch_states(con, interval="day", tokens=tokens)
+            minute_states = catalog.list_fetch_states(con, interval="minute", tokens=tokens)
+            fetch_now = datetime.now(auth.IST)
 
-        return {
-            "market": market_id,
-            "trade_date": trade_date,
-            "daily_status": result.status,
-            "day_fetched": day_results.contracts_fetched,
-            "day_errors": day_results.errors,
-            "minute_fetched": minute_results.contracts_fetched,
-            "minute_errors": minute_results.errors,
-            "series": len(queue_series),
-            "done_marker": str(marker),
-        }
+            day_items = planner.build_queue(
+                series_list,
+                ranks,
+                day_states,
+                fetch_now,
+                limit=max_series,
+                interval="day",
+                market=market_id,
+                types=types,
+            )
+            series_by_key = {(s.underlying, s.expiry): s for s in series_list}
+            queue_series = [
+                series_by_key[(item.underlying, item.expiry)]
+                for item in day_items
+                if (item.underlying, item.expiry) in series_by_key
+            ]
+
+            day_results = fetch_mod.run_fetch(
+                client,
+                con,
+                queue_series,
+                day_states,
+                now=fetch_now,
+                max_series=max_series,
+                interval="day",
+                series_root=mpaths.day_dir,
+                day_dir=mpaths.day_dir,
+                staging_dir=mpaths.staging_dir,
+                market=market_id,
+                interrupt=ctrl,
+            )
+            print(
+                f"  day fetch: series={day_results.series_done} "
+                f"fetched={day_results.contracts_fetched} err={day_results.errors}"
+            )
+
+            minute_results = fetch_mod.run_fetch(
+                client,
+                con,
+                queue_series,
+                minute_states,
+                now=datetime.now(auth.IST),
+                max_series=max_series,
+                interval="minute",
+                series_root=mpaths.minute_dir,
+                minute_dir=mpaths.minute_dir,
+                day_dir=mpaths.day_dir,
+                staging_dir=mpaths.staging_dir,
+                backfill_days=backfill_days,
+                market=market_id,
+                interrupt=ctrl,
+            )
+            print(
+                f"  minute fetch: series={minute_results.series_done} "
+                f"fetched={minute_results.contracts_fetched} err={minute_results.errors}"
+            )
+
+            from . import status as status_mod
+
+            rows = status_mod.series_status(
+                con,
+                include_all=False,
+                interval="minute",
+                day_dir=mpaths.day_dir,
+                minute_dir=mpaths.minute_dir,
+                market=market_id,
+                types=types,
+            )
+            eod_keys = {(s.underlying, s.expiry) for s in queue_series}
+            rows = [r for r in rows if (r.underlying, r.expiry) in eod_keys]
+            totals = status_mod.totals(rows) if rows else None
+            if totals is not None:
+                print(
+                    f"  status: {totals.series} series, {totals.complete_pct:.0f}% complete, "
+                    f"{totals.pending_requests} pending"
+                )
+
+            marker = mark_eod_done(market_id, trade_date)
+            print(f"  done marker: {marker}")
+
+            return {
+                "market": market_id,
+                "trade_date": trade_date,
+                "daily_status": result.status,
+                "day_fetched": day_results.contracts_fetched,
+                "day_errors": day_results.errors,
+                "minute_fetched": minute_results.contracts_fetched,
+                "minute_errors": minute_results.errors,
+                "series": len(queue_series),
+                "done_marker": str(marker),
+            }
+        finally:
+            con.close()
     finally:
-        con.close()
+        fetch_lock.release(market_id, lock_path=fetch_lock_path)
 
 
 def run_catchup(
@@ -785,6 +801,7 @@ def run_catchup(
             sleep=sleep,
             should_stop=should_stop,
             interrupt=interrupt,
+            fetch_cmd="ohlcv eod --catch-up",
         )
 
     if not try_acquire_catchup_lock(lock_path=lock_path):
@@ -806,6 +823,7 @@ def run_catchup(
             sleep=sleep,
             should_stop=should_stop,
             interrupt=interrupt,
+            fetch_cmd="ohlcv eod --catch-up",
         )
     finally:
         release_catchup_lock(lock_path=lock_path)
@@ -826,6 +844,7 @@ def run_eod(
     sleep: Callable[[float], None] = time.sleep,
     should_stop: Callable[[], str | None] | None = None,
     interrupt: object | None = None,
+    fetch_cmd: str = "ohlcv eod",
 ) -> list[dict]:
     """Orchestrate EOD across markets in DEFAULT_MARKET_ORDER (filtered)."""
     now = _aware_ist(now)
@@ -880,6 +899,7 @@ def run_eod(
                 sleep=sleep,
                 should_stop=should_stop,
                 interrupt=interrupt,
+                fetch_cmd=fetch_cmd,
             )
             summaries.append(summary)
             if dry_run:

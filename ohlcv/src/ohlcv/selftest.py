@@ -27,6 +27,7 @@ from . import catalog
 from . import continuous as continuous_mod
 from . import eod as eod_mod
 from . import fetch as fetch_mod
+from . import fetch_lock as fetch_lock_mod
 from . import planner
 from . import rank as rank_mod
 from . import read as read_mod
@@ -1131,6 +1132,90 @@ def test_eod_done_markers_and_missed_markets() -> None:
         )
         _assert(any(s.get("market") == "cds" for s in summaries), "catch-up dry cds")
         _assert(not any(s.get("market") == "nfo" for s in summaries), "nfo already done")
+
+
+def test_fetch_lock_market_single_flight() -> None:
+    started = datetime(2026, 10, 30, 16, 10, 2, tzinfo=auth.IST)
+    with tempfile.TemporaryDirectory() as tmp:
+        lock = Path(tmp) / "nfo" / "fetch.lock"
+
+        path = fetch_lock_mod.try_acquire(
+            "nfo",
+            cmd="ohlcv fetch --market nfo",
+            lock_path=lock,
+            now=started,
+        )
+        _assert(path == lock, "acquire returns lock path")
+        _assert(lock.is_file(), "lock file written")
+        text = lock.read_text(encoding="utf-8")
+        _assert(f"pid={os.getpid()}" in text, "pid in lock")
+        _assert("ohlcv fetch --market nfo" in text, "cmd in lock")
+
+        # Same process re-acquire refreshes.
+        fetch_lock_mod.try_acquire(
+            "nfo",
+            cmd="ohlcv fetch --market nfo",
+            lock_path=lock,
+            now=started + timedelta(minutes=1),
+        )
+
+        # Other live PID → FetchInProgress with clear message.
+        lock.write_text(
+            "pid=424242\n"
+            f"started={started.isoformat()}\n"
+            "cmd=ohlcv eod --markets nfo\n",
+            encoding="utf-8",
+        )
+        raised = False
+        try:
+            fetch_lock_mod.try_acquire(
+                "nfo",
+                cmd="ohlcv fetch --market nfo",
+                lock_path=lock,
+                now=started + timedelta(minutes=26),
+                alive_fn=lambda _pid: True,
+            )
+        except fetch_lock_mod.FetchInProgress as exc:
+            raised = True
+            msg = fetch_lock_mod.format_in_progress(
+                exc, now=started + timedelta(minutes=26)
+            )
+            _assert(exc.pid == 424242, f"pid={exc.pid}")
+            _assert(exc.alive, "marked alive")
+            _assert("nfo fetch already in progress" in msg, f"msg={msg}")
+            _assert("424242" in msg and "alive" in msg, f"pid line={msg}")
+            _assert("26m ago" in msg, f"age={msg}")
+            _assert("ohlcv eod --markets nfo" in msg, f"cmd={msg}")
+        _assert(raised, "expected FetchInProgress")
+
+        # Dead PID → stale reclaim.
+        lock.write_text(
+            "pid=424242\n"
+            f"started={started.isoformat()}\n"
+            "cmd=ohlcv eod --markets nfo\n",
+            encoding="utf-8",
+        )
+        fetch_lock_mod.try_acquire(
+            "nfo",
+            cmd="ohlcv fetch --market nfo",
+            lock_path=lock,
+            now=started + timedelta(hours=1),
+            alive_fn=lambda _pid: False,
+        )
+        text = lock.read_text(encoding="utf-8")
+        _assert(f"pid={os.getpid()}" in text, "reclaimed by us")
+
+        fetch_lock_mod.release("nfo", lock_path=lock)
+        _assert(not lock.exists(), "released")
+
+        fetch_lock_mod.try_acquire(
+            "nfo",
+            cmd="ohlcv fetch --market nfo",
+            lock_path=lock,
+            now=started,
+        )
+        fetch_lock_mod.release("nfo", lock_path=lock)
+        _assert(not lock.exists(), "re-acquire then release")
 
 
 def test_eod_select_series_expiry_and_unfinished() -> None:
@@ -3084,6 +3169,7 @@ def main() -> None:
         test_snapshot_status_boundary,
         test_eod_timing_and_plan,
         test_eod_done_markers_and_missed_markets,
+        test_fetch_lock_market_single_flight,
         test_eod_select_series_expiry_and_unfinished,
         test_snapshot_mcx_quote_prefix_and_rank,
         test_continuous_nearest_fut_and_write,

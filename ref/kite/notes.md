@@ -145,6 +145,7 @@ Project decision (not a Kite API fact):
 - `download_ready = session_end + 30m` → NFO **16:10**, CDS **17:30**, MCX **00:00** next calendar day. `session_end` itself stays the watermark / `final` snapshot gate.
 - `uv run ohlcv eod [--markets nfo,cds,mcx] [--buffer 30m] [--no-wait|--force|--dry-run|--catch-up] [--trade-date]`: plan table, optional wait, then per market `sync` → `daily` → fetch (expiry-on-trade_date ∪ unfinished). Before **06:00 IST**, default `trade_date` is yesterday (MCX 00:05 task).
 - Success marker after each completed market: `data/ohlcv/_eod/{market}-{yyyymmdd}.done`. `--catch-up` runs only markets already past `download_ready` that lack a marker (implies `--no-wait`); uses `catchup.lock` for single-flight.
+- Per-market fetch lock: `data/ohlcv/<market>/fetch.lock` (pid + IST started + cmd). Held by `ohlcv fetch` and each non-dry-run market pass in `ohlcv eod` / `--catch-up`. Second writer exits with pid / age / cmd; dead-PID locks are reclaimed. DuckDB catalog lock remains a second line of defense.
 - Late login: Task Scheduler still fires at ready time (fails if no token). Tray on invalid→valid or startup-if-valid spawns `ohlcv eod --catch-up` (menu **Catch up EOD** too). Logs: `catchup-*.log` under `_eod/`.
 - `snapshot_status(..., trade_date=)` so post-midnight MCX snapshots still count as `final` for the prior session.
 - Task Scheduler: `scripts/register-scheduled-tasks.ps1` (times assume OS clock = IST; tasks run when user is logged on). Logs under `data/ohlcv/_eod/`.
@@ -172,7 +173,7 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 ### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=2)
 Tables: `meta`, `contracts`, `fetch_state` (watermarks; Phase 3 writes), `underlying_rank`, `runs`, `daily_snapshots`.
 v1→v2 soft-migrates by creating `daily_snapshots`.
-Single-writer: only one process should open the catalog for writes; a lock error means close notebooks / other `ohlcv` runs.
+Single-writer: only one process should open the catalog for writes; a lock error means close notebooks / other `ohlcv` runs. `ohlcv fetch` / `eod` also take per-market `fetch.lock` before writing so parallel same-market runs fail fast.
 
 ### Universe
 - Live: dual nearest-**3** pools per underlying — nearest 3 **FUT** expiries ∪ nearest 3 **CE/PE** expiries with `expiry >= today` (Phase 4; NFO usually shares weekly dates so behaviour matches the old single pool).

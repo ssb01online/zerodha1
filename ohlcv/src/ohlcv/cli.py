@@ -683,7 +683,20 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     started = datetime.now(auth.IST)
     expiry_filter = _parse_ymd(args.expiry) if args.expiry else None
     con = None
+    lock_held = False
     try:
+        if not args.dry_run:
+            from . import fetch_lock
+
+            try:
+                fetch_lock.try_acquire(
+                    market_id,
+                    cmd=f"ohlcv fetch --market {market_id}",
+                )
+            except fetch_lock.FetchInProgress as exc:
+                raise SystemExit(fetch_lock.format_in_progress(exc)) from exc
+            lock_held = True
+
         try:
             con = catalog.connect(catalog_path)
         except catalog.CatalogLocked as exc:
@@ -1009,6 +1022,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         interrupt.restore()
         if con is not None:
             con.close()
+        if lock_held:
+            from . import fetch_lock
+
+            fetch_lock.release(market_id)
 
 
 def _catalog_ro(catalog_path=None):
@@ -1497,6 +1514,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
 def cmd_eod(args: argparse.Namespace) -> None:
     """Session-gated daily + fetch across markets (wait until ready, or --no-wait)."""
     from . import eod as eod_mod
+    from . import fetch_lock
     from . import planner
     from .client import SessionExpired
     from .progress import InterruptController
@@ -1546,6 +1564,8 @@ def cmd_eod(args: argparse.Namespace) -> None:
             )
     except eod_mod.CatchupInProgress as exc:
         raise SystemExit(str(exc)) from exc
+    except fetch_lock.FetchInProgress as exc:
+        raise SystemExit(fetch_lock.format_in_progress(exc)) from exc
     except (auth.NotLoggedIn, TokenException, SessionExpired) as exc:
         _login_exit(exc)
     except KeyboardInterrupt as exc:
