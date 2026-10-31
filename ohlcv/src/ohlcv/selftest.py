@@ -1218,8 +1218,10 @@ def test_fetch_lock_market_single_flight() -> None:
         _assert(not lock.exists(), "re-acquire then release")
 
 
-def test_eod_select_series_expiry_and_unfinished() -> None:
+def test_eod_select_series_near_term_horizon() -> None:
     trade = date(2026, 10, 27)
+    in_window = trade + timedelta(days=7)  # 2026-11-03
+    beyond = trade + timedelta(days=8)  # 2026-11-04
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "catalog.duckdb"
         con = catalog.connect(db)
@@ -1234,19 +1236,64 @@ def test_eod_select_series_expiry_and_unfinished() -> None:
                         3, "BANKNIFTY", date(2026, 10, 20), "BN20OCT", "FUT", 0.0, 15
                     ),
                     catalog.ContractRow(
-                        4, "NIFTY", date(2026, 11, 3), "NIFTY03NOV", "FUT", 0.0, 50
+                        4, "NIFTY", in_window, "NIFTY03NOV", "FUT", 0.0, 50
+                    ),
+                    catalog.ContractRow(
+                        5, "RELIANCE", beyond, "REL04NOV", "FUT", 0.0, 250
+                    ),
+                    catalog.ContractRow(
+                        6, "SENSEX", in_window, "SX03NOV", "FUT", 0.0, 10
+                    ),
+                    catalog.ContractRow(
+                        7, "BANKNIFTY", trade + timedelta(days=3), "BN30OCT", "FUT", 0.0, 15
                     ),
                 ],
                 seen_on=trade,
             )
-            # Token 3 unfinished (no fetch_state).
-            series = eod_mod.select_eod_series(con, trade, interval="minute", market="nfo")
+            series = eod_mod.select_eod_series(
+                con, trade, interval="minute", market="nfo", horizon_days=7
+            )
             keys = {(s.underlying, s.expiry) for s in series}
             _assert((("NIFTY", trade) in keys), "expiry today included")
-            _assert((("BANKNIFTY", date(2026, 10, 20)) in keys), "unfinished included")
-            _assert((("NIFTY", date(2026, 11, 3)) not in keys), "future expiry excluded")
-            exp_n, unf_n = eod_mod.count_eod_buckets(con, trade, market="nfo")
-            _assert(exp_n == 1 and unf_n == 1, f"buckets exp={exp_n} unf={unf_n}")
+            _assert((("NIFTY", in_window) in keys), "expiry +7 included")
+            _assert((("SENSEX", in_window) in keys), "same +7 other UL included")
+            _assert(
+                (("BANKNIFTY", trade + timedelta(days=3)) in keys),
+                "mid-horizon included",
+            )
+            _assert(
+                (("BANKNIFTY", date(2026, 10, 20)) not in keys),
+                "past unfinished excluded",
+            )
+            _assert((("RELIANCE", beyond) not in keys), "expiry +8 excluded")
+            exp_n, near_n = eod_mod.count_eod_buckets(
+                con, trade, market="nfo", horizon_days=7
+            )
+            _assert(exp_n == 1 and near_n == 3, f"buckets exp={exp_n} near={near_n}")
+
+            only_today = eod_mod.select_eod_series(
+                con, trade, market="nfo", horizon_days=0
+            )
+            _assert(len(only_today) == 1 and only_today[0].expiry == trade, "horizon 0")
+
+            ranks = {
+                "SENSEX": catalog.UnderlyingRank(
+                    trade, "SENSEX", 1, 100, 10.0, 5000.0, "quote"
+                ),
+                "NIFTY": catalog.UnderlyingRank(
+                    trade, "NIFTY", 2, 50, 10.0, 1000.0, "quote"
+                ),
+                "BANKNIFTY": catalog.UnderlyingRank(
+                    trade, "BANKNIFTY", 3, 40, 10.0, 200.0, "quote"
+                ),
+            }
+            ordered = eod_mod.order_eod_series(series, trade, ranks)
+            _assert(ordered[0].expiry == trade, "today bucket first")
+            near = [s for s in ordered if s.expiry > trade]
+            _assert(near[0].expiry == trade + timedelta(days=3), "earlier near expiry first")
+            same_day = [s for s in near if s.expiry == in_window]
+            _assert(same_day[0].underlying == "SENSEX", "higher traded_value first")
+            _assert(same_day[1].underlying == "NIFTY", "lower traded_value second")
         finally:
             con.close()
 
@@ -3170,7 +3217,7 @@ def main() -> None:
         test_eod_timing_and_plan,
         test_eod_done_markers_and_missed_markets,
         test_fetch_lock_market_single_flight,
-        test_eod_select_series_expiry_and_unfinished,
+        test_eod_select_series_near_term_horizon,
         test_snapshot_mcx_quote_prefix_and_rank,
         test_continuous_nearest_fut_and_write,
         test_can_skip_untraded_uses_market_daily_dir,

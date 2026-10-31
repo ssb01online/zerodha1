@@ -1532,6 +1532,9 @@ def cmd_eod(args: argparse.Namespace) -> None:
         raise SystemExit(str(exc)) from exc
 
     catch_up = bool(getattr(args, "catch_up", False))
+    horizon_days = int(getattr(args, "horizon_days", eod_mod.DEFAULT_HORIZON_DAYS))
+    if horizon_days < 0:
+        raise SystemExit(f"horizon-days must be >= 0, got {horizon_days}")
     interrupt = InterruptController()
     interrupt.install()
     try:
@@ -1545,6 +1548,7 @@ def cmd_eod(args: argparse.Namespace) -> None:
                 max_series=args.max_series,
                 backfill_days=backfill_days,
                 types=_types_arg(args),
+                horizon_days=horizon_days,
                 interrupt=interrupt,
                 should_stop=interrupt.should_stop,
             )
@@ -1559,6 +1563,7 @@ def cmd_eod(args: argparse.Namespace) -> None:
                 max_series=args.max_series,
                 backfill_days=backfill_days,
                 types=_types_arg(args),
+                horizon_days=horizon_days,
                 interrupt=interrupt,
                 should_stop=interrupt.should_stop,
             )
@@ -1867,7 +1872,7 @@ def main() -> None:
         "eod",
         help=(
             "End-of-day orchestrator: wait until each market's session_end+buffer, "
-            "then daily snapshot + fetch (expiry-today ∪ unfinished). "
+            "then daily snapshot + fetch (expiries in trade_date..trade_date+horizon). "
             "Default markets: nfo,cds,mcx."
         ),
     )
@@ -1880,6 +1885,16 @@ def main() -> None:
         "--buffer",
         default="30m",
         help="Ready buffer after session_end (default: 30m). Also accepts Nh / Ns / minutes.",
+    )
+    p_eod.add_argument(
+        "--horizon-days",
+        type=int,
+        default=7,
+        metavar="N",
+        help=(
+            "Include series with expiry in [trade_date, trade_date+N] calendar days "
+            "(default: 7). 0 = expiry-on-trade_date only. Past unfinished excluded."
+        ),
     )
     p_eod.add_argument(
         "--trade-date",

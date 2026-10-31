@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as dt_time
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 import duckdb
 
@@ -24,13 +24,14 @@ from . import planner
 from . import rank as rank_mod
 from . import snapshot
 from . import universe
-from .catalog import ContractRow
+from .catalog import ContractRow, UnderlyingRank
 from .client import KiteClient, RetryExhausted, SessionExpired
 from .markets import MARKETS, MarketProfile, get_market
 from .paths import EOD_DIR, ensure_dir, paths_for, ymd
 from .universe import Series
 
 DEFAULT_READY_BUFFER = timedelta(minutes=30)
+DEFAULT_HORIZON_DAYS = 7
 DEFAULT_MARKET_ORDER: tuple[str, ...] = ("nfo", "cds", "mcx")
 # Align with kitetools.auth.TOKEN_RESET — before 06:00 IST, trade_date is yesterday.
 _TRADE_DATE_CUTOFF = dt_time(6, 0)
@@ -50,7 +51,7 @@ class MarketPlan:
     ready_at: datetime
     wait_seconds: float
     expiry_today: int
-    unfinished: int
+    near_term: int
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class EodPlan:
     trade_date: date
     markets: tuple[MarketPlan, ...]
     buffer: timedelta
+    horizon_days: int = DEFAULT_HORIZON_DAYS
 
 
 class EodSkipped(Exception):
@@ -297,38 +299,35 @@ def select_eod_series(
     interval: str = "minute",
     market: MarketProfile | str | None = None,
     types: universe.TypesFilterName | frozenset[str] | None = None,
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> list[Series]:
-    """Expiry-on-trade_date series plus unfinished older series (catalog scan)."""
-    profile = universe.resolve_market(market)
+    """Near-term series: ``trade_date <= expiry <= trade_date + horizon_days``.
+
+    Past unfinished expiries are out of EOD scope. ``interval`` is kept for call-site
+    compatibility and is unused for selection.
+    """
+    del interval  # selection is horizon-only; day/minute incompleteness not used
+    universe.resolve_market(market)  # validate market id when provided
+    if horizon_days < 0:
+        raise ValueError(f"horizon_days must be >= 0, got {horizon_days}")
     type_filter = universe.resolve_types_filter(types)
     all_contracts = catalog.list_contracts(con)
     if type_filter is not None:
         all_contracts = [c for c in all_contracts if c.instrument_type in type_filter]
     grouped = universe._group_by_series(all_contracts)
-    tokens = [c.token for c in all_contracts]
-    fetch_states = catalog.list_fetch_states(con, interval=interval, tokens=tokens)
+    end = trade_date + timedelta(days=horizon_days)
 
     out: list[Series] = []
     for (underlying, expiry), contracts in grouped.items():
-        if expiry == trade_date:
-            out.append(
-                Series(
-                    underlying=underlying,
-                    expiry=expiry,
-                    contracts=tuple(sorted(contracts, key=lambda c: c.token)),
-                )
-            )
+        if expiry < trade_date or expiry > end:
             continue
-        if expiry < trade_date and universe._series_fetch_incomplete(
-            contracts, fetch_states, expiry, profile.session_end
-        ):
-            out.append(
-                Series(
-                    underlying=underlying,
-                    expiry=expiry,
-                    contracts=tuple(sorted(contracts, key=lambda c: c.token)),
-                )
+        out.append(
+            Series(
+                underlying=underlying,
+                expiry=expiry,
+                contracts=tuple(sorted(contracts, key=lambda c: c.token)),
             )
+        )
     return out
 
 
@@ -338,12 +337,61 @@ def count_eod_buckets(
     *,
     market: MarketProfile | str | None = None,
     types: universe.TypesFilterName | frozenset[str] | None = None,
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> tuple[int, int]:
-    """Return (expiry_today_series, unfinished_series) counts."""
-    series = select_eod_series(con, trade_date, interval="minute", market=market, types=types)
+    """Return ``(expiry_today_series, near_term_series)`` counts."""
+    series = select_eod_series(
+        con,
+        trade_date,
+        interval="minute",
+        market=market,
+        types=types,
+        horizon_days=horizon_days,
+    )
     expiry_today = sum(1 for s in series if s.expiry == trade_date)
-    unfinished = sum(1 for s in series if s.expiry < trade_date)
-    return expiry_today, unfinished
+    near_term = sum(1 for s in series if s.expiry > trade_date)
+    return expiry_today, near_term
+
+
+def eod_sort_key(
+    *,
+    expiry: date,
+    trade_date: date,
+    underlying: str,
+    ranked: bool,
+    traded_value: float | None,
+) -> tuple:
+    """Bucket 0 = expiry today, bucket 1 = rest of horizon; then expiry / rank / name."""
+    bucket = 0 if expiry == trade_date else 1
+    value = traded_value if traded_value is not None else -1.0
+    return (
+        bucket,
+        expiry,
+        0 if ranked else 1,
+        -value,
+        underlying,
+    )
+
+
+def order_eod_series(
+    series: Sequence[Series],
+    trade_date: date,
+    ranks: Mapping[str, UnderlyingRank] | None = None,
+) -> list[Series]:
+    """Order: expiry-today first, then near-term by expiry asc / traded_value desc."""
+    ranks = ranks or {}
+
+    def _key(s: Series) -> tuple:
+        rank = ranks.get(s.underlying)
+        return eod_sort_key(
+            expiry=s.expiry,
+            trade_date=trade_date,
+            underlying=s.underlying,
+            ranked=rank is not None,
+            traded_value=rank.traded_value if rank is not None else None,
+        )
+
+    return sorted(series, key=_key)
 
 
 def build_plan(
@@ -353,6 +401,7 @@ def build_plan(
     buffer: timedelta = DEFAULT_READY_BUFFER,
     now: datetime | None = None,
     catalog_counts: dict[str, tuple[int, int]] | None = None,
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> EodPlan:
     now = _aware_ist(now)
     trade_date = trade_date if trade_date is not None else resolve_trade_date(now)
@@ -362,9 +411,9 @@ def build_plan(
         profile = get_market(mid)
         ready = download_ready(trade_date, profile, buffer=buffer)
         wait = max(0.0, (ready - now).total_seconds())
-        exp_n, unf_n = (0, 0)
+        exp_n, near_n = (0, 0)
         if catalog_counts and mid in catalog_counts:
-            exp_n, unf_n = catalog_counts[mid]
+            exp_n, near_n = catalog_counts[mid]
         plans.append(
             MarketPlan(
                 market_id=mid,
@@ -373,17 +422,23 @@ def build_plan(
                 ready_at=ready,
                 wait_seconds=wait,
                 expiry_today=exp_n,
-                unfinished=unf_n,
+                near_term=near_n,
             )
         )
-    return EodPlan(trade_date=trade_date, markets=tuple(plans), buffer=buffer)
+    return EodPlan(
+        trade_date=trade_date,
+        markets=tuple(plans),
+        buffer=buffer,
+        horizon_days=horizon_days,
+    )
 
 
 def format_plan(plan: EodPlan) -> str:
     lines = [
-        f"trade_date={ymd(plan.trade_date)} IST  buffer={int(plan.buffer.total_seconds() // 60)}m",
+        f"trade_date={ymd(plan.trade_date)} IST  buffer={int(plan.buffer.total_seconds() // 60)}m "
+        f"horizon={plan.horizon_days}d",
         f"{'market':<6} {'session_end':>11} {'ready':>16} {'wait':>10} "
-        f"{'exp_today':>9} {'unfinished':>10}",
+        f"{'exp_today':>9} {'near_term':>10}",
         "-" * 72,
     ]
     for m in plan.markets:
@@ -391,7 +446,7 @@ def format_plan(plan: EodPlan) -> str:
         ready = m.ready_at.strftime("%Y-%m-%d %H:%M")
         lines.append(
             f"{m.market_id:<6} {m.session_end.strftime('%H:%M'):>11} {ready:>16} "
-            f"{wait:>10} {m.expiry_today:>9} {m.unfinished:>10}"
+            f"{wait:>10} {m.expiry_today:>9} {m.near_term:>10}"
         )
     order = " → ".join(m.market_id for m in plan.markets)
     lines.append(f"order: {order}")
@@ -428,6 +483,7 @@ def run_market_eod(
     max_series: int | None = None,
     backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
     types: str = "all",
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
     sleep: Callable[[float], None] = time.sleep,
     on_heartbeat: Callable[[float, datetime], None] | None = None,
     should_stop: Callable[[], str | None] | None = None,
@@ -439,6 +495,8 @@ def run_market_eod(
     """Run sync → daily → fetch for one market. Returns a summary dict."""
     from .progress import InterruptController
 
+    if horizon_days < 0:
+        raise ValueError(f"horizon_days must be >= 0, got {horizon_days}")
     profile = get_market(market_id)
     mpaths = paths_for(market_id)
     now = _aware_ist(now)
@@ -472,6 +530,7 @@ def run_market_eod(
             max_series=max_series,
             backfill_days=backfill_days,
             types=types,
+            horizon_days=horizon_days,
             sleep=sleep,
             on_heartbeat=on_heartbeat,
             client=client,
@@ -500,6 +559,7 @@ def _run_market_eod_body(
     max_series: int | None,
     backfill_days: int | None,
     types: str,
+    horizon_days: int,
     sleep: Callable[[float], None],
     on_heartbeat: Callable[[float, datetime], None] | None,
     client: KiteClient | None,
@@ -540,27 +600,36 @@ def _run_market_eod_body(
                 "trade_date": trade_date,
                 "dry_run": True,
                 "ready_at": ready,
+                "horizon_days": horizon_days,
                 "expiry_today": 0,
-                "unfinished": 0,
+                "near_term": 0,
                 "series": 0,
             }
         con = catalog.connect(mpaths.catalog_path)
         try:
             catalog.ensure_schema(con)
             series = select_eod_series(
-                con, trade_date, interval="minute", market=market_id, types=types
+                con,
+                trade_date,
+                interval="minute",
+                market=market_id,
+                types=types,
+                horizon_days=horizon_days,
             )
+            ranks = rank_mod.load_ranks(con)
+            series = order_eod_series(series, trade_date, ranks)
             if max_series is not None:
                 series = series[:max_series]
             exp_n = sum(1 for s in series if s.expiry == trade_date)
-            unf_n = sum(1 for s in series if s.expiry < trade_date)
+            near_n = sum(1 for s in series if s.expiry > trade_date)
             return {
                 "market": market_id,
                 "trade_date": trade_date,
                 "dry_run": True,
                 "ready_at": ready,
+                "horizon_days": horizon_days,
                 "expiry_today": exp_n,
-                "unfinished": unf_n,
+                "near_term": near_n,
                 "series": len(series),
             }
         finally:
@@ -633,18 +702,28 @@ def _run_market_eod_body(
             )
 
             series_day = select_eod_series(
-                con, trade_date, interval="day", market=market_id, types=types
+                con,
+                trade_date,
+                interval="day",
+                market=market_id,
+                types=types,
+                horizon_days=horizon_days,
             )
             series_min = select_eod_series(
-                con, trade_date, interval="minute", market=market_id, types=types
+                con,
+                trade_date,
+                interval="minute",
+                market=market_id,
+                types=types,
+                horizon_days=horizon_days,
             )
             by_key: dict[tuple[str, date], Series] = {}
             for s in series_day + series_min:
                 prev = by_key.get(s.key)
                 if prev is None or len(s.contracts) > len(prev.contracts):
                     by_key[s.key] = s
-            series_list = list(by_key.values())
             ranks = rank_mod.load_ranks(con)
+            series_list = order_eod_series(list(by_key.values()), trade_date, ranks)
             tokens = [c.token for s in series_list for c in s.contracts]
             day_states = catalog.list_fetch_states(con, interval="day", tokens=tokens)
             minute_states = catalog.list_fetch_states(con, interval="minute", tokens=tokens)
@@ -655,11 +734,22 @@ def _run_market_eod_body(
                 ranks,
                 day_states,
                 fetch_now,
-                limit=max_series,
+                limit=None,
                 interval="day",
                 market=market_id,
                 types=types,
             )
+            day_items.sort(
+                key=lambda item: eod_sort_key(
+                    expiry=item.expiry,
+                    trade_date=trade_date,
+                    underlying=item.underlying,
+                    ranked=item.ranked,
+                    traded_value=item.traded_value,
+                )
+            )
+            if max_series is not None and max_series >= 0:
+                day_items = day_items[:max_series]
             series_by_key = {(s.underlying, s.expiry): s for s in series_list}
             queue_series = [
                 series_by_key[(item.underlying, item.expiry)]
@@ -758,6 +848,7 @@ def run_catchup(
     max_series: int | None = None,
     backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
     types: str = "all",
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
     sleep: Callable[[float], None] = time.sleep,
     should_stop: Callable[[], str | None] | None = None,
     interrupt: object | None = None,
@@ -798,6 +889,7 @@ def run_catchup(
             max_series=max_series,
             backfill_days=backfill_days,
             types=types,
+            horizon_days=horizon_days,
             sleep=sleep,
             should_stop=should_stop,
             interrupt=interrupt,
@@ -820,6 +912,7 @@ def run_catchup(
             max_series=max_series,
             backfill_days=backfill_days,
             types=types,
+            horizon_days=horizon_days,
             sleep=sleep,
             should_stop=should_stop,
             interrupt=interrupt,
@@ -841,12 +934,15 @@ def run_eod(
     max_series: int | None = None,
     backfill_days: int | None = planner.BACKFILL_WINDOW_DAYS,
     types: str = "all",
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
     sleep: Callable[[float], None] = time.sleep,
     should_stop: Callable[[], str | None] | None = None,
     interrupt: object | None = None,
     fetch_cmd: str = "ohlcv eod",
 ) -> list[dict]:
     """Orchestrate EOD across markets in DEFAULT_MARKET_ORDER (filtered)."""
+    if horizon_days < 0:
+        raise ValueError(f"horizon_days must be >= 0, got {horizon_days}")
     now = _aware_ist(now)
     trade_date = trade_date if trade_date is not None else resolve_trade_date(now)
     market_ids = list(markets) if markets is not None else list(DEFAULT_MARKET_ORDER)
@@ -864,7 +960,11 @@ def run_eod(
             con = catalog.connect(mpaths.catalog_path, read_only=True)
             try:
                 catalog_counts[mid] = count_eod_buckets(
-                    con, trade_date, market=mid, types=types
+                    con,
+                    trade_date,
+                    market=mid,
+                    types=types,
+                    horizon_days=horizon_days,
                 )
             finally:
                 con.close()
@@ -877,6 +977,7 @@ def run_eod(
         buffer=buffer,
         now=now,
         catalog_counts=catalog_counts,
+        horizon_days=horizon_days,
     )
     print(format_plan(plan))
     print()
@@ -896,6 +997,7 @@ def run_eod(
                 max_series=max_series,
                 backfill_days=backfill_days,
                 types=types,
+                horizon_days=horizon_days,
                 sleep=sleep,
                 should_stop=should_stop,
                 interrupt=interrupt,
@@ -906,7 +1008,7 @@ def run_eod(
                 print(
                     f"  dry-run: series={summary.get('series', 0)} "
                     f"expiry_today={summary.get('expiry_today', 0)} "
-                    f"unfinished={summary.get('unfinished', 0)}"
+                    f"near_term={summary.get('near_term', 0)}"
                 )
         except EodSkipped as exc:
             print(f"  skipped: {exc}")
