@@ -18,9 +18,9 @@ from .catalog import ContractRow, list_contracts
 from .client import KiteClient, RetryExhausted
 from .markets import MarketProfile
 from .paths import DAILY_DIR, STAGING_DIR, ensure_dir, paths_for, ymd
+from .settings import QUOTE_BATCH_SIZE
 from .universe import resolve_market
 
-QUOTE_BATCH_SIZE = 500
 QUOTE_PACE_S = 1.0
 
 

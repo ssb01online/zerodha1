@@ -25,9 +25,10 @@ from . import rank as rank_mod
 from . import snapshot
 from . import universe
 from .catalog import ContractRow, UnderlyingRank
-from .client import KiteClient, RetryExhausted, SessionExpired
+from .client import KiteClient, RequestRejected, RetryExhausted, SessionExpired
 from .markets import MARKETS, MarketProfile, get_market
 from .paths import EOD_DIR, ensure_dir, paths_for, ymd
+from .settings import QUOTE_BATCH_SIZE
 from .universe import Series
 
 DEFAULT_READY_BUFFER = timedelta(minutes=30)
@@ -68,6 +69,45 @@ class EodSkipped(Exception):
 
 class EodNonSession(Exception):
     """Daily snapshot rejected (weekend / holiday / no volume)."""
+
+
+class EodFailed(Exception):
+    """One or more markets did not finish downloading. No done marker for those."""
+
+    def __init__(self, summaries: list[dict]) -> None:
+        self.summaries = summaries
+        super().__init__(format_eod_failure(summaries))
+
+
+def format_eod_failure(summaries: Sequence[Mapping]) -> str:
+    """Final message when a market failed. Empty string when every market is clean."""
+    failed = [s for s in summaries if s.get("error")]
+    if not failed:
+        return ""
+    lines = ["eod failed; these markets were not fully downloaded:"]
+    for summary in failed:
+        lines.append(f"  {summary.get('market', '?')}: {summary['error']}")
+    lines.append("no done marker was written for the markets above")
+    return "\n".join(lines)
+
+
+def download_failure_reason(day_results: fetch_mod.FetchRunResult, minute_results: fetch_mod.FetchRunResult) -> str | None:
+    """Why an EOD market must not be marked done, or None when both passes are clean.
+
+    ``gave_up`` (expired contracts abandoned after repeated rejections) does not
+    count: those watermarks are intentionally closed.
+    """
+    parts: list[str] = []
+    if day_results.errors:
+        parts.append(f"day errors={day_results.errors}")
+    if minute_results.errors:
+        parts.append(f"minute errors={minute_results.errors}")
+    stopped = day_results.stopped_reason or minute_results.stopped_reason
+    if stopped:
+        parts.append(f"stopped: {stopped}")
+    if not parts:
+        return None
+    return "; ".join(parts)
 
 
 def resolve_trade_date(now: datetime | None = None) -> date:
@@ -436,7 +476,7 @@ def build_plan(
 def format_plan(plan: EodPlan) -> str:
     lines = [
         f"trade_date={ymd(plan.trade_date)} IST  buffer={int(plan.buffer.total_seconds() // 60)}m "
-        f"horizon={plan.horizon_days}d",
+        f"horizon={plan.horizon_days}d quote_batch={QUOTE_BATCH_SIZE}",
         f"{'market':<6} {'session_end':>11} {'ready':>16} {'wait':>10} "
         f"{'exp_today':>9} {'near_term':>10}",
         "-" * 72,
@@ -797,6 +837,22 @@ def _run_market_eod_body(
                 f"fetched={minute_results.contracts_fetched} err={minute_results.errors}"
             )
 
+            failure = download_failure_reason(day_results, minute_results)
+            if failure is not None:
+                print(f"  FAILED: {failure}")
+                print("  download incomplete; no done marker written")
+                return {
+                    "market": market_id,
+                    "trade_date": trade_date,
+                    "error": failure,
+                    "daily_status": result.status,
+                    "day_fetched": day_results.contracts_fetched,
+                    "day_errors": day_results.errors,
+                    "minute_fetched": minute_results.contracts_fetched,
+                    "minute_errors": minute_results.errors,
+                    "series": len(queue_series),
+                }
+
             from . import status as status_mod
 
             rows = status_mod.series_status(
@@ -1022,8 +1078,11 @@ def run_eod(
                 break
         except (auth.NotLoggedIn, SessionExpired) as exc:
             raise
-        except RetryExhausted as exc:
+        except (RetryExhausted, RequestRejected) as exc:
             summaries.append({"market": mid, "error": str(exc)})
-            print(f"  error: {exc}")
+            print(f"  FAILED: {exc}")
+            print("  download incomplete; no done marker written")
         print()
+    if any(s.get("error") for s in summaries):
+        raise EodFailed(summaries)
     return summaries

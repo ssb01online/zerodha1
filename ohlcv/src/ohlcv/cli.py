@@ -1567,6 +1567,8 @@ def cmd_eod(args: argparse.Namespace) -> None:
                 interrupt=interrupt,
                 should_stop=interrupt.should_stop,
             )
+    except eod_mod.EodFailed as exc:
+        raise SystemExit(str(exc)) from exc
     except eod_mod.CatchupInProgress as exc:
         raise SystemExit(str(exc)) from exc
     except fetch_lock.FetchInProgress as exc:

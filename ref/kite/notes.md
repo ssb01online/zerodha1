@@ -144,7 +144,7 @@ Project decision (not a Kite API fact):
 
 - `download_ready = session_end + 30m` → NFO **16:10**, CDS **17:30**, MCX **00:00** next calendar day. `session_end` itself stays the watermark / `final` snapshot gate.
 - `uv run ohlcv eod [--markets nfo,cds,mcx] [--buffer 30m] [--horizon-days 7] [--no-wait|--force|--dry-run|--catch-up] [--trade-date]`: plan table, optional wait, then per market `sync` → `daily` → fetch series with `expiry` in `[trade_date, trade_date + horizon]` (default 7 calendar days). Fetch order: expiry-on-`trade_date` first, then rest of window (expiry asc, traded_value desc). Past unfinished expiries are **out of EOD scope** (use `ohlcv fetch` for manual recovery). Before **06:00 IST**, default `trade_date` is yesterday (MCX 00:05 task), so post-midnight MCX still targets the session that just closed.
-- Success marker after each completed market: `data/ohlcv/_eod/{market}-{yyyymmdd}.done`. `--catch-up` runs only markets already past `download_ready` that lack a marker (implies `--no-wait`); uses `catchup.lock` for single-flight.
+- Success marker after each completed market: `data/ohlcv/_eod/{market}-{yyyymmdd}.done`. A market with a quote/historical failure (`RetryExhausted`, `RequestRejected`, day/minute errors, or a stopped fetch) does not get a marker, and `ohlcv eod` exits non-zero listing those markets. `--catch-up` runs only markets already past `download_ready` that lack a marker (implies `--no-wait`); uses `catchup.lock` for single-flight.
 - Per-market fetch lock: `data/ohlcv/<market>/fetch.lock` (pid + IST started + cmd). Held by `ohlcv fetch` and each non-dry-run market pass in `ohlcv eod` / `--catch-up`. Second writer exits with pid / age / cmd; dead-PID locks are reclaimed. DuckDB catalog lock remains a second line of defense.
 - Late login: Task Scheduler still fires at ready time (fails if no token). Tray on invalid→valid or startup-if-valid spawns `ohlcv eod --catch-up` (menu **Catch up EOD** too). Logs: `catchup-*.log` under `_eod/`.
 - `snapshot_status(..., trade_date=)` so post-midnight MCX snapshots still count as `final` for the prior session.
@@ -210,7 +210,7 @@ Activity: `volume`, `average_price`, `traded_value` (`volume * average_price`), 
 ### Commands
 | Command | Purpose |
 | --- | --- |
-| `uv run ohlcv daily [--market]` | Sync → quote all live contracts (~500/batch, 1 req/s) → write parquet → record snapshot → rank (`source=quote`) |
+| `uv run ohlcv daily [--market]` | Sync → quote all live contracts (`settings.QUOTE_BATCH_SIZE`, default 250, 1 req/s) → write parquet → record snapshot → rank (`source=quote`) |
 | `uv run ohlcv daily --dry-run` | Contract/batch/time estimate; no quote calls |
 | `uv run ohlcv daily --show [yyyymmdd]` | Offline summary of an existing snapshot (default: latest) |
 

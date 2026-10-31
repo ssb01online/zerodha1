@@ -1079,6 +1079,57 @@ def test_eod_timing_and_plan() -> None:
     _assert(summary.get("dry_run") is True, "dry_run summary")
     _assert(summary.get("market") == "nfo", "dry_run market")
     _assert("series" in summary, "dry_run series key")
+    _assert("quote_batch=" in text, "plan shows quote batch size")
+
+
+def test_quote_batch_size_chunks_snapshot() -> None:
+    from .settings import QUOTE_BATCH_SIZE
+
+    _assert(QUOTE_BATCH_SIZE == snapshot.QUOTE_BATCH_SIZE, "snapshot uses settings.QUOTE_BATCH_SIZE")
+    _assert(QUOTE_BATCH_SIZE > 0, "batch size positive")
+    rows = [
+        catalog.ContractRow(i, "NIFTY", date(2026, 10, 27), f"S{i}", "CE", 1.0, 1)
+        for i in range(QUOTE_BATCH_SIZE + 1)
+    ]
+    dry = snapshot.estimate_dry_run(rows)
+    _assert(dry.contracts == QUOTE_BATCH_SIZE + 1, f"contracts={dry.contracts}")
+    _assert(dry.batches == 2, f"batches={dry.batches}")
+
+
+def test_eod_failure_is_reported_and_not_success() -> None:
+    clean = [{"market": "nfo", "done_marker": "x"}]
+    _assert(eod_mod.format_eod_failure(clean) == "", "clean run has no failure text")
+
+    failed = [{"market": "nfo", "error": "retries exhausted"}, {"market": "cds", "skipped": True}]
+    text = eod_mod.format_eod_failure(failed)
+    _assert("not fully downloaded" in text, text)
+    _assert("nfo: retries exhausted" in text, text)
+    _assert("no done marker" in text, text)
+    _assert("cds" not in text, "skipped market is not a failure")
+    try:
+        raise eod_mod.EodFailed(failed)
+    except eod_mod.EodFailed as exc:
+        _assert(str(exc) == text, "EodFailed message")
+        _assert(exc.summaries == failed, "summaries kept")
+
+    def _run(errors: int = 0, stopped: str | None = None) -> fetch_mod.FetchRunResult:
+        return fetch_mod.FetchRunResult(
+            series_done=1,
+            contracts_fetched=1,
+            contracts_skipped=0,
+            rows_written=1,
+            errors=errors,
+            gave_up=3,
+            locked=[],
+            stopped_reason=stopped,
+        )
+
+    _assert(
+        eod_mod.download_failure_reason(_run(), _run()) is None,
+        "gave_up alone is not a failed download",
+    )
+    reason = eod_mod.download_failure_reason(_run(errors=2), _run(stopped="3 consecutive RetryExhausted"))
+    _assert(reason is not None and "day errors=2" in reason and "stopped:" in reason, reason)
 
 
 def test_eod_done_markers_and_missed_markets() -> None:
@@ -3215,6 +3266,8 @@ def main() -> None:
         test_catalog_v1_to_v2_migration,
         test_snapshot_status_boundary,
         test_eod_timing_and_plan,
+        test_quote_batch_size_chunks_snapshot,
+        test_eod_failure_is_reported_and_not_success,
         test_eod_done_markers_and_missed_markets,
         test_fetch_lock_market_single_flight,
         test_eod_select_series_near_term_horizon,
