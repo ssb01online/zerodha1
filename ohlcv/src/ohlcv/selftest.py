@@ -1132,6 +1132,99 @@ def test_eod_failure_is_reported_and_not_success() -> None:
     _assert(reason is not None and "day errors=2" in reason and "stopped:" in reason, reason)
 
 
+def test_eod_non_session_continues_historical_fetch() -> None:
+    """Weekend/holiday daily reject must not abort near-term day/minute fetch."""
+    from .paths import MarketPaths
+
+    trade = date(2026, 10, 31)  # Saturday
+    near = date(2026, 11, 3)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "nfo"
+        stub = MarketPaths(
+            root=root,
+            probe_dir=root / "_probe",
+            daily_dir=root / "daily",
+            day_dir=root / "day",
+            minute_dir=root / "minute",
+            continuous_dir=root / "continuous",
+            staging_dir=root / "_staging",
+            logs_dir=root / "logs",
+            catalog_path=root / "catalog.duckdb",
+        )
+        for p in (
+            stub.daily_dir,
+            stub.day_dir,
+            stub.minute_dir,
+            stub.staging_dir,
+            stub.logs_dir,
+        ):
+            p.mkdir(parents=True, exist_ok=True)
+        con = catalog.connect(stub.catalog_path)
+        try:
+            catalog.ensure_schema(con)
+            catalog.upsert_contracts(
+                con,
+                [
+                    catalog.ContractRow(
+                        1, "NIFTY", near, "NIFTY03NOV", "FUT", 0.0, 50
+                    ),
+                ],
+                seen_on=trade,
+            )
+        finally:
+            con.close()
+
+        fetch_calls = {"n": 0}
+
+        def fake_fetch(*_a: Any, **_k: Any) -> fetch_mod.FetchRunResult:
+            fetch_calls["n"] += 1
+            return fetch_mod.FetchRunResult(
+                series_done=1,
+                contracts_fetched=1,
+                contracts_skipped=0,
+                rows_written=10,
+                errors=0,
+                gave_up=0,
+                locked=[],
+            )
+
+        def reject_snap(*_a: Any, **_k: Any) -> None:
+            raise snapshot.SnapshotRejected(
+                "no session today; last session was 20261030; "
+                "take the snapshot on the session day after close."
+            )
+
+        done_path = Path(tmp) / "_eod" / "nfo-20261031.done"
+
+        with (
+            mock.patch.object(eod_mod, "paths_for", return_value=stub),
+            mock.patch.object(eod_mod, "ensure_token"),
+            mock.patch.object(eod_mod, "mark_eod_done", return_value=done_path),
+            mock.patch.object(universe, "sync_contracts", return_value=1),
+            mock.patch.object(eod_mod.snapshot, "take_snapshot", side_effect=reject_snap),
+            mock.patch.object(eod_mod.fetch_mod, "run_fetch", side_effect=fake_fetch),
+            mock.patch.object(status_mod, "series_status", return_value=[]),
+            mock.patch("instruments.ensure_cache"),
+            mock.patch.object(archive_mod, "ensure_archive"),
+            mock.patch.object(fetch_lock_mod, "try_acquire"),
+            mock.patch.object(fetch_lock_mod, "release"),
+        ):
+            summary = eod_mod.run_market_eod(
+                "nfo",
+                trade_date=trade,
+                now=datetime(2026, 10, 31, 12, 0, tzinfo=auth.IST),
+                force=True,
+                client=mock.Mock(),
+                fetch_lock_path=root / "fetch.lock",
+            )
+
+        _assert(fetch_calls["n"] == 2, f"day+minute fetch calls={fetch_calls['n']}")
+        _assert(summary.get("daily_status") is None, "no daily status on non-session")
+        _assert(summary.get("error") is None, f"unexpected error={summary.get('error')}")
+        _assert(summary.get("done_marker") == str(done_path), "done marker after fetch")
+        _assert(summary.get("series", 0) >= 1, "near-term series selected")
+
+
 def test_eod_done_markers_and_missed_markets() -> None:
     day = date(2026, 10, 27)
     buf = timedelta(minutes=30)
@@ -3268,6 +3361,7 @@ def main() -> None:
         test_eod_timing_and_plan,
         test_quote_batch_size_chunks_snapshot,
         test_eod_failure_is_reported_and_not_success,
+        test_eod_non_session_continues_historical_fetch,
         test_eod_done_markers_and_missed_markets,
         test_fetch_lock_market_single_flight,
         test_eod_select_series_near_term_horizon,

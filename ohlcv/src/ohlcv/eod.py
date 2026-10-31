@@ -67,10 +67,6 @@ class EodSkipped(Exception):
     """Market skipped (not ready under --no-wait)."""
 
 
-class EodNonSession(Exception):
-    """Daily snapshot rejected (weekend / holiday / no volume)."""
-
-
 class EodFailed(Exception):
     """One or more markets did not finish downloading. No done marker for those."""
 
@@ -703,6 +699,7 @@ def _run_market_eod_body(
             contracts = snapshot_contracts_for_trade_date(
                 con, trade_date, calendar_today=calendar_today
             )
+            daily_status: str | None = None
             try:
                 result = snapshot.take_snapshot(
                     client,
@@ -715,31 +712,45 @@ def _run_market_eod_body(
                     should_stop=stop,
                 )
             except snapshot.SnapshotRejected as exc:
-                raise EodNonSession(str(exc)) from exc
-
-            catalog.record_snapshot(
-                con,
-                catalog.DailySnapshotMeta(
-                    trade_date=result.trade_date,
-                    status=result.status,
-                    taken_at=result.taken_at,
-                    contracts=result.contracts,
-                    traded_contracts=result.traded_contracts,
-                    missing=result.missing,
-                    total_volume=result.total_volume,
-                    path=str(result.path),
-                ),
-            )
-            rank_mod.rank_from_snapshot(
-                con,
-                result.trade_date,
-                market=market_id,
-                dest_dir=mpaths.daily_dir,
-            )
-            print(
-                f"  daily {ymd(result.trade_date)} status={result.status} "
-                f"traded={result.traded_contracts}/{result.contracts}"
-            )
+                # Weekend / holiday / zero volume: no daily file for trade_date, but
+                # near-term historical fetch can still catch up incomplete series.
+                if "no session today" in str(exc):
+                    print(f"  non-session: {exc}; continuing with historical fetch")
+                    result = None
+                else:
+                    print(f"  FAILED: {exc}")
+                    print("  download incomplete; no done marker written")
+                    return {
+                        "market": market_id,
+                        "trade_date": trade_date,
+                        "error": str(exc),
+                        "daily_status": None,
+                    }
+            else:
+                catalog.record_snapshot(
+                    con,
+                    catalog.DailySnapshotMeta(
+                        trade_date=result.trade_date,
+                        status=result.status,
+                        taken_at=result.taken_at,
+                        contracts=result.contracts,
+                        traded_contracts=result.traded_contracts,
+                        missing=result.missing,
+                        total_volume=result.total_volume,
+                        path=str(result.path),
+                    ),
+                )
+                rank_mod.rank_from_snapshot(
+                    con,
+                    result.trade_date,
+                    market=market_id,
+                    dest_dir=mpaths.daily_dir,
+                )
+                daily_status = result.status
+                print(
+                    f"  daily {ymd(result.trade_date)} status={result.status} "
+                    f"traded={result.traded_contracts}/{result.contracts}"
+                )
 
             series_day = select_eod_series(
                 con,
@@ -845,7 +856,7 @@ def _run_market_eod_body(
                     "market": market_id,
                     "trade_date": trade_date,
                     "error": failure,
-                    "daily_status": result.status,
+                    "daily_status": daily_status,
                     "day_fetched": day_results.contracts_fetched,
                     "day_errors": day_results.errors,
                     "minute_fetched": minute_results.contracts_fetched,
@@ -879,7 +890,7 @@ def _run_market_eod_body(
             return {
                 "market": market_id,
                 "trade_date": trade_date,
-                "daily_status": result.status,
+                "daily_status": daily_status,
                 "day_fetched": day_results.contracts_fetched,
                 "day_errors": day_results.errors,
                 "minute_fetched": minute_results.contracts_fetched,
@@ -1069,13 +1080,6 @@ def run_eod(
         except EodSkipped as exc:
             print(f"  skipped: {exc}")
             summaries.append({"market": mid, "skipped": True, "reason": str(exc)})
-        except EodNonSession as exc:
-            print(f"  non-session: {exc}")
-            summaries.append({"market": mid, "non_session": True, "reason": str(exc)})
-            # First market holiday → stop the whole run.
-            if mid == market_ids[0]:
-                print("first market is non-session; stopping remaining markets")
-                break
         except (auth.NotLoggedIn, SessionExpired) as exc:
             raise
         except (RetryExhausted, RequestRejected) as exc:
