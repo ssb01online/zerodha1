@@ -252,6 +252,59 @@ export interface OptionChainResult {
   strikes: OptionChainStrike[];
 }
 
+export interface QualityMarketMeta {
+  as_of: string | null;
+  day_files: number;
+  minute_files: number;
+  contracts: number;
+}
+
+export interface QualityReportMeta {
+  id: string;
+  generated_at: string;
+  schema_version: number;
+  markets: Record<string, QualityMarketMeta>;
+}
+
+export interface QualityReportsResult {
+  reports: QualityReportMeta[];
+}
+
+export interface QualityRow {
+  market: string;
+  underlying: string | null;
+  expiry: string | null;
+  token: number | null;
+  tradingsymbol: string | null;
+  instrument_type: string | null;
+  strike: number | null;
+  session_days: number;
+  day_bars: number;
+  day_gaps: number;
+  traded_days: number;
+  minute_days: number;
+  minute_pct: number | null;
+  no_day_data: boolean;
+}
+
+export interface QualitySummary {
+  id: string;
+  generated_at: string;
+  days: number | null;
+  level: "market" | "underlying" | "expiry" | "contract";
+  as_of: Record<string, string | null>;
+  rows: QualityRow[];
+}
+
+export interface QualityContract {
+  id: string;
+  generated_at: string;
+  days: number | null;
+  row: QualityRow;
+  gap_dates: string[];
+  traded_without_minute: string[];
+}
+
 export interface PreopenDayMeta {
   trade_date: string;
   ymd: string;

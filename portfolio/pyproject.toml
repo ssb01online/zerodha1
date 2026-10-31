@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.28.0",
     "instruments",
     "kitetools",
+    "ohlcv",
     "preopen",
     "uvicorn>=0.32.0",
 ]
@@ -23,4 +24,5 @@ build-backend = "uv_build"
 [tool.uv.sources]
 instruments = { workspace = true }
 kitetools = { workspace = true }
+ohlcv = { workspace = true }
 preopen = { workspace = true }

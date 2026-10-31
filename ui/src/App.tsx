@@ -5,6 +5,7 @@ import InstrumentsPage from "./pages/InstrumentsPage";
 import LivePage from "./pages/LivePage";
 import NfoChainPage from "./pages/NfoChainPage";
 import PreopenPage from "./pages/PreopenPage";
+import QualityPage from "./pages/QualityPage";
 import SnapshotPage from "./pages/SnapshotPage";
 import SnapshotsPage from "./pages/SnapshotsPage";
 
@@ -19,6 +20,7 @@ export default function App() {
           <Route path="/snapshots" element={<SnapshotsPage />} />
           <Route path="/snapshots/:id" element={<SnapshotPage />} />
           <Route path="/preopen" element={<PreopenPage />} />
+          <Route path="/quality" element={<QualityPage />} />
           <Route path="/instruments" element={<InstrumentsPage />} />
           <Route
             path="/instruments/nfo/:underlying"

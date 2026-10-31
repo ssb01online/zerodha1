@@ -3727,6 +3727,134 @@ def test_quality_days_window() -> None:
             con.close()
 
 
+def test_quality_api() -> None:
+    """Read-only quality routes: report list, N window, contract dates, missing id."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from .api import router
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        day_dir = root / "day"
+        minute_dir = root / "minute"
+        expiry = date(2026, 12, 31)
+        start = date(2026, 1, 1)
+        dates = [start + timedelta(days=i) for i in range(61)]
+        day_rows = []
+        minute_rows = []
+        for index, day in enumerate(dates):
+            day_rows.append(
+                _quality_bar(
+                    "CRUDEOIL",
+                    expiry,
+                    7,
+                    "CRUDEOIL26DECFUT",
+                    "FUT",
+                    datetime(day.year, day.month, day.day),
+                    10,
+                )
+            )
+            if index > 0:
+                minute_rows.append(
+                    _quality_bar(
+                        "CRUDEOIL",
+                        expiry,
+                        7,
+                        "CRUDEOIL26DECFUT",
+                        "FUT",
+                        datetime(day.year, day.month, day.day, 9, 15),
+                        10,
+                    )
+                )
+        _write_quality_parquet(series_path(day_dir, "CRUDEOIL", expiry), day_rows)
+        _write_quality_parquet(series_path(minute_dir, "CRUDEOIL", expiry), minute_rows)
+        reports = root / "reports"
+        moment = datetime(2026, 3, 3, 18, 0, tzinfo=auth.IST)
+        roots = {
+            "nfo": quality_mod.MarketInputs(
+                day_dir=day_dir,
+                minute_dir=minute_dir,
+                catalog_path=root / "missing-catalog.duckdb",
+            )
+        }
+        quality_mod.generate(["nfo"], reports_root=reports, now=moment, roots=roots)
+        later = quality_mod.generate(
+            ["nfo"],
+            reports_root=reports,
+            now=moment + timedelta(seconds=1),
+            roots=roots,
+        )
+        bad = reports / "20260101-000000"
+        bad.mkdir()
+        (bad / "manifest.json").write_text(
+            json.dumps({"schema_version": 2, "generated_at": "x", "markets": {}}),
+            encoding="utf-8",
+        )
+
+        old = quality_mod.REPORTS_DIR
+        quality_mod.REPORTS_DIR = reports
+        try:
+            app = FastAPI()
+            app.include_router(router)
+            tc = TestClient(app)
+            listed = tc.get("/api/ohlcv/quality/reports")
+            _assert(listed.status_code == 200, listed.text)
+            body = listed.json()
+            ids = [item["id"] for item in body["reports"]]
+            _assert(ids[0] == later.path.name, f"newest first {ids}")
+            _assert("20260101-000000" in ids, "bad schema still listed")
+            _assert(body["reports"][0]["markets"]["nfo"]["as_of"] == "2026-03-02", body)
+
+            missing = tc.get("/api/ohlcv/quality/reports/20260102-000000")
+            _assert(missing.status_code == 404, missing.text)
+
+            stale = tc.get("/api/ohlcv/quality/reports/20260101-000000")
+            _assert(stale.status_code == 503, stale.text)
+
+            full = tc.get(f"/api/ohlcv/quality/reports/{later.path.name}/summary")
+            _assert(full.status_code == 200, full.text)
+            full_body = full.json()
+            _assert(full_body["days"] is None, full_body)
+            _assert(full_body["level"] == "market", full_body)
+            _assert(len(full_body["rows"]) == 1, full_body)
+            _assert(abs(full_body["rows"][0]["minute_pct"] - (60 / 61 * 100)) < 0.01, full_body)
+
+            narrow = tc.get(
+                f"/api/ohlcv/quality/reports/{later.path.name}/summary?days=60&market=nfo"
+            )
+            _assert(narrow.status_code == 200, narrow.text)
+            narrow_body = narrow.json()
+            _assert(narrow_body["level"] == "underlying", narrow_body)
+            _assert(narrow_body["rows"][0]["minute_pct"] == 100.0, narrow_body)
+            _assert(narrow_body["rows"][0]["underlying"] == "CRUDEOIL", narrow_body)
+
+            bad_days = tc.get(f"/api/ohlcv/quality/reports/{later.path.name}/summary?days=0")
+            _assert(bad_days.status_code == 400, bad_days.text)
+
+            detail = tc.get(
+                f"/api/ohlcv/quality/reports/{later.path.name}/contract?token=7&market=nfo"
+            )
+            _assert(detail.status_code == 200, detail.text)
+            detail_body = detail.json()
+            _assert(detail_body["traded_without_minute"] == ["2026-01-01"], detail_body)
+            _assert(detail_body["gap_dates"] == [], detail_body)
+            _assert(detail_body["row"]["minute_days"] == 60, detail_body)
+
+            absent = tc.get(
+                f"/api/ohlcv/quality/reports/{later.path.name}/contract?token=999"
+            )
+            _assert(absent.status_code == 404, absent.text)
+
+            quality_mod.REPORTS_DIR = root / "empty-reports"
+            (root / "empty-reports").mkdir()
+            empty = tc.get("/api/ohlcv/quality/reports")
+            _assert(empty.status_code == 200, empty.text)
+            _assert(empty.json()["reports"] == [], empty.text)
+        finally:
+            quality_mod.REPORTS_DIR = old
+
+
 def main() -> None:
     tests = [
         test_paths,
@@ -3784,6 +3912,7 @@ def main() -> None:
         test_catalog_readonly_open,
         test_quality_coverage_rules,
         test_quality_days_window,
+        test_quality_api,
     ]
     failed = 0
     for fn in tests:

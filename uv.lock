@@ -640,6 +640,7 @@ dependencies = [
     { name = "httpx" },
     { name = "instruments" },
     { name = "kitetools" },
+    { name = "ohlcv" },
     { name = "preopen" },
     { name = "uvicorn" },
 ]
@@ -651,6 +652,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "instruments", editable = "instruments" },
     { name = "kitetools", editable = "." },
+    { name = "ohlcv", editable = "ohlcv" },
     { name = "preopen", editable = "preopen" },
     { name = "uvicorn", specifier = ">=0.32.0" },
 ]

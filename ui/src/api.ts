@@ -11,6 +11,10 @@ import type {
   PortfolioPayload,
   PreopenDayPayload,
   PreopenDaysResult,
+  QualityContract,
+  QualityReportMeta,
+  QualityReportsResult,
+  QualitySummary,
   SnapshotsList,
 } from "./types";
 
@@ -138,6 +142,48 @@ export function getNfoChain(
   const sp = new URLSearchParams({ underlying, expiry });
   return apiFetch<OptionChainResult>(
     `/api/instruments/nfo/chain?${sp.toString()}`,
+  );
+}
+
+export function listQualityReports(): Promise<QualityReportsResult> {
+  return apiFetch<QualityReportsResult>("/api/ohlcv/quality/reports");
+}
+
+export function getQualityReport(id: string): Promise<QualityReportMeta> {
+  return apiFetch<QualityReportMeta>(`/api/ohlcv/quality/reports/${id}`);
+}
+
+export function getQualitySummary(
+  id: string,
+  params?: {
+    days?: number | null;
+    market?: string;
+    underlying?: string;
+    expiry?: string;
+  },
+): Promise<QualitySummary> {
+  const sp = new URLSearchParams();
+  if (params?.days != null) sp.set("days", String(params.days));
+  if (params?.market) sp.set("market", params.market);
+  if (params?.underlying) sp.set("underlying", params.underlying);
+  if (params?.expiry) sp.set("expiry", params.expiry);
+  const q = sp.toString();
+  return apiFetch<QualitySummary>(
+    `/api/ohlcv/quality/reports/${id}/summary${q ? `?${q}` : ""}`,
+  );
+}
+
+export function getQualityContract(
+  id: string,
+  token: number,
+  params?: { days?: number | null; market?: string },
+): Promise<QualityContract> {
+  const sp = new URLSearchParams();
+  sp.set("token", String(token));
+  if (params?.days != null) sp.set("days", String(params.days));
+  if (params?.market) sp.set("market", params.market);
+  return apiFetch<QualityContract>(
+    `/api/ohlcv/quality/reports/${id}/contract?${sp.toString()}`,
   );
 }
 

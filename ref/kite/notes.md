@@ -333,6 +333,10 @@ uv run ohlcv quality show [--report yyyymmdd-HHMMSS] [--days N] [--market nfo] [
 - `contract(market, token, underlying, expiry, tradingsymbol, instrument_type, strike, lot_size, in_catalog)` — series-file identity, plus catalog rows that have no parquet
 - `contract_day(market, token, trade_date, day_volume, minute_bars)` — a row only when a day bar and/or a minute candle exists. `day_volume` null means minute rows without a day bar. Gaps are derived at show time.
 
+### UI
+
+`uv run portfolio serve` then open `/quality` (dev: Vite on port 5173). The page only reads saved snapshots. Pick a report, then a window (`days` query param: omitted = full span, or `60` / `90` / any N). Drill market → underlying → expiry → contract. Refresh the list after generating a new snapshot; the page does not scan parquet and does not run `ohlcv quality`.
+
 ### Offline check
 
 `uv run python -m ohlcv.selftest` (quality snapshot cases).

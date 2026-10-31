@@ -66,6 +66,12 @@ export default function TopBar() {
           Pre-open
         </NavLink>
         <NavLink
+          to="/quality"
+          className={({ isActive }) => (isActive ? "active" : undefined)}
+        >
+          Quality
+        </NavLink>
+        <NavLink
           to="/instruments"
           className={({ isActive }) => (isActive ? "active" : undefined)}
         >
