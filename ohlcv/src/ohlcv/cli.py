@@ -1625,10 +1625,18 @@ def _quality_label(row, level: str) -> str:
     return f"{row.token} {row.tradingsymbol}{flag}"
 
 
+def _quality_ttq(value: int) -> str:
+    return f"{value:,}"
+
+
+def _quality_ttv(value: float) -> str:
+    return f"{value:,.2f}"
+
+
 def _print_quality_table(rows, level: str) -> None:
     print(
         f"{'name':<36} {'sess':>6} {'bars':>6} {'gaps':>6} "
-        f"{'traded':>7} {'minute':>7} {'min%':>6}"
+        f"{'traded':>7} {'minute':>7} {'min%':>6} {'ttq':>16} {'ttv':>18}"
     )
     if not rows:
         print("(none)")
@@ -1636,7 +1644,8 @@ def _print_quality_table(rows, level: str) -> None:
     for row in rows:
         print(
             f"{_quality_label(row, level):<36} {row.session_days:>6} {row.day_bars:>6} "
-            f"{row.day_gaps:>6} {row.traded_days:>7} {row.minute_days:>7} {_quality_pct(row):>6}"
+            f"{row.day_gaps:>6} {row.traded_days:>7} {row.minute_days:>7} {_quality_pct(row):>6} "
+            f"{_quality_ttq(row.ttq):>16} {_quality_ttv(row.ttv):>18}"
         )
 
 
@@ -1717,7 +1726,8 @@ def _cmd_quality_show(args: argparse.Namespace) -> None:
                     print("  no day data")
                 print(
                     f"  sess={row.session_days} bars={row.day_bars} gaps={row.day_gaps} "
-                    f"traded={row.traded_days} minute={row.minute_days} min%={_quality_pct(row)}"
+                    f"traded={row.traded_days} minute={row.minute_days} min%={_quality_pct(row)} "
+                    f"ttq={_quality_ttq(row.ttq)} ttv={_quality_ttv(row.ttv)}"
                 )
                 print("  Gap dates:")
                 if item.gap_dates:

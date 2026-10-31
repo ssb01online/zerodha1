@@ -284,6 +284,8 @@ export interface QualityRow {
   traded_days: number;
   minute_days: number;
   minute_pct: number | null;
+  ttq: number;
+  ttv: number;
   no_day_data: boolean;
 }
 

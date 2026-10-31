@@ -326,12 +326,13 @@ uv run ohlcv quality show [--report yyyymmdd-HHMMSS] [--days N] [--market nfo] [
 - Day gaps are session days in the slice with no day bar. Traded days are day bars with `volume > 0`. Minute coverage is traded days that have at least one minute candle, divided by traded days. A `volume = 0` day is not a minute obligation.
 - Drill-down follows the filters: no market filter prints markets; `--market` prints underlyings; `--underlying` prints expiries; `--expiry` prints contracts. `--token` prints that contract's totals plus gap dates and traded dates with no minute bar.
 - Market, underlying, and expiry rows sum the contract day counts. A catalog contract with no day bars is "no day data" (zeros), not a full-calendar gap.
+- **TTQ** is the sum of day-bar `volume` in the same window (quantity as stored, not lots). **TTV** is the sum of day-bar `volume * close`. A `volume = 0` day, a day gap, and a minute-only row add nothing. Minute bars are not used for either sum. Quote-snapshot `average_price` is not on these files. Parent levels sum the contract figures. Schema 1 snapshots have no turnover columns; regenerate with `ohlcv quality`.
 
-### Tables (`quality.duckdb`, schema_version 1)
+### Tables (`quality.duckdb`, schema_version 2)
 
 - `session_day(market, trade_date)`
 - `contract(market, token, underlying, expiry, tradingsymbol, instrument_type, strike, lot_size, in_catalog)` — series-file identity, plus catalog rows that have no parquet
-- `contract_day(market, token, trade_date, day_volume, minute_bars)` — a row only when a day bar and/or a minute candle exists. `day_volume` null means minute rows without a day bar. Gaps are derived at show time.
+- `contract_day(market, token, trade_date, day_volume, day_close, minute_bars)` — a row only when a day bar and/or a minute candle exists. `day_volume` and `day_close` are null when the row is minute-only. `day_close` is `arg_max(close, ts)` for that token and date. Gaps are derived at show time.
 
 ### UI
 

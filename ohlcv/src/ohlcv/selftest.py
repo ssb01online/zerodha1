@@ -3410,6 +3410,7 @@ def _quality_bar(
     volume: int,
     *,
     strike: float = 0.0,
+    close: float = 1.0,
 ) -> tuple:
     return (
         underlying,
@@ -3420,10 +3421,10 @@ def _quality_bar(
         strike,
         1,
         ts,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
+        close,
+        close,
+        close,
+        close,
         volume,
         0,
     )
@@ -3447,7 +3448,16 @@ def test_quality_coverage_rules() -> None:
             return datetime(day.year, day.month, day.day, 9, 15)
 
         nifty_day = [
-            _quality_bar("NIFTY", exp_long, 1, "NIFTY26OCTFUT", "FUT", day_ts(date(2026, 10, 5)), 100),
+            _quality_bar(
+                "NIFTY",
+                exp_long,
+                1,
+                "NIFTY26OCTFUT",
+                "FUT",
+                day_ts(date(2026, 10, 5)),
+                100,
+                close=2.0,
+            ),
             _quality_bar("NIFTY", exp_long, 1, "NIFTY26OCTFUT", "FUT", day_ts(date(2026, 10, 6)), 50),
             _quality_bar("NIFTY", exp_long, 1, "NIFTY26OCTFUT", "FUT", day_ts(date(2026, 10, 7)), 0),
         ]
@@ -3561,7 +3571,7 @@ def test_quality_coverage_rules() -> None:
             "report id",
         )
         manifest = quality_mod.load_manifest(report.path)
-        _assert(manifest["schema_version"] == 1, "schema")
+        _assert(manifest["schema_version"] == 2, "schema")
         _assert(manifest["markets"]["nfo"]["as_of"] == "2026-10-09", "as_of")
 
         con = quality_mod.connect_report(report.path)
@@ -3601,6 +3611,8 @@ def test_quality_coverage_rules() -> None:
             _assert(nifty.row.traded_days == 2, f"nifty traded={nifty.row.traded_days}")
             _assert(nifty.row.minute_days == 1, f"nifty minute={nifty.row.minute_days}")
             _assert(nifty.row.minute_pct == 50.0, f"nifty pct={nifty.row.minute_pct}")
+            _assert(nifty.row.ttq == 150, f"nifty ttq={nifty.row.ttq}")
+            _assert(nifty.row.ttv == 250.0, f"nifty ttv={nifty.row.ttv}")
             _assert(nifty.gap_dates == (date(2026, 10, 9),), f"gaps={nifty.gap_dates}")
             _assert(
                 nifty.traded_without_minute == (date(2026, 10, 6),),
@@ -3613,6 +3625,7 @@ def test_quality_coverage_rules() -> None:
             _assert(narrow.row.day_bars == 0, "N=1 bars")
             _assert(narrow.row.day_gaps == 1, "N=1 gap")
             _assert(narrow.row.traded_days == 0, "N=1 traded")
+            _assert(narrow.row.ttq == 0 and narrow.row.ttv == 0.0, "N=1 drops older turnover")
             _assert(narrow.gap_dates == (date(2026, 10, 9),), "N=1 gap date")
 
             short = quality_mod.contract_slices(con, market="nfo", token=4)[0]
@@ -3630,6 +3643,7 @@ def test_quality_coverage_rules() -> None:
             _assert(empty[0].no_day_data, "no day data")
             _assert(empty[0].session_days == 0 and empty[0].day_gaps == 0, "no invented gaps")
             _assert(empty[0].minute_pct is None, "no traded days")
+            _assert(empty[0].ttq == 0 and empty[0].ttv == 0.0, "no turnover without day bars")
 
             contracts = quality_mod.summarize(con, market="nfo", level="contract")
             market_rows = quality_mod.summarize(con, market="nfo", level="market")
@@ -3646,11 +3660,20 @@ def test_quality_coverage_rules() -> None:
                 market_rows[0].minute_days == sum(row.minute_days for row in contracts),
                 "market sums minute days",
             )
+            _assert(
+                market_rows[0].ttq == sum(row.ttq for row in contracts),
+                "market sums ttq",
+            )
+            _assert(
+                abs(market_rows[0].ttv - sum(row.ttv for row in contracts)) < 0.01,
+                "market sums ttv",
+            )
             under = quality_mod.summarize(
                 con, market="nfo", underlying="NIFTY", level="expiry"
             )
             _assert(len(under) == 1 and under[0].expiry == exp_long, "series row")
             _assert(under[0].minute_days == nifty.row.minute_days, "series rolls up contract")
+            _assert(under[0].ttq == nifty.row.ttq and under[0].ttv == nifty.row.ttv, "series rolls up turnover")
 
             raised = False
             try:
@@ -3723,6 +3746,8 @@ def test_quality_days_window() -> None:
             _assert(window.row.minute_days == 60, f"N=60 minute={window.row.minute_days}")
             _assert(window.row.minute_pct == 100.0, "N=60 complete")
             _assert(window.traded_without_minute == (), "N=60 has no minute gaps")
+            _assert(full.row.ttq == 610 and full.row.ttv == 610.0, "full turnover")
+            _assert(window.row.ttq == 600 and window.row.ttv == 600.0, "N=60 drops oldest day")
         finally:
             con.close()
 
@@ -3788,7 +3813,7 @@ def test_quality_api() -> None:
         bad = reports / "20260101-000000"
         bad.mkdir()
         (bad / "manifest.json").write_text(
-            json.dumps({"schema_version": 2, "generated_at": "x", "markets": {}}),
+            json.dumps({"schema_version": 1, "generated_at": "x", "markets": {}}),
             encoding="utf-8",
         )
 
@@ -3819,6 +3844,8 @@ def test_quality_api() -> None:
             _assert(full_body["level"] == "market", full_body)
             _assert(len(full_body["rows"]) == 1, full_body)
             _assert(abs(full_body["rows"][0]["minute_pct"] - (60 / 61 * 100)) < 0.01, full_body)
+            _assert(full_body["rows"][0]["ttq"] == 610, full_body)
+            _assert(full_body["rows"][0]["ttv"] == 610.0, full_body)
 
             narrow = tc.get(
                 f"/api/ohlcv/quality/reports/{later.path.name}/summary?days=60&market=nfo"
@@ -3827,6 +3854,7 @@ def test_quality_api() -> None:
             narrow_body = narrow.json()
             _assert(narrow_body["level"] == "underlying", narrow_body)
             _assert(narrow_body["rows"][0]["minute_pct"] == 100.0, narrow_body)
+            _assert(narrow_body["rows"][0]["ttq"] == 600, narrow_body)
             _assert(narrow_body["rows"][0]["underlying"] == "CRUDEOIL", narrow_body)
 
             bad_days = tc.get(f"/api/ohlcv/quality/reports/{later.path.name}/summary?days=0")

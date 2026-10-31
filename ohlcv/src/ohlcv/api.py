@@ -96,6 +96,8 @@ def _row_payload(row: quality_mod.QualityRow) -> dict[str, Any]:
         "traded_days": row.traded_days,
         "minute_days": row.minute_days,
         "minute_pct": row.minute_pct,
+        "ttq": row.ttq,
+        "ttv": row.ttv,
         "no_day_data": row.no_day_data,
     }
 

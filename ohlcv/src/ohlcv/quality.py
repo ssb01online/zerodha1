@@ -6,6 +6,8 @@ is written.
 
 A session day is any date that appears in that market's day parquet. A traded
 day (day volume > 0) is minute-complete when at least one minute candle exists.
+TTQ is the sum of day-bar volume in the window. TTV is the sum of
+day-bar volume times close.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from . import catalog
 from .markets import MARKETS, get_market
 from .paths import REPORTS_DIR, ensure_dir, paths_for
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _REPORT_ID = re.compile(r"^\d{8}-\d{6}(?:-\d+)?$")
 
 _LEVELS = ("market", "underlying", "expiry", "contract")
@@ -68,6 +70,8 @@ class QualityRow:
     day_gaps: int
     traded_days: int
     minute_days: int
+    ttq: int
+    ttv: float
     no_day_data: bool
 
     @property
@@ -182,6 +186,7 @@ def _create_schema(con: duckdb.DuckDBPyConnection) -> None:
             token BIGINT NOT NULL,
             trade_date DATE NOT NULL,
             day_volume BIGINT,
+            day_close DOUBLE,
             minute_bars INTEGER NOT NULL,
             PRIMARY KEY (market, token, trade_date)
         )
@@ -199,7 +204,8 @@ def _create_schema(con: duckdb.DuckDBPyConnection) -> None:
             strike DOUBLE,
             lot_size INTEGER,
             trade_date DATE NOT NULL,
-            day_volume BIGINT
+            day_volume BIGINT,
+            day_close DOUBLE
         )
         """
     )
@@ -235,7 +241,8 @@ def _insert_day_file(con: duckdb.DuckDBPyConnection, market: str, path: Path) ->
             any_value(CAST(strike AS DOUBLE)),
             any_value(CAST(lot_size AS INTEGER)),
             CAST(ts AS DATE) AS trade_date,
-            MAX(CAST(volume AS BIGINT)) AS day_volume
+            MAX(CAST(volume AS BIGINT)) AS day_volume,
+            arg_max(CAST(close AS DOUBLE), ts) AS day_close
         FROM read_parquet(?)
         WHERE token IS NOT NULL AND ts IS NOT NULL
         GROUP BY token, CAST(ts AS DATE)
@@ -318,15 +325,21 @@ def _finalize_facts(con: duckdb.DuckDBPyConnection) -> None:
     )
     con.execute(
         """
-        INSERT INTO contract_day (market, token, trade_date, day_volume, minute_bars)
+        INSERT INTO contract_day (market, token, trade_date, day_volume, day_close, minute_bars)
         SELECT
             COALESCE(d.market, m.market),
             COALESCE(d.token, m.token),
             COALESCE(d.trade_date, m.trade_date),
             d.day_volume,
+            d.day_close,
             COALESCE(m.minute_bars, 0)
         FROM (
-            SELECT market, token, trade_date, MAX(day_volume) AS day_volume
+            SELECT
+                market,
+                token,
+                trade_date,
+                MAX(day_volume) AS day_volume,
+                arg_max(day_close, COALESCE(day_volume, -1)) AS day_close
             FROM raw_day
             GROUP BY market, token, trade_date
         ) d
@@ -611,7 +624,21 @@ metrics AS (
                 END
             ),
             0
-        ) AS minute_days
+        ) AS minute_days,
+        COALESCE(
+            SUM(CASE WHEN cd.day_volume IS NOT NULL THEN cd.day_volume ELSE 0 END),
+            0
+        ) AS ttq,
+        COALESCE(
+            SUM(
+                CASE
+                    WHEN cd.day_volume IS NOT NULL
+                    THEN cd.day_volume * COALESCE(cd.day_close, 0)
+                    ELSE 0
+                END
+            ),
+            0
+        ) AS ttv
     FROM contract c
     LEFT JOIN first_bar fb
         ON fb.market = c.market AND fb.token = c.token
@@ -650,7 +677,9 @@ def _row_from_contract(record: tuple[Any, ...]) -> QualityRow:
         day_gaps=int(record[9] or 0),
         traded_days=int(record[10] or 0),
         minute_days=int(record[11] or 0),
-        no_day_data=bool(record[12]),
+        ttq=int(record[12] or 0),
+        ttv=float(record[13] or 0),
+        no_day_data=bool(record[14]),
     )
 
 
@@ -671,6 +700,8 @@ def _row_from_rollup(record: tuple[Any, ...], *, level: str) -> QualityRow:
         day_gaps=int(record[5] or 0),
         traded_days=int(record[6] or 0),
         minute_days=int(record[7] or 0),
+        ttq=int(record[8] or 0),
+        ttv=float(record[9] or 0),
         no_day_data=False,
     )
 
@@ -698,7 +729,7 @@ def summarize(
             WITH {cte}
             SELECT
                 market, underlying, expiry, token, tradingsymbol, instrument_type, strike,
-                session_days, day_bars, day_gaps, traded_days, minute_days, no_day_data
+                session_days, day_bars, day_gaps, traded_days, minute_days, ttq, ttv, no_day_data
             FROM metrics
             ORDER BY market, underlying, expiry, instrument_type, strike, token
         """
@@ -737,7 +768,9 @@ def summarize(
             SUM(day_bars),
             SUM(day_gaps),
             SUM(traded_days),
-            SUM(minute_days)
+            SUM(minute_days),
+            SUM(ttq),
+            SUM(ttv)
         FROM metrics
         GROUP BY {group}
         ORDER BY {order}
@@ -764,6 +797,8 @@ def summarize(
                     day_gaps=0,
                     traded_days=0,
                     minute_days=0,
+                    ttq=0,
+                    ttv=0.0,
                     no_day_data=False,
                 )
             )
@@ -790,7 +825,7 @@ def contract_slices(
         WITH {_metrics_sql(where)}
         SELECT
             market, underlying, expiry, token, tradingsymbol, instrument_type, strike,
-            session_days, day_bars, day_gaps, traded_days, minute_days, no_day_data
+            session_days, day_bars, day_gaps, traded_days, minute_days, ttq, ttv, no_day_data
         FROM metrics
         ORDER BY market, underlying, expiry, token
     """

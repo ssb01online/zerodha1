@@ -8,7 +8,7 @@ import {
 } from "../api";
 import DataTable, { type Column } from "../components/DataTable";
 import ErrorBanner from "../components/ErrorBanner";
-import { formatIst } from "../format";
+import { formatInrCompact, formatIst, formatQty } from "../format";
 import type { QualityContract, QualityReportMeta, QualityRow, QualitySummary } from "../types";
 
 const DAY_PRESETS = [60, 90] as const;
@@ -261,6 +261,20 @@ export default function QualityPage() {
         sortValue: (row) => row.minute_pct,
         cell: (row) => formatPct(row.minute_pct),
       },
+      {
+        key: "ttq",
+        header: "TTQ",
+        align: "right",
+        sortValue: (row) => row.ttq,
+        cell: (row) => formatQty(row.ttq),
+      },
+      {
+        key: "ttv",
+        header: "TTV",
+        align: "right",
+        sortValue: (row) => row.ttv,
+        cell: (row) => formatInrCompact(row.ttv),
+      },
     );
     return cols;
   }, [level, writeParams]);
@@ -467,7 +481,8 @@ export default function QualityPage() {
                 Session {formatCount(contract.row.session_days)} · Day bars{" "}
                 {formatCount(contract.row.day_bars)} · Gaps {formatCount(contract.row.day_gaps)} ·
                 Traded {formatCount(contract.row.traded_days)} · Minute{" "}
-                {formatCount(contract.row.minute_days)} · {formatPct(contract.row.minute_pct)}
+                {formatCount(contract.row.minute_days)} · {formatPct(contract.row.minute_pct)} · TTQ{" "}
+                {formatQty(contract.row.ttq)} · TTV {formatInrCompact(contract.row.ttv)}
               </p>
               <div className="quality-date-grid">
                 <div>
