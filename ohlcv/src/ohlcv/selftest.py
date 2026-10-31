@@ -2826,6 +2826,35 @@ def test_setup_run_logging_writes_file() -> None:
         _assert("log_file=" in text, "startup line")
 
 
+def test_eod_reporter_logs_plan() -> None:
+    """ohlcv eod progress reporter writes milestones into the run log."""
+    from .progress import ProgressReporter
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "eod.log"
+        setup_run_logging("eod", log_file=path)
+        reporter = ProgressReporter(logger=__import__("logging").getLogger("ohlcv"))
+        day = date(2026, 10, 27)
+        after = datetime(2026, 10, 27, 16, 15, tzinfo=auth.IST)
+        eod_mod.run_eod(
+            markets=["nfo"],
+            trade_date=day,
+            now=after,
+            no_wait=True,
+            dry_run=True,
+            reporter=reporter,
+        )
+        log = __import__("logging").getLogger("ohlcv")
+        for h in list(log.handlers):
+            h.flush()
+            h.close()
+        log.handlers.clear()
+        text = path.read_text(encoding="utf-8")
+        _assert("trade_date=20261027" in text, f"plan in log: {text[:200]!r}")
+        _assert("=== NFO ===" in text, "market header in log")
+        _assert("log_file=" in text, "startup line")
+
+
 def test_interrupt_soft_then_force() -> None:
     ctrl = InterruptController()
     announced: list[str] = []
@@ -3384,6 +3413,7 @@ def main() -> None:
         test_fetch_gave_up_expired_contract,
         test_fetch_max_series,
         test_setup_run_logging_writes_file,
+        test_eod_reporter_logs_plan,
         test_interrupt_soft_then_force,
         test_fetch_soft_interrupt_commits_and_stops,
         test_status_counts_and_pending,

@@ -1517,7 +1517,8 @@ def cmd_eod(args: argparse.Namespace) -> None:
     from . import fetch_lock
     from . import planner
     from .client import SessionExpired
-    from .progress import InterruptController
+    from .paths import EOD_DIR
+    from .progress import InterruptController, ProgressReporter, setup_run_logging
 
     try:
         markets = eod_mod.parse_markets_arg(getattr(args, "markets", None))
@@ -1535,8 +1536,15 @@ def cmd_eod(args: argparse.Namespace) -> None:
     horizon_days = int(getattr(args, "horizon_days", eod_mod.DEFAULT_HORIZON_DAYS))
     if horizon_days < 0:
         raise SystemExit(f"horizon-days must be >= 0, got {horizon_days}")
+
+    log_path = setup_run_logging(
+        "eod",
+        log_file=_optional_log_path(args),
+        logs_dir=EOD_DIR,
+    )
+    reporter = ProgressReporter(logger=logging.getLogger("ohlcv"))
     interrupt = InterruptController()
-    interrupt.install()
+    interrupt.install(on_soft_stop=reporter.soft_stop_announced)
     try:
         if catch_up:
             eod_mod.run_catchup(
@@ -1551,6 +1559,7 @@ def cmd_eod(args: argparse.Namespace) -> None:
                 horizon_days=horizon_days,
                 interrupt=interrupt,
                 should_stop=interrupt.should_stop,
+                reporter=reporter,
             )
         else:
             eod_mod.run_eod(
@@ -1566,19 +1575,27 @@ def cmd_eod(args: argparse.Namespace) -> None:
                 horizon_days=horizon_days,
                 interrupt=interrupt,
                 should_stop=interrupt.should_stop,
+                reporter=reporter,
             )
+        print(f"Log: {log_path}")
     except eod_mod.EodFailed as exc:
+        print(f"Log: {log_path}")
         raise SystemExit(str(exc)) from exc
     except eod_mod.CatchupInProgress as exc:
+        print(f"Log: {log_path}")
         raise SystemExit(str(exc)) from exc
     except fetch_lock.FetchInProgress as exc:
+        print(f"Log: {log_path}")
         raise SystemExit(fetch_lock.format_in_progress(exc)) from exc
     except (auth.NotLoggedIn, TokenException, SessionExpired) as exc:
+        print(f"Log: {log_path}")
         _login_exit(exc)
     except KeyboardInterrupt as exc:
+        print(f"Log: {log_path}")
         raise SystemExit(f"stopped: {exc}") from exc
     finally:
         interrupt.restore()
+        reporter.clear_heartbeat()
 
 
 def main() -> None:
@@ -1938,6 +1955,15 @@ def main() -> None:
         default="60",
         metavar="N|all",
         help="Minute backfill window (default: 60).",
+    )
+    p_eod.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write run log to PATH "
+            "(default: data/ohlcv/_eod/eod_YYYYMMDD_HHMMSS.log)."
+        ),
     )
     _add_types_arg(p_eod)
     p_eod.set_defaults(func=cmd_eod)

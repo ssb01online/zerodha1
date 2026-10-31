@@ -28,6 +28,7 @@ from .catalog import ContractRow, UnderlyingRank
 from .client import KiteClient, RequestRejected, RetryExhausted, SessionExpired
 from .markets import MARKETS, MarketProfile, get_market
 from .paths import EOD_DIR, ensure_dir, paths_for, ymd
+from .progress import InterruptController, ProgressReporter
 from .settings import QUOTE_BATCH_SIZE
 from .universe import Series
 
@@ -507,6 +508,14 @@ def ensure_token() -> None:
     auth.load_token()
 
 
+def _emit(reporter: ProgressReporter | None, message: str) -> None:
+    """Milestone line: log file + stderr when reporter is set, else stdout print."""
+    if reporter is not None:
+        reporter.note(message)
+    else:
+        print(message)
+
+
 def run_market_eod(
     market_id: str,
     *,
@@ -527,10 +536,9 @@ def run_market_eod(
     client: KiteClient | None = None,
     fetch_cmd: str = "ohlcv eod",
     fetch_lock_path: Path | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> dict:
     """Run sync → daily → fetch for one market. Returns a summary dict."""
-    from .progress import InterruptController
-
     if horizon_days < 0:
         raise ValueError(f"horizon_days must be >= 0, got {horizon_days}")
     profile = get_market(market_id)
@@ -574,6 +582,7 @@ def run_market_eod(
             stop=_stop,
             fetch_cmd=fetch_cmd,
             fetch_lock_path=fetch_lock_path,
+            reporter=reporter,
         )
     finally:
         if own_ctrl:
@@ -603,6 +612,7 @@ def _run_market_eod_body(
     stop: Callable[[], str | None],
     fetch_cmd: str = "ohlcv eod",
     fetch_lock_path: Path | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> dict:
     # --no-wait skips not-yet-ready markets (including dry-run). dry-run never sleeps.
     # --force proceeds early (may be intraday).
@@ -616,9 +626,10 @@ def _run_market_eod_body(
             if on_heartbeat is not None:
                 on_heartbeat(left, target)
             else:
-                print(
+                _emit(
+                    reporter,
                     f"  waiting for {market_id} ready {target.strftime('%H:%M')} IST "
-                    f"({_format_wait(left)} left)"
+                    f"({_format_wait(left)} left)",
                 )
 
         now = wait_until(
@@ -690,7 +701,7 @@ def _run_market_eod_body(
             archive_mod.ensure_archive()
             allowed = universe.resolve_types_filter(types)
             count = universe.sync_contracts(con, market=market_id, allowed_types=allowed)
-            print(f"  synced {count} {profile.exchange} contracts")
+            _emit(reporter, f"  synced {count} {profile.exchange} contracts")
 
             if client is None:
                 client = KiteClient(auth.get_kite())
@@ -700,6 +711,20 @@ def _run_market_eod_body(
                 con, trade_date, calendar_today=calendar_today
             )
             daily_status: str | None = None
+            snap_t0 = time.monotonic()
+
+            def _on_quote_batch(bi: int, bt: int, done: int, total: int) -> None:
+                if reporter is None:
+                    return
+                reporter.batch(
+                    batch_index=bi,
+                    batch_total=bt,
+                    contracts_done=done,
+                    contracts_total=total,
+                    requests=client.counters.requests,
+                    elapsed_s=time.monotonic() - snap_t0,
+                )
+
             try:
                 result = snapshot.take_snapshot(
                     client,
@@ -710,16 +735,22 @@ def _run_market_eod_body(
                     dest_dir=mpaths.daily_dir,
                     staging_dir=mpaths.staging_dir,
                     should_stop=stop,
+                    on_batch=_on_quote_batch if reporter is not None else None,
                 )
             except snapshot.SnapshotRejected as exc:
                 # Weekend / holiday / zero volume: no daily file for trade_date, but
                 # near-term historical fetch can still catch up incomplete series.
+                if reporter is not None:
+                    reporter.clear_heartbeat()
                 if "no session today" in str(exc):
-                    print(f"  non-session: {exc}; continuing with historical fetch")
+                    _emit(
+                        reporter,
+                        f"  non-session: {exc}; continuing with historical fetch",
+                    )
                     result = None
                 else:
-                    print(f"  FAILED: {exc}")
-                    print("  download incomplete; no done marker written")
+                    _emit(reporter, f"  FAILED: {exc}")
+                    _emit(reporter, "  download incomplete; no done marker written")
                     return {
                         "market": market_id,
                         "trade_date": trade_date,
@@ -727,6 +758,8 @@ def _run_market_eod_body(
                         "daily_status": None,
                     }
             else:
+                if reporter is not None:
+                    reporter.clear_heartbeat()
                 catalog.record_snapshot(
                     con,
                     catalog.DailySnapshotMeta(
@@ -747,9 +780,10 @@ def _run_market_eod_body(
                     dest_dir=mpaths.daily_dir,
                 )
                 daily_status = result.status
-                print(
+                _emit(
+                    reporter,
                     f"  daily {ymd(result.trade_date)} status={result.status} "
-                    f"traded={result.traded_contracts}/{result.contracts}"
+                    f"traded={result.traded_contracts}/{result.contracts}",
                 )
 
             series_day = select_eod_series(
@@ -808,6 +842,49 @@ def _run_market_eod_body(
                 if (item.underlying, item.expiry) in series_by_key
             ]
 
+            on_series = None
+            on_contract = None
+            on_series_start = None
+            if reporter is not None:
+                contracts_total = sum(len(s.contracts) for s in queue_series)
+                reporter.set_totals(contracts_total=max(1, contracts_total * 2))
+                _emit(
+                    reporter,
+                    f"  fetch queue: {len(queue_series)} series, "
+                    f"{contracts_total} contracts (day then minute)",
+                )
+
+                def _on_series_start(idx: int, total: int, s: Series) -> None:
+                    reporter.series_start(
+                        series_index=idx,
+                        series_total=total,
+                        underlying=s.underlying,
+                        expiry=s.expiry,
+                        contracts=len(s.contracts),
+                    )
+
+                def _on_series(idx: int, total: int, result: fetch_mod.SeriesResult) -> None:
+                    reporter.series_done(
+                        series_index=idx,
+                        series_total=total,
+                        underlying=result.underlying,
+                        expiry=result.expiry,
+                        contracts=result.contracts,
+                        fetched=result.fetched,
+                        skipped=result.skipped,
+                        errors=result.errors,
+                        rows=result.rows,
+                        elapsed_s=result.elapsed_s,
+                        locked=result.locked,
+                        stop_reason=result.stop_reason,
+                    )
+
+                on_series_start = _on_series_start
+                on_series = _on_series
+                on_contract = reporter.contract
+
+            if reporter is not None:
+                _emit(reporter, "  Pass 1/2: day candles")
             day_results = fetch_mod.run_fetch(
                 client,
                 con,
@@ -821,12 +898,20 @@ def _run_market_eod_body(
                 staging_dir=mpaths.staging_dir,
                 market=market_id,
                 interrupt=ctrl,
+                on_series=on_series,
+                on_contract=on_contract,
+                on_series_start=on_series_start,
             )
-            print(
+            if reporter is not None:
+                reporter.clear_heartbeat()
+            _emit(
+                reporter,
                 f"  day fetch: series={day_results.series_done} "
-                f"fetched={day_results.contracts_fetched} err={day_results.errors}"
+                f"fetched={day_results.contracts_fetched} err={day_results.errors}",
             )
 
+            if reporter is not None:
+                _emit(reporter, "  Pass 2/2: minute candles")
             minute_results = fetch_mod.run_fetch(
                 client,
                 con,
@@ -842,16 +927,22 @@ def _run_market_eod_body(
                 backfill_days=backfill_days,
                 market=market_id,
                 interrupt=ctrl,
+                on_series=on_series,
+                on_contract=on_contract,
+                on_series_start=on_series_start,
             )
-            print(
+            if reporter is not None:
+                reporter.clear_heartbeat()
+            _emit(
+                reporter,
                 f"  minute fetch: series={minute_results.series_done} "
-                f"fetched={minute_results.contracts_fetched} err={minute_results.errors}"
+                f"fetched={minute_results.contracts_fetched} err={minute_results.errors}",
             )
 
             failure = download_failure_reason(day_results, minute_results)
             if failure is not None:
-                print(f"  FAILED: {failure}")
-                print("  download incomplete; no done marker written")
+                _emit(reporter, f"  FAILED: {failure}")
+                _emit(reporter, "  download incomplete; no done marker written")
                 return {
                     "market": market_id,
                     "trade_date": trade_date,
@@ -879,13 +970,14 @@ def _run_market_eod_body(
             rows = [r for r in rows if (r.underlying, r.expiry) in eod_keys]
             totals = status_mod.totals(rows) if rows else None
             if totals is not None:
-                print(
+                _emit(
+                    reporter,
                     f"  status: {totals.series} series, {totals.complete_pct:.0f}% complete, "
-                    f"{totals.pending_requests} pending"
+                    f"{totals.pending_requests} pending",
                 )
 
             marker = mark_eod_done(market_id, trade_date)
-            print(f"  done marker: {marker}")
+            _emit(reporter, f"  done marker: {marker}")
 
             return {
                 "market": market_id,
@@ -921,6 +1013,7 @@ def run_catchup(
     interrupt: object | None = None,
     eod_dir: Path | None = None,
     lock_path: Path | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> list[dict]:
     """Run EOD only for markets already past ready that lack a ``.done`` marker.
 
@@ -937,9 +1030,10 @@ def run_catchup(
         buffer=buffer,
         eod_dir=eod_dir,
     )
-    print(
+    _emit(
+        reporter,
         f"catch-up trade_date={ymd(trade_date)} "
-        f"missed={','.join(missed) if missed else '(none)'}"
+        f"missed={','.join(missed) if missed else '(none)'}",
     )
     if not missed:
         return []
@@ -961,6 +1055,7 @@ def run_catchup(
             should_stop=should_stop,
             interrupt=interrupt,
             fetch_cmd="ohlcv eod --catch-up",
+            reporter=reporter,
         )
 
     if not try_acquire_catchup_lock(lock_path=lock_path):
@@ -984,6 +1079,7 @@ def run_catchup(
             should_stop=should_stop,
             interrupt=interrupt,
             fetch_cmd="ohlcv eod --catch-up",
+            reporter=reporter,
         )
     finally:
         release_catchup_lock(lock_path=lock_path)
@@ -1006,6 +1102,7 @@ def run_eod(
     should_stop: Callable[[], str | None] | None = None,
     interrupt: object | None = None,
     fetch_cmd: str = "ohlcv eod",
+    reporter: ProgressReporter | None = None,
 ) -> list[dict]:
     """Orchestrate EOD across markets in DEFAULT_MARKET_ORDER (filtered)."""
     if horizon_days < 0:
@@ -1046,12 +1143,18 @@ def run_eod(
         catalog_counts=catalog_counts,
         horizon_days=horizon_days,
     )
-    print(format_plan(plan))
-    print()
+    plan_text = format_plan(plan)
+    if reporter is not None:
+        for line in plan_text.splitlines():
+            reporter.note(line)
+        reporter.note("")
+    else:
+        print(plan_text)
+        print()
 
     summaries: list[dict] = []
     for mid in market_ids:
-        print(f"=== {mid.upper()} ===")
+        _emit(reporter, f"=== {mid.upper()} ===")
         try:
             summary = run_market_eod(
                 mid,
@@ -1069,24 +1172,26 @@ def run_eod(
                 should_stop=should_stop,
                 interrupt=interrupt,
                 fetch_cmd=fetch_cmd,
+                reporter=reporter,
             )
             summaries.append(summary)
             if dry_run:
-                print(
+                _emit(
+                    reporter,
                     f"  dry-run: series={summary.get('series', 0)} "
                     f"expiry_today={summary.get('expiry_today', 0)} "
-                    f"near_term={summary.get('near_term', 0)}"
+                    f"near_term={summary.get('near_term', 0)}",
                 )
         except EodSkipped as exc:
-            print(f"  skipped: {exc}")
+            _emit(reporter, f"  skipped: {exc}")
             summaries.append({"market": mid, "skipped": True, "reason": str(exc)})
         except (auth.NotLoggedIn, SessionExpired) as exc:
             raise
         except (RetryExhausted, RequestRejected) as exc:
             summaries.append({"market": mid, "error": str(exc)})
-            print(f"  FAILED: {exc}")
-            print("  download incomplete; no done marker written")
-        print()
+            _emit(reporter, f"  FAILED: {exc}")
+            _emit(reporter, "  download incomplete; no done marker written")
+        _emit(reporter, "")
     if any(s.get("error") for s in summaries):
         raise EodFailed(summaries)
     return summaries
