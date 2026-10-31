@@ -65,14 +65,15 @@ def _parse_market(market: str | None) -> str | None:
     return key
 
 
-def _level(market: str | None, underlying: str | None, expiry: date | None) -> str:
-    if expiry is not None:
-        return "contract"
-    if underlying:
-        return "expiry"
-    if market:
-        return "underlying"
-    return "market"
+def _drill_underlying(
+    underlying: str | None,
+    expiry: date | None,
+    by: str,
+) -> str | None:
+    """Expiry-first drill lists dates until an expiry is chosen."""
+    if by == "expiry" and expiry is None:
+        return None
+    return underlying
 
 
 def _iso(value: date | None) -> str | None:
@@ -162,12 +163,14 @@ def quality_summary(
     market: str | None = Query(None),
     underlying: str | None = Query(None),
     expiry: str | None = Query(None),
+    by: str | None = Query(None),
 ) -> dict[str, Any] | JSONResponse:
     try:
         path = _report_dir(report_id)
         window = _parse_days(days)
         market_id = _parse_market(market)
         expiry_date = _parse_expiry(expiry)
+        mode = quality_mod.check_by(by)
     except FileNotFoundError as exc:
         return _error(404, "quality_not_found", str(exc))
     except ValueError as exc:
@@ -178,8 +181,8 @@ def quality_summary(
     if schema_error is not None:
         return schema_error
 
-    name = (underlying or "").strip() or None
-    level = _level(market_id, name, expiry_date)
+    name = _drill_underlying((underlying or "").strip() or None, expiry_date, mode)
+    level = quality_mod.drill_level(market_id, name, expiry_date, mode)
     include = list(payload["markets"]) if level == "market" else None
     con = quality_mod.connect_report(path)
     try:

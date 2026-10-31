@@ -3675,6 +3675,73 @@ def test_quality_coverage_rules() -> None:
             _assert(under[0].minute_days == nifty.row.minute_days, "series rolls up contract")
             _assert(under[0].ttq == nifty.row.ttq and under[0].ttv == nifty.row.ttv, "series rolls up turnover")
 
+            dates = quality_mod.summarize(con, market="nfo", level="date")
+            _assert(len(dates) == 4, f"date rows={len(dates)}")
+            _assert(
+                all(row.underlying is None and row.expiry is not None for row in dates),
+                "date grain",
+            )
+            shared = next(row for row in dates if row.expiry == exp_long)
+            nifty_c = next(row for row in contracts if row.token == 1)
+            reliance_c = next(row for row in contracts if row.token == 2)
+            _assert(
+                shared.session_days == nifty_c.session_days + reliance_c.session_days,
+                "shared date sums session",
+            )
+            _assert(
+                shared.traded_days == nifty_c.traded_days + reliance_c.traded_days,
+                "shared date sums traded",
+            )
+            _assert(
+                shared.minute_days == nifty_c.minute_days + reliance_c.minute_days,
+                "shared date sums minute",
+            )
+            _assert(shared.ttq == nifty_c.ttq + reliance_c.ttq, "shared date sums ttq")
+            _assert(
+                abs(shared.ttv - (nifty_c.ttv + reliance_c.ttv)) < 0.01,
+                "shared date sums ttv",
+            )
+            split = quality_mod.summarize(
+                con, market="nfo", expiry=exp_long, level="underlying"
+            )
+            split_names = {row.underlying for row in split}
+            _assert(split_names == {"NIFTY", "RELIANCE"}, f"date splits to {split_names}")
+            _assert(all(row.expiry is None for row in split), "underlying rollup drops expiry")
+            _assert(
+                sum(row.session_days for row in split) == shared.session_days,
+                "split session matches date",
+            )
+            _assert(
+                quality_mod.drill_level("nfo", None, None, "security") == "underlying",
+                "security drill lists underlyings",
+            )
+            _assert(
+                quality_mod.drill_level("nfo", "NIFTY", None) == "expiry",
+                "default by is security",
+            )
+            _assert(
+                quality_mod.drill_level("nfo", None, None, "expiry") == "date",
+                "expiry drill lists dates",
+            )
+            _assert(
+                quality_mod.drill_level("nfo", "NIFTY", None, "expiry") == "date",
+                "underlying ignored without expiry",
+            )
+            _assert(
+                quality_mod.drill_level("nfo", None, exp_long, "expiry") == "underlying",
+                "date opens securities",
+            )
+            _assert(
+                quality_mod.drill_level("nfo", "NIFTY", exp_long, "expiry") == "contract",
+                "security on a date opens contracts",
+            )
+            raised_by = False
+            try:
+                quality_mod.check_by("foo")
+            except ValueError:
+                raised_by = True
+            _assert(raised_by, "unknown by rejected")
+
             raised = False
             try:
                 quality_mod.summarize(con, days=0)
@@ -3856,6 +3923,44 @@ def test_quality_api() -> None:
             _assert(narrow_body["rows"][0]["minute_pct"] == 100.0, narrow_body)
             _assert(narrow_body["rows"][0]["ttq"] == 600, narrow_body)
             _assert(narrow_body["rows"][0]["underlying"] == "CRUDEOIL", narrow_body)
+
+            by_date = tc.get(
+                f"/api/ohlcv/quality/reports/{later.path.name}/summary?market=nfo&by=expiry"
+            )
+            _assert(by_date.status_code == 200, by_date.text)
+            by_date_body = by_date.json()
+            _assert(by_date_body["level"] == "date", by_date_body)
+            _assert(len(by_date_body["rows"]) == 1, by_date_body)
+            _assert(by_date_body["rows"][0]["expiry"] == "2026-12-31", by_date_body)
+            _assert(by_date_body["rows"][0]["underlying"] is None, by_date_body)
+
+            by_names = tc.get(
+                f"/api/ohlcv/quality/reports/{later.path.name}/summary"
+                "?market=nfo&by=expiry&expiry=2026-12-31"
+            )
+            _assert(by_names.status_code == 200, by_names.text)
+            by_names_body = by_names.json()
+            _assert(by_names_body["level"] == "underlying", by_names_body)
+            _assert(by_names_body["rows"][0]["underlying"] == "CRUDEOIL", by_names_body)
+
+            by_contracts = tc.get(
+                f"/api/ohlcv/quality/reports/{later.path.name}/summary"
+                "?market=nfo&by=expiry&expiry=2026-12-31&underlying=CRUDEOIL"
+            )
+            _assert(by_contracts.status_code == 200, by_contracts.text)
+            _assert(by_contracts.json()["level"] == "contract", by_contracts.text)
+
+            ignored = tc.get(
+                f"/api/ohlcv/quality/reports/{later.path.name}/summary"
+                "?market=nfo&by=expiry&underlying=CRUDEOIL"
+            )
+            _assert(ignored.status_code == 200, ignored.text)
+            _assert(ignored.json()["level"] == "date", ignored.text)
+
+            bad_by = tc.get(
+                f"/api/ohlcv/quality/reports/{later.path.name}/summary?by=foo"
+            )
+            _assert(bad_by.status_code == 400, bad_by.text)
 
             bad_days = tc.get(f"/api/ohlcv/quality/reports/{later.path.name}/summary?days=0")
             _assert(bad_days.status_code == 400, bad_days.text)

@@ -32,7 +32,7 @@ function parseDays(raw: string | null): number | null {
 function rowLabel(row: QualityRow, level: QualitySummary["level"]): string {
   if (level === "market") return row.market;
   if (level === "underlying") return row.underlying ?? "";
-  if (level === "expiry") return row.expiry ?? "";
+  if (level === "expiry" || level === "date") return row.expiry ?? "";
   return row.tradingsymbol ?? String(row.token ?? "");
 }
 
@@ -52,6 +52,7 @@ export default function QualityPage() {
   const market = params.get("market") ?? "";
   const underlying = params.get("underlying") ?? "";
   const expiry = params.get("expiry") ?? "";
+  const by = params.get("by") === "expiry" ? "expiry" : "security";
   const tokenRaw = params.get("token") ?? "";
   const token = tokenRaw !== "" && Number.isInteger(Number(tokenRaw)) ? Number(tokenRaw) : null;
   const days = parseDays(daysQuery);
@@ -118,6 +119,7 @@ export default function QualityPage() {
       market: market || undefined,
       underlying: underlying || undefined,
       expiry: expiry || undefined,
+      by,
     })
       .then((res) => {
         if (!cancelled) setSummary(res);
@@ -133,7 +135,7 @@ export default function QualityPage() {
     return () => {
       cancelled = true;
     };
-  }, [selected, days, market, underlying, expiry]);
+  }, [selected, days, market, underlying, expiry, by]);
 
   useEffect(() => {
     if (!selected || token == null) {
@@ -169,6 +171,18 @@ export default function QualityPage() {
           expiry: null,
           token: null,
         });
+        return;
+      }
+      if (by === "expiry") {
+        if (level === "date") {
+          writeParams({ expiry: row.expiry, underlying: null, token: null });
+          return;
+        }
+        if (level === "underlying") {
+          writeParams({ underlying: row.underlying, token: null });
+          return;
+        }
+        if (row.token != null) writeParams({ token: String(row.token) });
         return;
       }
       if (level === "underlying") {
@@ -277,7 +291,17 @@ export default function QualityPage() {
       },
     );
     return cols;
-  }, [level, writeParams]);
+  }, [level, by, writeParams]);
+
+  function setDrill(next: "security" | "expiry") {
+    if (next === by) return;
+    writeParams({
+      by: next === "security" ? null : "expiry",
+      underlying: null,
+      expiry: null,
+      token: null,
+    });
+  }
 
   function commitDays() {
     const text = daysDraft.trim();
@@ -301,23 +325,41 @@ export default function QualityPage() {
         : null,
     },
   ];
-  if (market) {
+  if (market && by === "expiry") {
+    const belowMarket = Boolean(expiry || underlying || token != null);
+    crumbs.push({
+      label: market,
+      patch: belowMarket ? { underlying: null, expiry: null, token: null } : null,
+    });
+    if (expiry) {
+      crumbs.push({
+        label: expiry,
+        patch: underlying || token != null ? { underlying: null, token: null } : null,
+      });
+    }
+    if (underlying) {
+      crumbs.push({
+        label: underlying,
+        patch: token != null ? { token: null } : null,
+      });
+    }
+  } else if (market) {
     crumbs.push({
       label: market,
       patch: underlying ? { underlying: null, expiry: null, token: null } : null,
     });
-  }
-  if (underlying) {
-    crumbs.push({
-      label: underlying,
-      patch: expiry ? { expiry: null, token: null } : null,
-    });
-  }
-  if (expiry) {
-    crumbs.push({
-      label: expiry,
-      patch: token != null ? { token: null } : null,
-    });
+    if (underlying) {
+      crumbs.push({
+        label: underlying,
+        patch: expiry ? { expiry: null, token: null } : null,
+      });
+    }
+    if (expiry) {
+      crumbs.push({
+        label: expiry,
+        patch: token != null ? { token: null } : null,
+      });
+    }
   }
   if (token != null) {
     crumbs.push({
@@ -417,6 +459,24 @@ export default function QualityPage() {
                 }}
               />
             </label>
+            {market ? (
+              <div className="segmented" role="group" aria-label="Drill">
+                <button
+                  type="button"
+                  className={by === "security" ? "active" : undefined}
+                  onClick={() => setDrill("security")}
+                >
+                  Security
+                </button>
+                <button
+                  type="button"
+                  className={by === "expiry" ? "active" : undefined}
+                  onClick={() => setDrill("expiry")}
+                >
+                  Expiry
+                </button>
+              </div>
+            ) : null}
             <button type="button" className="btn btn-ghost btn-sm" onClick={() => void loadReports()}>
               Refresh
             </button>

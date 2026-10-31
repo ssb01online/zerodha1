@@ -293,7 +293,7 @@ export interface QualitySummary {
   id: string;
   generated_at: string;
   days: number | null;
-  level: "market" | "underlying" | "expiry" | "contract";
+  level: "market" | "underlying" | "expiry" | "date" | "contract";
   as_of: Record<string, string | null>;
   rows: QualityRow[];
 }

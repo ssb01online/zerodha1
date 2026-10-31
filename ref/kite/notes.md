@@ -313,7 +313,7 @@ Offline coverage snapshot. Does not call Kite and does not read `fetch_state`. A
 
 ```powershell
 uv run ohlcv quality [--market nfo|mcx|cds]
-uv run ohlcv quality show [--report yyyymmdd-HHMMSS] [--days N] [--market nfo] [--underlying NIFTY] [--expiry yyyymmdd] [--token N]
+uv run ohlcv quality show [--report yyyymmdd-HHMMSS] [--days N] [--market nfo] [--by security|expiry] [--underlying NIFTY] [--expiry yyyymmdd] [--token N]
 ```
 
 `quality` writes a new directory `data/ohlcv/_reports/<yyyymmdd-HHMMSS>/` (`quality.duckdb` + `manifest.json`) and leaves older snapshots in place. Default scan is nfo, mcx, and cds. `show` reads the latest directory unless `--report` is set.
@@ -324,8 +324,8 @@ uv run ohlcv quality show [--report yyyymmdd-HHMMSS] [--days N] [--market nfo] [
 - `--days N` is the last N session days ending at `as_of`. Omit it to score the full span. `N` is applied at show time, so one snapshot serves every window.
 - A contract's slice is those days clipped to `min(expiry, as_of)` and on or after that contract's first day bar. Dates before the first bar are not gaps.
 - Day gaps are session days in the slice with no day bar. Traded days are day bars with `volume > 0`. Minute coverage is traded days that have at least one minute candle, divided by traded days. A `volume = 0` day is not a minute obligation.
-- Drill-down follows the filters: no market filter prints markets; `--market` prints underlyings; `--underlying` prints expiries; `--expiry` prints contracts. `--token` prints that contract's totals plus gap dates and traded dates with no minute bar.
-- Market, underlying, and expiry rows sum the contract day counts. A catalog contract with no day bars is "no day data" (zeros), not a full-calendar gap.
+- Drill-down follows the filters. Default `--by security`: no market filter prints markets; `--market` prints underlyings; `--underlying` prints expiries; `--expiry` prints contracts. `--by expiry`: `--market` prints one row per expiry date (every security on that date summed); `--expiry` prints underlyings on that date; `--underlying` with `--expiry` prints contracts. An underlying without an expiry is ignored on the expiry drill. `--token` prints that contract's totals plus gap dates and traded dates with no minute bar.
+- Market, underlying, expiry, and date rows sum the contract day counts. A catalog contract with no day bars is "no day data" (zeros), not a full-calendar gap.
 - **TTQ** is the sum of day-bar `volume` in the same window (quantity as stored, not lots). **TTV** is the sum of day-bar `volume * close`. A `volume = 0` day, a day gap, and a minute-only row add nothing. Minute bars are not used for either sum. Quote-snapshot `average_price` is not on these files. Parent levels sum the contract figures. Schema 1 snapshots have no turnover columns; regenerate with `ohlcv quality`.
 
 ### Tables (`quality.duckdb`, schema_version 2)
@@ -336,7 +336,7 @@ uv run ohlcv quality show [--report yyyymmdd-HHMMSS] [--days N] [--market nfo] [
 
 ### UI
 
-`uv run portfolio serve` then open `/quality` (dev: Vite on port 5173). The page only reads saved snapshots. Pick a report, then a window (`days` query param: omitted = full span, or `60` / `90` / any N). Drill market → underlying → expiry → contract. Refresh the list after generating a new snapshot; the page does not scan parquet and does not run `ohlcv quality`.
+`uv run portfolio serve` then open `/quality` (dev: Vite on port 5173). The page only reads saved snapshots. Pick a report, then a window (`days` query param: omitted = full span, or `60` / `90` / any N). After a market, choose Security (underlying → expiry → contract) or Expiry (`by=expiry`: date → underlying → contract). A shared calendar date is one row until you open it. Refresh the list after generating a new snapshot; the page does not scan parquet and does not run `ohlcv quality`.
 
 ### Offline check
 

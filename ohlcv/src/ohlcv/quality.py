@@ -30,7 +30,8 @@ from .paths import REPORTS_DIR, ensure_dir, paths_for
 SCHEMA_VERSION = 2
 _REPORT_ID = re.compile(r"^\d{8}-\d{6}(?:-\d+)?$")
 
-_LEVELS = ("market", "underlying", "expiry", "contract")
+_LEVELS = ("market", "underlying", "expiry", "date", "contract")
+_BY = ("security", "expiry")
 
 
 @dataclass(frozen=True)
@@ -551,6 +552,43 @@ def _check_level(level: str) -> str:
     return key
 
 
+def check_by(by: str | None) -> str:
+    """``security`` walks market → underlying → expiry. ``expiry`` walks market → date → underlying."""
+    key = (by or "security").strip().lower()
+    if key not in _BY:
+        raise ValueError(f"unknown by {by!r}; expected one of: {', '.join(_BY)}")
+    return key
+
+
+def drill_level(
+    market: str | None,
+    underlying: str | None,
+    expiry: date | None,
+    by: str | None = "security",
+) -> str:
+    """Next summary grain for the active drill.
+
+    ``by=expiry`` with an underlying and no expiry ignores the underlying and
+    lists dates for the market.
+    """
+    mode = check_by(by)
+    if mode == "expiry":
+        if expiry is not None and underlying:
+            return "contract"
+        if expiry is not None:
+            return "underlying"
+        if market:
+            return "date"
+        return "market"
+    if expiry is not None:
+        return "contract"
+    if underlying:
+        return "expiry"
+    if market:
+        return "underlying"
+    return "market"
+
+
 def _filter_sql(
     *,
     market: str | None,
@@ -686,7 +724,7 @@ def _row_from_contract(record: tuple[Any, ...]) -> QualityRow:
 def _row_from_rollup(record: tuple[Any, ...], *, level: str) -> QualityRow:
     market = str(record[0])
     underlying = str(record[1]) if level in ("underlying", "expiry") and record[1] is not None else None
-    expiry = _as_optional_date(record[2]) if level == "expiry" else None
+    expiry = _as_optional_date(record[2]) if level in ("expiry", "date") else None
     return QualityRow(
         market=market,
         underlying=underlying,
@@ -752,6 +790,14 @@ def summarize(
         """
         group = "market, underlying"
         order = "market, underlying"
+    elif level == "date":
+        select = """
+            market,
+            CAST(NULL AS VARCHAR) AS underlying,
+            expiry,
+        """
+        group = "market, expiry"
+        order = "market, expiry"
     else:
         select = """
             market,

@@ -160,6 +160,7 @@ export function getQualitySummary(
     market?: string;
     underlying?: string;
     expiry?: string;
+    by?: "security" | "expiry";
   },
 ): Promise<QualitySummary> {
   const sp = new URLSearchParams();
@@ -167,6 +168,7 @@ export function getQualitySummary(
   if (params?.market) sp.set("market", params.market);
   if (params?.underlying) sp.set("underlying", params.underlying);
   if (params?.expiry) sp.set("expiry", params.expiry);
+  if (params?.by === "expiry") sp.set("by", "expiry");
   const q = sp.toString();
   return apiFetch<QualitySummary>(
     `/api/ohlcv/quality/reports/${id}/summary${q ? `?${q}` : ""}`,

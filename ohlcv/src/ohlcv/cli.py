@@ -1598,14 +1598,15 @@ def cmd_eod(args: argparse.Namespace) -> None:
         reporter.clear_heartbeat()
 
 
-def _quality_level(args: argparse.Namespace) -> str:
-    if getattr(args, "expiry", None):
-        return "contract"
-    if getattr(args, "underlying", None):
-        return "expiry"
-    if getattr(args, "market", None):
-        return "underlying"
-    return "market"
+def _quality_level(args: argparse.Namespace, expiry: date | None, underlying: str | None) -> str:
+    from . import quality as quality_mod
+
+    return quality_mod.drill_level(
+        getattr(args, "market", None),
+        underlying,
+        expiry,
+        getattr(args, "by", None),
+    )
 
 
 def _quality_pct(row) -> str:
@@ -1619,6 +1620,8 @@ def _quality_label(row, level: str) -> str:
         return row.market
     if level == "underlying":
         return row.underlying or ""
+    if level == "date":
+        return ymd(row.expiry) if row.expiry is not None else ""
     if level == "expiry":
         return f"{row.underlying} {ymd(row.expiry)}"
     flag = " no-day-data" if row.no_day_data else ""
@@ -1677,6 +1680,10 @@ def _cmd_quality_show(args: argparse.Namespace) -> None:
     if days is not None and days < 1:
         raise SystemExit("--days must be >= 1")
     try:
+        quality_mod.check_by(getattr(args, "by", None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    try:
         report_dir = quality_mod.resolve_report(getattr(args, "report", None))
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
@@ -1684,6 +1691,9 @@ def _cmd_quality_show(args: argparse.Namespace) -> None:
     market = getattr(args, "market", None) or None
     underlying = (getattr(args, "underlying", None) or "").strip() or None
     expiry = _parse_ymd(args.expiry) if getattr(args, "expiry", None) else None
+    mode = quality_mod.check_by(getattr(args, "by", None))
+    if mode == "expiry" and expiry is None:
+        underlying = None
     token = getattr(args, "token", None)
     days_label = "all" if days is None else str(days)
     print(f"Report: {report_dir.name}")
@@ -1743,7 +1753,7 @@ def _cmd_quality_show(args: argparse.Namespace) -> None:
                     print("    (none)")
             return
 
-        level = _quality_level(args)
+        level = _quality_level(args, expiry, underlying)
         include = list(market_meta) if level == "market" else None
         rows = quality_mod.summarize(
             con,
@@ -2167,11 +2177,17 @@ def main() -> None:
         default=None,
         help="Market to show (default: one row per market).",
     )
+    p_qshow.add_argument(
+        "--by",
+        choices=("security", "expiry"),
+        default="security",
+        help="Drill order after --market. security: underlying then expiry. expiry: date then underlying.",
+    )
     p_qshow.add_argument("--underlying", default=None, help="Underlying filter.")
     p_qshow.add_argument(
         "--expiry",
         default=None,
-        help="Expiry yyyymmdd. With --underlying, lists contracts.",
+        help="Expiry yyyymmdd. security drill: lists contracts. expiry drill: lists underlyings until --underlying is set.",
     )
     p_qshow.add_argument(
         "--token",
