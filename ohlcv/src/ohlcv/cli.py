@@ -1598,12 +1598,165 @@ def cmd_eod(args: argparse.Namespace) -> None:
         reporter.clear_heartbeat()
 
 
+def _quality_level(args: argparse.Namespace) -> str:
+    if getattr(args, "expiry", None):
+        return "contract"
+    if getattr(args, "underlying", None):
+        return "expiry"
+    if getattr(args, "market", None):
+        return "underlying"
+    return "market"
+
+
+def _quality_pct(row) -> str:
+    if row.minute_pct is None:
+        return "n/a"
+    return f"{row.minute_pct:.0f}%"
+
+
+def _quality_label(row, level: str) -> str:
+    if level == "market":
+        return row.market
+    if level == "underlying":
+        return row.underlying or ""
+    if level == "expiry":
+        return f"{row.underlying} {ymd(row.expiry)}"
+    flag = " no-day-data" if row.no_day_data else ""
+    return f"{row.token} {row.tradingsymbol}{flag}"
+
+
+def _print_quality_table(rows, level: str) -> None:
+    print(
+        f"{'name':<36} {'sess':>6} {'bars':>6} {'gaps':>6} "
+        f"{'traded':>7} {'minute':>7} {'min%':>6}"
+    )
+    if not rows:
+        print("(none)")
+        return
+    for row in rows:
+        print(
+            f"{_quality_label(row, level):<36} {row.session_days:>6} {row.day_bars:>6} "
+            f"{row.day_gaps:>6} {row.traded_days:>7} {row.minute_days:>7} {_quality_pct(row):>6}"
+        )
+
+
+def cmd_quality(args: argparse.Namespace) -> None:
+    from . import quality as quality_mod
+    from .catalog import CatalogLocked
+
+    if getattr(args, "quality_cmd", None) == "show":
+        _cmd_quality_show(args)
+        return
+    markets = [args.market] if getattr(args, "market", None) else None
+    try:
+        report = quality_mod.generate(markets)
+    except CatalogLocked as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"Wrote {report.path}")
+    for info in report.markets:
+        as_of = ymd(info.as_of) if info.as_of is not None else "none"
+        print(
+            f"  {info.market} as_of={as_of} day_files={info.day_files} "
+            f"minute_files={info.minute_files} contracts={info.contracts}"
+        )
+
+
+def _cmd_quality_show(args: argparse.Namespace) -> None:
+    from . import quality as quality_mod
+
+    days = getattr(args, "days", None)
+    if days is not None and days < 1:
+        raise SystemExit("--days must be >= 1")
+    try:
+        report_dir = quality_mod.resolve_report(getattr(args, "report", None))
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    manifest = quality_mod.load_manifest(report_dir)
+    market = getattr(args, "market", None) or None
+    underlying = (getattr(args, "underlying", None) or "").strip() or None
+    expiry = _parse_ymd(args.expiry) if getattr(args, "expiry", None) else None
+    token = getattr(args, "token", None)
+    days_label = "all" if days is None else str(days)
+    print(f"Report: {report_dir.name}")
+    print(f"Generated: {manifest.get('generated_at', '')}")
+    print(f"Days: {days_label}")
+    market_meta = manifest.get("markets") or {}
+    if market is not None:
+        meta = market_meta.get(market) or {}
+        as_of = meta.get("as_of") or "none"
+        print(f"As of: {market}={as_of}")
+    else:
+        parts = [
+            f"{name}={meta.get('as_of') or 'none'}"
+            for name, meta in market_meta.items()
+        ]
+        if parts:
+            print("As of: " + " ".join(parts))
+
+    con = quality_mod.connect_report(report_dir)
+    try:
+        if token is not None:
+            slices = quality_mod.contract_slices(
+                con,
+                days=days,
+                market=market,
+                underlying=underlying,
+                expiry=expiry,
+                token=token,
+            )
+            if not slices:
+                raise SystemExit(f"token {token} is not in this report")
+            for item in slices:
+                row = item.row
+                print()
+                print(
+                    f"{row.market} {row.underlying} {ymd(row.expiry)} "
+                    f"token={row.token} {row.tradingsymbol} {row.instrument_type}"
+                )
+                if row.no_day_data:
+                    print("  no day data")
+                print(
+                    f"  sess={row.session_days} bars={row.day_bars} gaps={row.day_gaps} "
+                    f"traded={row.traded_days} minute={row.minute_days} min%={_quality_pct(row)}"
+                )
+                print("  Gap dates:")
+                if item.gap_dates:
+                    for day in item.gap_dates:
+                        print(f"    {ymd(day)}")
+                else:
+                    print("    (none)")
+                print("  Traded dates with no minute bar:")
+                if item.traded_without_minute:
+                    for day in item.traded_without_minute:
+                        print(f"    {ymd(day)}")
+                else:
+                    print("    (none)")
+            return
+
+        level = _quality_level(args)
+        include = list(market_meta) if level == "market" else None
+        rows = quality_mod.summarize(
+            con,
+            days=days,
+            market=market,
+            underlying=underlying,
+            expiry=expiry,
+            level=level,
+            include_markets=include,
+        )
+    finally:
+        con.close()
+    print()
+    print(f"Level: {level}")
+    _print_quality_table(rows, level)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ohlcv",
         description=(
             "OHLCV tools (probe, sync, rank, queue, daily, continuous, fetch, "
-            "eod, status, show). Use --market nfo|mcx|cds (default nfo)."
+            "eod, status, show, quality). Use --market nfo|mcx|cds (default nfo)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1967,6 +2120,57 @@ def main() -> None:
     )
     _add_types_arg(p_eod)
     p_eod.set_defaults(func=cmd_eod)
+
+    p_quality = sub.add_parser(
+        "quality",
+        help=(
+            "Write a versioned day/minute coverage snapshot under "
+            "data/ohlcv/_reports/. Add 'show' to read one."
+        ),
+    )
+    p_quality.add_argument(
+        "--market",
+        choices=("nfo", "mcx", "cds"),
+        default=None,
+        help="Limit the snapshot to one market (default: nfo, mcx, and cds).",
+    )
+    qsub = p_quality.add_subparsers(dest="quality_cmd")
+    p_qshow = qsub.add_parser(
+        "show",
+        help="Print a saved snapshot. --days N rescores the last N session days.",
+    )
+    p_qshow.add_argument(
+        "--report",
+        default=None,
+        help="Snapshot directory name (yyyymmdd-HHMMSS). Default: latest.",
+    )
+    p_qshow.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Last N market session days ending at as_of (default: all).",
+    )
+    p_qshow.add_argument(
+        "--market",
+        choices=("nfo", "mcx", "cds"),
+        default=None,
+        help="Market to show (default: one row per market).",
+    )
+    p_qshow.add_argument("--underlying", default=None, help="Underlying filter.")
+    p_qshow.add_argument(
+        "--expiry",
+        default=None,
+        help="Expiry yyyymmdd. With --underlying, lists contracts.",
+    )
+    p_qshow.add_argument(
+        "--token",
+        type=int,
+        default=None,
+        help="One contract: totals plus gap dates and traded dates with no minute bar.",
+    )
+    p_quality.set_defaults(func=cmd_quality)
+    p_qshow.set_defaults(func=cmd_quality)
 
     args = parser.parse_args()
     args.func(args)

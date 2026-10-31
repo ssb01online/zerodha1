@@ -58,6 +58,8 @@ CATALOG_PATH = _NFO.catalog_path
 ARCHIVE_DIR = DATA_DIR / "instruments" / "archive"
 # Cross-market EOD logs + done markers (scheduler + late-login catch-up).
 EOD_DIR = DATA_DIR / "ohlcv" / "_eod"
+# Versioned offline quality snapshots (one directory per generate run).
+REPORTS_DIR = DATA_DIR / "ohlcv" / "_reports"
 
 
 def ymd(value: date | datetime) -> str:

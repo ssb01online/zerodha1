@@ -168,6 +168,8 @@ Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.
 | `uv run ohlcv eod [--markets] [--buffer] [--horizon-days N] [--no-wait\|--force\|--dry-run\|--catch-up] […]` | yes (except `--dry-run`) | Wait until ready, then daily+fetch near-term window (`trade_date`..`+N`, default 7; today first); `--catch-up` = missed ready markets only |
 | `uv run ohlcv status [--market] [--types] [--all] [--expiry] [--underlying] [--interval] [--limit] [--runs]` | no | Offline progress report |
 | `uv run ohlcv show [--market] UNDERLYING EXPIRY [--interval] [--symbol\|--token] [--tail]` | no | Inspect one minute or day series file |
+| `uv run ohlcv quality [--market]` | no | Write a versioned day/minute coverage snapshot under `data/ohlcv/_reports/` |
+| `uv run ohlcv quality show [--report id] [--days N] [--market] [--underlying] [--expiry] [--token]` | no | Read a snapshot; `--days N` rescores the last N session days |
 | `uv run sessiontray` | no (reads token file only) | Tray icon; Login; Catch up EOD / auto catch-up on login |
 
 ### Catalog (`data/ohlcv/nfo/catalog.duckdb`, schema_version=2)
@@ -302,6 +304,38 @@ If `status`/`show` fail with a catalog lock message, a `daily`/`fetch` run (or n
 
 ### Offline check
 `uv run python -m ohlcv.selftest` (includes Phase 4/5 status/read/day-fetch tests).
+
+## OHLCV quality report
+
+Offline coverage snapshot. Does not call Kite and does not read `fetch_state`. A traded day counts as minute-complete when at least one minute candle is on disk (fetches are assumed to have run after the close).
+
+### Commands
+
+```powershell
+uv run ohlcv quality [--market nfo|mcx|cds]
+uv run ohlcv quality show [--report yyyymmdd-HHMMSS] [--days N] [--market nfo] [--underlying NIFTY] [--expiry yyyymmdd] [--token N]
+```
+
+`quality` writes a new directory `data/ohlcv/_reports/<yyyymmdd-HHMMSS>/` (`quality.duckdb` + `manifest.json`) and leaves older snapshots in place. Default scan is nfo, mcx, and cds. `show` reads the latest directory unless `--report` is set.
+
+### Rules
+
+- A session day is any date present in that market's `day/` parquet. A date with no day bar anywhere in the market is closed and is not counted. `as_of` is the latest session day (stored per market in the manifest).
+- `--days N` is the last N session days ending at `as_of`. Omit it to score the full span. `N` is applied at show time, so one snapshot serves every window.
+- A contract's slice is those days clipped to `min(expiry, as_of)` and on or after that contract's first day bar. Dates before the first bar are not gaps.
+- Day gaps are session days in the slice with no day bar. Traded days are day bars with `volume > 0`. Minute coverage is traded days that have at least one minute candle, divided by traded days. A `volume = 0` day is not a minute obligation.
+- Drill-down follows the filters: no market filter prints markets; `--market` prints underlyings; `--underlying` prints expiries; `--expiry` prints contracts. `--token` prints that contract's totals plus gap dates and traded dates with no minute bar.
+- Market, underlying, and expiry rows sum the contract day counts. A catalog contract with no day bars is "no day data" (zeros), not a full-calendar gap.
+
+### Tables (`quality.duckdb`, schema_version 1)
+
+- `session_day(market, trade_date)`
+- `contract(market, token, underlying, expiry, tradingsymbol, instrument_type, strike, lot_size, in_catalog)` — series-file identity, plus catalog rows that have no parquet
+- `contract_day(market, token, trade_date, day_volume, minute_bars)` — a row only when a day bar and/or a minute candle exists. `day_volume` null means minute rows without a day bar. Gaps are derived at show time.
+
+### Offline check
+
+`uv run python -m ohlcv.selftest` (quality snapshot cases).
 
 ## Day vs daily vs continuous layout
 

@@ -42,6 +42,7 @@ from .client import (
 )
 from . import markets as markets_mod
 from . import planner as planner_mod
+from . import quality as quality_mod
 from . import universe as universe_mod
 from .paths import (
     CATALOG_PATH,
@@ -3366,6 +3367,366 @@ def test_catalog_readonly_open() -> None:
             ro.close()
 
 
+def _write_quality_parquet(path: Path, rows: list[tuple]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    try:
+        con.execute(
+            """
+            CREATE TABLE t (
+                underlying VARCHAR,
+                expiry DATE,
+                token BIGINT,
+                tradingsymbol VARCHAR,
+                instrument_type VARCHAR,
+                strike DOUBLE,
+                lot_size INTEGER,
+                ts TIMESTAMP,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume BIGINT,
+                oi BIGINT
+            )
+            """
+        )
+        con.executemany(
+            "INSERT INTO t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        con.execute("COPY t TO ? (FORMAT parquet, COMPRESSION zstd)", [str(path)])
+    finally:
+        con.close()
+
+
+def _quality_bar(
+    underlying: str,
+    expiry: date,
+    token: int,
+    symbol: str,
+    instrument_type: str,
+    ts: datetime,
+    volume: int,
+    *,
+    strike: float = 0.0,
+) -> tuple:
+    return (
+        underlying,
+        expiry,
+        token,
+        symbol,
+        instrument_type,
+        strike,
+        1,
+        ts,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        volume,
+        0,
+    )
+
+
+def test_quality_coverage_rules() -> None:
+    """Session calendar, gaps, volume 0, expiry clip, and catalog-only contracts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        day_dir = root / "day"
+        minute_dir = root / "minute"
+        catalog_path = root / "catalog.duckdb"
+        exp_long = date(2026, 10, 30)
+        exp_short = date(2026, 10, 6)
+        exp_early = date(2026, 10, 1)
+
+        def day_ts(day: date) -> datetime:
+            return datetime(day.year, day.month, day.day)
+
+        def minute_ts(day: date) -> datetime:
+            return datetime(day.year, day.month, day.day, 9, 15)
+
+        nifty_day = [
+            _quality_bar("NIFTY", exp_long, 1, "NIFTY26OCTFUT", "FUT", day_ts(date(2026, 10, 5)), 100),
+            _quality_bar("NIFTY", exp_long, 1, "NIFTY26OCTFUT", "FUT", day_ts(date(2026, 10, 6)), 50),
+            _quality_bar("NIFTY", exp_long, 1, "NIFTY26OCTFUT", "FUT", day_ts(date(2026, 10, 7)), 0),
+        ]
+        nifty_minute = [
+            _quality_bar(
+                "NIFTY", exp_long, 1, "NIFTY26OCTFUT", "FUT", minute_ts(date(2026, 10, 5)), 100
+            ),
+            # Minute candle on a date with no day bar anywhere: not a session day.
+            _quality_bar(
+                "NIFTY", exp_long, 1, "NIFTY26OCTFUT", "FUT", minute_ts(date(2026, 10, 8)), 5
+            ),
+        ]
+        reliance_day = [
+            _quality_bar(
+                "RELIANCE", exp_long, 2, "RELIANCE26OCTFUT", "FUT", day_ts(date(2026, 10, 9)), 10
+            ),
+        ]
+        reliance_minute = [
+            _quality_bar(
+                "RELIANCE", exp_long, 2, "RELIANCE26OCTFUT", "FUT", minute_ts(date(2026, 10, 9)), 10
+            ),
+        ]
+        early_day = [
+            _quality_bar(
+                "BANKNIFTY", exp_early, 3, "BANKNIFTY26OCTFUT", "FUT", day_ts(date(2026, 10, 1)), 5
+            ),
+        ]
+        early_minute = [
+            _quality_bar(
+                "BANKNIFTY",
+                exp_early,
+                3,
+                "BANKNIFTY26OCTFUT",
+                "FUT",
+                minute_ts(date(2026, 10, 1)),
+                5,
+            ),
+        ]
+        short_day = [
+            _quality_bar("INFY", exp_short, 4, "INFY26OCTFUT", "FUT", day_ts(date(2026, 10, 5)), 10),
+            _quality_bar("INFY", exp_short, 4, "INFY26OCTFUT", "FUT", day_ts(date(2026, 10, 6)), 10),
+        ]
+        short_minute = [
+            _quality_bar(
+                "INFY", exp_short, 4, "INFY26OCTFUT", "FUT", minute_ts(date(2026, 10, 5)), 10
+            ),
+        ]
+        _write_quality_parquet(series_path(day_dir, "NIFTY", exp_long), nifty_day)
+        _write_quality_parquet(series_path(minute_dir, "NIFTY", exp_long), nifty_minute)
+        _write_quality_parquet(series_path(day_dir, "RELIANCE", exp_long), reliance_day)
+        _write_quality_parquet(series_path(minute_dir, "RELIANCE", exp_long), reliance_minute)
+        _write_quality_parquet(series_path(day_dir, "BANKNIFTY", exp_early), early_day)
+        _write_quality_parquet(series_path(minute_dir, "BANKNIFTY", exp_early), early_minute)
+        _write_quality_parquet(series_path(day_dir, "INFY", exp_short), short_day)
+        _write_quality_parquet(series_path(minute_dir, "INFY", exp_short), short_minute)
+
+        cat = catalog.connect(catalog_path)
+        try:
+            catalog.ensure_schema(cat)
+            catalog.upsert_contracts(
+                cat,
+                [
+                    catalog.ContractRow(
+                        token=1,
+                        underlying="NIFTY",
+                        expiry=exp_long,
+                        tradingsymbol="NIFTY26OCTFUT",
+                        instrument_type="FUT",
+                        strike=0.0,
+                        lot_size=1,
+                    ),
+                    catalog.ContractRow(
+                        token=99,
+                        underlying="TCS",
+                        expiry=date(2026, 11, 26),
+                        tradingsymbol="TCS26NOVFUT",
+                        instrument_type="FUT",
+                        strike=0.0,
+                        lot_size=1,
+                    ),
+                ],
+                seen_on=date(2026, 10, 9),
+            )
+        finally:
+            cat.close()
+
+        reports = root / "reports"
+        moment = datetime(2026, 10, 31, 12, 0, tzinfo=auth.IST)
+        roots = {
+            "nfo": quality_mod.MarketInputs(
+                day_dir=day_dir,
+                minute_dir=minute_dir,
+                catalog_path=catalog_path,
+            )
+        }
+        report = quality_mod.generate(
+            ["nfo"],
+            reports_root=reports,
+            now=moment,
+            roots=roots,
+        )
+        later = quality_mod.generate(
+            ["nfo"],
+            reports_root=reports,
+            now=moment + timedelta(seconds=1),
+            roots=roots,
+        )
+        _assert(quality_mod.resolve_report(reports_root=reports) == later.path, "latest report")
+        _assert(
+            quality_mod.resolve_report(report.path.name, reports_root=reports) == report.path,
+            "report id",
+        )
+        manifest = quality_mod.load_manifest(report.path)
+        _assert(manifest["schema_version"] == 1, "schema")
+        _assert(manifest["markets"]["nfo"]["as_of"] == "2026-10-09", "as_of")
+
+        con = quality_mod.connect_report(report.path)
+        try:
+            session_days = {
+                row[0] if isinstance(row[0], date) else date.fromisoformat(str(row[0])[:10])
+                for row in con.execute(
+                    "SELECT trade_date FROM session_day WHERE market = 'nfo'"
+                ).fetchall()
+            }
+            _assert(date(2026, 10, 8) not in session_days, "holiday not a session day")
+            _assert(
+                session_days
+                == {
+                    date(2026, 10, 1),
+                    date(2026, 10, 5),
+                    date(2026, 10, 6),
+                    date(2026, 10, 7),
+                    date(2026, 10, 9),
+                },
+                f"session days={sorted(session_days)}",
+            )
+            flags = {
+                int(row[0]): bool(row[1])
+                for row in con.execute(
+                    "SELECT token, in_catalog FROM contract WHERE market = 'nfo'"
+                ).fetchall()
+            }
+            _assert(flags[1] is True, "file contract in catalog")
+            _assert(flags[2] is False, "file contract not in catalog")
+            _assert(flags[99] is True, "catalog-only contract")
+
+            nifty = quality_mod.contract_slices(con, market="nfo", token=1)[0]
+            _assert(nifty.row.session_days == 4, f"nifty sess={nifty.row.session_days}")
+            _assert(nifty.row.day_bars == 3, f"nifty bars={nifty.row.day_bars}")
+            _assert(nifty.row.day_gaps == 1, f"nifty gaps={nifty.row.day_gaps}")
+            _assert(nifty.row.traded_days == 2, f"nifty traded={nifty.row.traded_days}")
+            _assert(nifty.row.minute_days == 1, f"nifty minute={nifty.row.minute_days}")
+            _assert(nifty.row.minute_pct == 50.0, f"nifty pct={nifty.row.minute_pct}")
+            _assert(nifty.gap_dates == (date(2026, 10, 9),), f"gaps={nifty.gap_dates}")
+            _assert(
+                nifty.traded_without_minute == (date(2026, 10, 6),),
+                f"missing minute={nifty.traded_without_minute}",
+            )
+            _assert(not nifty.row.no_day_data, "nifty has day data")
+
+            narrow = quality_mod.contract_slices(con, market="nfo", token=1, days=1)[0]
+            _assert(narrow.row.session_days == 1, "N=1 session")
+            _assert(narrow.row.day_bars == 0, "N=1 bars")
+            _assert(narrow.row.day_gaps == 1, "N=1 gap")
+            _assert(narrow.row.traded_days == 0, "N=1 traded")
+            _assert(narrow.gap_dates == (date(2026, 10, 9),), "N=1 gap date")
+
+            short = quality_mod.contract_slices(con, market="nfo", token=4)[0]
+            _assert(short.row.session_days == 2, f"short sess={short.row.session_days}")
+            _assert(short.row.day_gaps == 0, "expiry clips later session days")
+            _assert(short.row.traded_days == 2, "short traded")
+            _assert(short.row.minute_days == 1, "short minute")
+            _assert(short.traded_without_minute == (date(2026, 10, 6),), "short missing")
+            _assert(date(2026, 10, 1) not in short.gap_dates, "before first bar is not a gap")
+
+            empty = quality_mod.summarize(
+                con, market="nfo", underlying="TCS", level="contract"
+            )
+            _assert(len(empty) == 1 and empty[0].token == 99, "catalog-only row")
+            _assert(empty[0].no_day_data, "no day data")
+            _assert(empty[0].session_days == 0 and empty[0].day_gaps == 0, "no invented gaps")
+            _assert(empty[0].minute_pct is None, "no traded days")
+
+            contracts = quality_mod.summarize(con, market="nfo", level="contract")
+            market_rows = quality_mod.summarize(con, market="nfo", level="market")
+            _assert(len(market_rows) == 1, "one market")
+            _assert(
+                market_rows[0].session_days == sum(row.session_days for row in contracts),
+                "market sums session days",
+            )
+            _assert(
+                market_rows[0].traded_days == sum(row.traded_days for row in contracts),
+                "market sums traded days",
+            )
+            _assert(
+                market_rows[0].minute_days == sum(row.minute_days for row in contracts),
+                "market sums minute days",
+            )
+            under = quality_mod.summarize(
+                con, market="nfo", underlying="NIFTY", level="expiry"
+            )
+            _assert(len(under) == 1 and under[0].expiry == exp_long, "series row")
+            _assert(under[0].minute_days == nifty.row.minute_days, "series rolls up contract")
+
+            raised = False
+            try:
+                quality_mod.summarize(con, days=0)
+            except ValueError:
+                raised = True
+            _assert(raised, "days 0 rejected")
+        finally:
+            con.close()
+
+
+def test_quality_days_window() -> None:
+    """Last N session days: N=60 can be complete when the full span is not."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        day_dir = root / "day"
+        minute_dir = root / "minute"
+        expiry = date(2026, 12, 31)
+        start = date(2026, 1, 1)
+        dates = [start + timedelta(days=i) for i in range(61)]
+        day_rows = []
+        minute_rows = []
+        for index, day in enumerate(dates):
+            day_rows.append(
+                _quality_bar(
+                    "CRUDEOIL",
+                    expiry,
+                    7,
+                    "CRUDEOIL26DECFUT",
+                    "FUT",
+                    datetime(day.year, day.month, day.day),
+                    10,
+                )
+            )
+            if index > 0:
+                minute_rows.append(
+                    _quality_bar(
+                        "CRUDEOIL",
+                        expiry,
+                        7,
+                        "CRUDEOIL26DECFUT",
+                        "FUT",
+                        datetime(day.year, day.month, day.day, 9, 15),
+                        10,
+                    )
+                )
+        _write_quality_parquet(series_path(day_dir, "CRUDEOIL", expiry), day_rows)
+        _write_quality_parquet(series_path(minute_dir, "CRUDEOIL", expiry), minute_rows)
+        report = quality_mod.generate(
+            ["nfo"],
+            reports_root=root / "reports",
+            now=datetime(2026, 3, 3, 18, 0, tzinfo=auth.IST),
+            roots={
+                "nfo": quality_mod.MarketInputs(
+                    day_dir=day_dir,
+                    minute_dir=minute_dir,
+                    catalog_path=root / "missing-catalog.duckdb",
+                )
+            },
+        )
+        con = quality_mod.connect_report(report.path)
+        try:
+            full = quality_mod.contract_slices(con, token=7)[0]
+            _assert(full.row.traded_days == 61, f"full traded={full.row.traded_days}")
+            _assert(full.row.minute_days == 60, f"full minute={full.row.minute_days}")
+            _assert(full.row.day_gaps == 0, "no day gaps")
+            _assert(full.traded_without_minute == (dates[0],), "oldest day lacks minutes")
+            window = quality_mod.contract_slices(con, token=7, days=60)[0]
+            _assert(window.row.traded_days == 60, f"N=60 traded={window.row.traded_days}")
+            _assert(window.row.minute_days == 60, f"N=60 minute={window.row.minute_days}")
+            _assert(window.row.minute_pct == 100.0, "N=60 complete")
+            _assert(window.traded_without_minute == (), "N=60 has no minute gaps")
+        finally:
+            con.close()
+
+
 def main() -> None:
     tests = [
         test_paths,
@@ -3421,6 +3782,8 @@ def main() -> None:
         test_snapshot_gaps_weekdays_only,
         test_read_series_filters_and_file_info,
         test_catalog_readonly_open,
+        test_quality_coverage_rules,
+        test_quality_days_window,
     ]
     failed = 0
     for fn in tests:
