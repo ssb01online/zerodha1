@@ -148,7 +148,7 @@ Project decision (not a Kite API fact):
 - Per-market fetch lock: `data/ohlcv/<market>/fetch.lock` (pid + IST started + cmd). Held by `ohlcv fetch` and each non-dry-run market pass in `ohlcv eod` / `--catch-up`. Second writer exits with pid / age / cmd; dead-PID locks are reclaimed. DuckDB catalog lock remains a second line of defense.
 - Late login: Task Scheduler still fires at ready time (fails if no token). Tray on invalid→valid or startup-if-valid spawns `ohlcv eod --catch-up` (menu **Catch up EOD** too). Logs: `catchup-*.log` under `_eod/`.
 - `snapshot_status(..., trade_date=)` so post-midnight MCX snapshots still count as `final` for the prior session.
-- Task Scheduler: `scripts/register-scheduled-tasks.ps1` (times assume OS clock = IST; tasks run when user is logged on). Logs under `data/ohlcv/_eod/`.
+- Task Scheduler: `scripts/register-scheduled-tasks.ps1` converts IST ready times (NFO 16:10, CDS 17:30, MCX 00:05) to the OS local timezone; re-run after DST changes. Tasks run when user is logged on. Logs under `data/ohlcv/_eod/`.
 - Tray: workspace package `sessiontray` — local token file check only (green/red); toast on expire; menu Login spawns `uv run kitetools login`. No password/TOTP automation.
 
 ## OHLCV Phase 1 (NFO foundation + download queue)

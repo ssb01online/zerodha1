@@ -156,18 +156,18 @@ Tray menu: **Login** (new console with `kitetools login`), **Catch up EOD**, **R
 
 On **login** (red→green) and on **tray startup** when the token is already valid, the tray spawns `uv run ohlcv eod --catch-up` in the background. That runs only markets whose `download_ready` time has already passed and that lack a success marker under `data/ohlcv/_eod/{market}-{yyyymmdd}.done` (so a late login after 16:10 still picks up NFO). Catch-up logs: `data/ohlcv/_eod/catchup-*.log`.
 
-2. **EOD download tasks** — machine clock should be **IST**. Register once:
+2. **EOD download tasks** — ready times are **IST**; `register-scheduled-tasks.ps1` converts them to the OS local timezone (re-run after DST changes):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\register-scheduled-tasks.ps1
 ```
 
-| Task | When (local/IST) | Action |
+| Task | When (IST) | Action |
 | --- | --- | --- |
 | `KiteSessionTray` | At logon | `scripts\sessiontray.cmd` |
-| `OhlcvEodNfo` | Mon–Fri 16:10 | `ohlcv eod --markets nfo --no-wait` |
-| `OhlcvEodCds` | Mon–Fri 17:30 | `ohlcv eod --markets cds --no-wait` |
-| `OhlcvEodMcx` | Daily 00:05 | `ohlcv eod --markets mcx --no-wait` (trade_date = yesterday before 06:00) |
+| `OhlcvEodNfo` | Mon–Fri 16:10 IST | `ohlcv eod --markets nfo --no-wait` |
+| `OhlcvEodCds` | Mon–Fri 17:30 IST | `ohlcv eod --markets cds --no-wait` |
+| `OhlcvEodMcx` | Daily 00:05 IST | `ohlcv eod --markets mcx --no-wait` (trade_date = yesterday before 06:00) |
 
 Logs / done markers: `data/ohlcv/_eod/`. Remove tasks: `scripts\unregister-scheduled-tasks.ps1`.
 
