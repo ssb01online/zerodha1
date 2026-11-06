@@ -2,13 +2,15 @@
 
 Projected from the daily instruments master. No second Kite call.
 Indices (segment INDICES, instrument_type EQ) are excluded.
+Kite still labels debt, gold bonds, REITs, and InvITs as instrument_type EQ;
+those are dropped by series (NSE) or scrip code (BSE).
 """
 
 from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from pathlib import Path
 
@@ -21,6 +23,21 @@ EQUITY_DB_PATH = CACHE_DIR / "equity.duckdb"
 EQUITY_CSV_PATH = CACHE_DIR / "equity.csv"
 
 EQ_EXCHANGES = frozenset({"NSE", "BSE"})
+
+# NSE "Legend of series": fully paid equity and ETFs, SME equity, partly paid equity.
+# Kite leaves series EQ unsuffixed and appends -SERIES otherwise.
+# @ runs 1-9 then A-Z. E+Q is EQ, which is also the main series.
+_NSE_SERIES_TAIL = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_NSE_EQUITY_SERIES = frozenset(
+    {"EQ", "BE", "BZ", "BL", "SM", "ST", "SZ"}
+    | {f"E{ch}" for ch in _NSE_SERIES_TAIL}
+    | {f"X{ch}" for ch in _NSE_SERIES_TAIL}
+)
+
+# BSE equity scrip codes. G-sec, SDL, T-bills, gold bonds, and corporate debt
+# sit in the 7xxxxx / 8xxxxx / 9xxxxx bands (checked against the Kite dump).
+_BSE_EQUITY_TOKEN_MIN = 500_000
+_BSE_EQUITY_TOKEN_MAX = 599_999
 
 _COLUMNS = (
     "instrument_token",
@@ -62,12 +79,61 @@ class EquityPublish:
     csv_path: Path
 
 
+def _nse_series(tradingsymbol: str) -> str:
+    """Series code Kite encodes in the trading symbol.
+
+    EQ has no suffix. Any other series is appended as ``-XX`` (two characters).
+    A hyphen inside an EQ symbol (``BAJAJ-AUTO``) is not a series code.
+    """
+    symbol = tradingsymbol.strip().upper()
+    if "-" not in symbol:
+        return "EQ"
+    head, suffix = symbol.rsplit("-", 1)
+    if head and len(suffix) == 2 and suffix.isalnum():
+        return suffix
+    return "EQ"
+
+
+def _is_etf(symbol: str, name: str) -> bool:
+    return "ETF" in symbol or "ETF" in name or symbol.endswith("BEES")
+
+
+def _bse_cash_equity(inst: Instrument) -> bool:
+    """Equity shares and ETFs in the BSE equity scrip band.
+
+    Drops debt (other scrip bands), REITs, InvITs, and mutual-fund schemes.
+    An unnamed row is kept only when the symbol itself says ETF.
+    """
+    token = int(inst.exchange_token)
+    if token < _BSE_EQUITY_TOKEN_MIN or token > _BSE_EQUITY_TOKEN_MAX:
+        return False
+    symbol = inst.tradingsymbol.strip().upper()
+    name = (inst.name or "").strip().upper()
+    if "INVIT" in name or "REIT" in name:
+        return False
+    etf = _is_etf(symbol, name)
+    if not name:
+        return etf
+    if "MUTUAL FUND" in name and not etf:
+        return False
+    return True
+
+
 def is_cash_equity(inst: Instrument) -> bool:
-    """True for NSE/BSE regular equity. Drops indices and other series."""
+    """True for NSE/BSE equity shares and ETFs.
+
+    Drops indices, debt (government, state, corporate), gold bonds, warrants,
+    REITs, and InvITs. NSE series follows the exchange legend (EQ/BE/BZ,
+    SME SM/ST/SZ, partly paid E@ and X@). BSE uses the equity scrip-code band.
+    """
     exchange = (inst.exchange or "").strip().upper()
     itype = (inst.instrument_type or "").strip().upper()
     segment = (inst.segment or "").strip().upper()
-    return exchange in EQ_EXCHANGES and itype == "EQ" and segment == exchange
+    if exchange not in EQ_EXCHANGES or itype != "EQ" or segment != exchange:
+        return False
+    if exchange == "NSE":
+        return _nse_series(inst.tradingsymbol) in _NSE_EQUITY_SERIES
+    return _bse_cash_equity(inst)
 
 
 def _connect(db_path: Path) -> duckdb.DuckDBPyConnection:
@@ -149,6 +215,29 @@ def _merge(existing: EquityRow | None, inst: Instrument, as_of: date) -> EquityR
         lot_size=int(inst.lot_size or 0),
         first_seen=first,
         last_seen=as_of,
+    )
+
+
+def _drop_stale_live(
+    con: duckdb.DuckDBPyConnection,
+    incoming: list[Instrument],
+    as_of: date,
+) -> None:
+    """Take today's stamp off rows this publish did not accept."""
+    previous = as_of - timedelta(days=1)
+    con.execute("CREATE TEMP TABLE _live_tokens(instrument_token BIGINT)")
+    tokens = [(int(inst.instrument_token),) for inst in incoming]
+    if tokens:
+        con.executemany("INSERT INTO _live_tokens VALUES (?)", tokens)
+    con.execute(
+        """
+        UPDATE equity
+        SET last_seen = ?,
+            first_seen = least(first_seen, ?)
+        WHERE last_seen = ?
+          AND instrument_token NOT IN (SELECT instrument_token FROM _live_tokens)
+        """,
+        [previous, previous, as_of],
     )
 
 
@@ -258,8 +347,11 @@ def publish_equity(
 ) -> EquityPublish:
     """Upsert cash-equity rows and overwrite the live-universe CSV.
 
-    Tokens that leave the dump stay in DuckDB with their previous ``last_seen``.
-    The CSV contains only rows whose ``last_seen`` equals ``as_of``.
+    Tokens that leave the dump stay in DuckDB. Rows already stamped ``last_seen``
+    on ``as_of`` but absent from this filtered dump move back one day, so a
+    same-day republish (a tighter filter, or a name that left the file) drops
+    them from the live CSV. ``first_seen`` moves with them when the only
+    sighting was today.
     """
     if rows is None:
         ensure_cache()
@@ -281,6 +373,7 @@ def publish_equity(
             for inst in incoming:
                 merged = _merge(existing.get(int(inst.instrument_token)), inst, as_of)
                 _upsert(con, merged)
+            _drop_stale_live(con, incoming, as_of)
             con.execute("COMMIT")
         except Exception:
             con.execute("ROLLBACK")

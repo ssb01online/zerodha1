@@ -35,10 +35,11 @@ def _inst(
     expiry: date | None = None,
     strike: float = 0.0,
     lot_size: int = 1,
+    exchange_token: int | None = None,
 ) -> Instrument:
     return Instrument(
         instrument_token=token,
-        exchange_token=token // 100,
+        exchange_token=token // 100 if exchange_token is None else exchange_token,
         tradingsymbol=symbol,
         name=name,
         last_price=0.0,
@@ -140,7 +141,13 @@ def test_equity_publish_filter_and_history() -> None:
     day2 = date(2026, 10, 28)
     infy = _inst(1, exchange="NSE", symbol="INFY", name="INFOSYS")
     reliance = _inst(3, exchange="NSE", symbol="RELIANCE", name="RELIANCE INDUSTRIES")
-    bse = _inst(2, exchange="BSE", symbol="INFY", name="INFOSYS")
+    bse = _inst(
+        2,
+        exchange="BSE",
+        symbol="INFY",
+        name="INFOSYS",
+        exchange_token=500209,
+    )
     index = Instrument(
         instrument_token=256265,
         exchange_token=1001,
@@ -155,27 +162,65 @@ def test_equity_publish_filter_and_history() -> None:
         segment="INDICES",
         exchange="NSE",
     )
-    be = _inst(9, exchange="NSE", symbol="FOO", name="FOO", itype="BE")
+    be_type = _inst(9, exchange="NSE", symbol="FOO", name="FOO", itype="BE")
+    t2t = _inst(4, exchange="NSE", symbol="ABAN-BE", name="ABAN OFFSHORE")
+    sme = _inst(5, exchange="NSE", symbol="AAKAAR-SM", name="AAKAAR MEDICAL")
+    hyphen_eq = _inst(6, exchange="NSE", symbol="BAJAJ-AUTO", name="BAJAJ AUTO")
+    debt = _inst(10, exchange="NSE", symbol="10157PCP27-N0", name="")
+    sdl = _inst(13, exchange="NSE", symbol="582RJ27-SG", name="SDL RJ 5.82% 2027")
+    gold = _inst(14, exchange="NSE", symbol="SGBAPR28I-GB", name="GOLDBONDS")
+    invit = _inst(15, exchange="NSE", symbol="INDIGRID-IV", name="INDIGRID - INVIT")
+    bse_debt = _inst(
+        12,
+        exchange="BSE",
+        symbol="001HCCL29",
+        name="",
+        exchange_token=974246,
+    )
+    bse_mf = _inst(
+        16,
+        exchange="BSE",
+        symbol="08ABB",
+        name="NIPPON INDIA MUTUAL FUND",
+        exchange_token=543076,
+    )
+    bse_etf = _inst(
+        17,
+        exchange="BSE",
+        symbol="SBISENSEX",
+        name="SBI MUTUAL FUND - SBI ETF SENS",
+        exchange_token=590105,
+    )
     _assert(is_cash_equity(infy) and is_cash_equity(bse), "eq included")
+    _assert(is_cash_equity(t2t) and is_cash_equity(sme), "t2t and sme included")
+    _assert(is_cash_equity(hyphen_eq), "hyphenated EQ symbol included")
+    _assert(is_cash_equity(bse_etf), "bse etf included")
     _assert(not is_cash_equity(index), "index excluded")
-    _assert(not is_cash_equity(be), "BE excluded")
+    _assert(not is_cash_equity(be_type), "non-EQ instrument type excluded")
+    _assert(not is_cash_equity(debt), "nse N-series debt excluded")
+    _assert(not is_cash_equity(sdl) and not is_cash_equity(gold), "sdl and gold excluded")
+    _assert(not is_cash_equity(invit), "invit excluded")
+    _assert(not is_cash_equity(bse_debt), "bse debt scrip excluded")
+    _assert(not is_cash_equity(bse_mf), "bse mutual fund excluded")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         db = root / "equity.duckdb"
         csv_path = root / "equity.csv"
         first = publish_equity(
-            [infy, reliance, bse, index, be],
+            [infy, reliance, bse, index, be_type, t2t, debt, bse_debt, bse_mf],
             as_of=day1,
             db_path=db,
             csv_path=csv_path,
         )
-        _assert(first.live == 3 and first.nse == 2 and first.bse == 1, f"live={first}")
+        _assert(first.live == 4 and first.nse == 3 and first.bse == 1, f"live={first}")
         stored = {r.instrument_token: r for r in list_equity(db)}
-        _assert(set(stored) == {1, 2, 3}, f"tokens={set(stored)}")
+        _assert(set(stored) == {1, 2, 3, 4}, f"tokens={set(stored)}")
         _assert(stored[1].first_seen == day1 and stored[1].prev_tradingsymbol is None, "first seen")
         text = csv_path.read_text(encoding="utf-8")
         _assert("NIFTY 50" not in text and "FOO" not in text, "csv dropped non-EQ")
+        _assert("10157PCP27-N0" not in text and "001HCCL29" not in text, "csv dropped debt")
+        _assert("ABAN-BE" in text, "csv kept trade-for-trade equity")
         _assert(text.count("INFY") == 2, "csv has both INFY rows")
 
         renamed = _inst(1, exchange="NSE", symbol="INFYNEW", name="INFOSYS")
@@ -196,6 +241,28 @@ def test_equity_publish_filter_and_history() -> None:
         live_csv = csv_path.read_text(encoding="utf-8")
         _assert("RELIANCE" not in live_csv, "csv is live universe only")
         _assert("INFYNEW" in live_csv and "INFY," in live_csv, "csv has rename and BSE")
+
+        # Same calendar day: a name already stamped today must leave the live set
+        # when this publish does not accept it (filter change, or it left the dump).
+        same_day = publish_equity(
+            [renamed],
+            as_of=day2,
+            db_path=db,
+            csv_path=csv_path,
+        )
+        _assert(same_day.live == 1 and same_day.nse == 1 and same_day.bse == 0, f"same-day={same_day}")
+        dropped_bse = get_equity(db, token=2)
+        _assert(
+            dropped_bse is not None and dropped_bse.last_seen == day1,
+            f"same-day last_seen={dropped_bse}",
+        )
+        fresh = _inst(8, exchange="NSE", symbol="NEWCO", name="NEWCO")
+        publish_equity([renamed, fresh], as_of=day2, db_path=db, csv_path=csv_path)
+        publish_equity([renamed], as_of=day2, db_path=db, csv_path=csv_path)
+        gone = get_equity(db, token=8)
+        _assert(gone is not None and gone.first_seen == day1 and gone.last_seen == day1, f"only-today={gone}")
+        after = csv_path.read_text(encoding="utf-8")
+        _assert("NEWCO" not in after and ",BSE,INFY," not in after, "same-day csv dropped them")
     print("  ok equity_publish_filter_and_history")
 
 
