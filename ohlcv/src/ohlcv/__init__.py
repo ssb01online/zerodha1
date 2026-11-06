@@ -1,7 +1,8 @@
-"""OHLCV download, storage, and query (NFO + MCX/CDS markets).
+"""OHLCV download, storage, and query (NFO, MCX, CDS, and NSE/BSE cash equity).
 
 CLI: probe, sync, rank, queue, daily, continuous, fetch, eod, status, show, quality.
-Use --market nfo|mcx|cds (default nfo) on market-scoped commands.
+Use --market nfo|mcx|cds|nse|bse (default nfo) on market-scoped commands.
+NSE and BSE are day candles only.
 Quality API router is mounted by ``portfolio serve``.
 """
 

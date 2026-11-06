@@ -151,6 +151,17 @@ Project decision (not a Kite API fact):
 - Task Scheduler: `scripts/register-scheduled-tasks.ps1` converts IST ready times (NFO 16:10, CDS 17:30, MCX 00:05) to the OS local timezone; re-run after DST changes. Tasks run when user is logged on. Logs under `data/ohlcv/_eod/`.
 - Tray: workspace package `sessiontray` — local token file check only (green/red); toast on expire; menu Login spawns `uv run kitetools login`. No password/TOTP automation.
 
+## OHLCV cash equity (NSE and BSE, day only)
+
+Project decision. Cash equities have no expiry, so they do not use the F&O catalog or `universe.sync_contracts`.
+
+- Markets: `nse` and `bse`. Session 09:15–15:30 IST. `cash_equity=True`. Minute, continuous, quote snapshot, rank, queue, and quality stay on NFO/MCX/CDS.
+- Instrument list: `data/instruments/equity.duckdb` (table `equity`, both exchanges) and `data/instruments/equity.csv` (live universe only, overwritten each publish). Filter: `instrument_type == EQ` and `segment` equal to the exchange (drops `INDICES`). `instrument_token` is the key. `first_seen` is kept, `last_seen` moves while the token is in the dump, and a symbol change stores the old symbol in `prev_tradingsymbol`. A token that leaves the dump stays in DuckDB.
+- Day files: `data/ohlcv/<market>/day/<token>.parquet` with `token`, `tradingsymbol`, `ts`, `open`, `high`, `low`, `close`, `volume`. No open interest. Fetch state lives in that market's `catalog.duckdb` (`fetch_state` only).
+- Backfill: from 2000-01-01 through the latest closed session, 2000-calendar-day chunks, `oi=False`. An empty chunk (before listing) advances the watermark. The next run requests only the gap after the watermark.
+- Commands: `uv run ohlcv sync --market nse|bse` publishes the shared meta and ensures that market's catalog. `uv run ohlcv fetch --market nse` then `bse` (one at a time; historical limit is 3 req/s). Optional `--symbol`, `--token`, `--max-symbols`. `status` lists symbols that are not `done`; `--all` includes finished ones. `show` takes a tradingsymbol or `--token`. `ohlcv eod` does not accept `nse` or `bse`.
+- Offline: `uv run python -m instruments.selftest`, `uv run python -m ohlcv.selftest`.
+
 ## OHLCV Phase 1 (NFO foundation + download queue)
 
 Workspace package `ohlcv`. Offline check: `uv run python -m ohlcv.selftest`.

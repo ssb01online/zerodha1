@@ -39,10 +39,23 @@ def _market_id(args: argparse.Namespace) -> str:
     return (getattr(args, "market", None) or "nfo").strip().lower()
 
 
+_MARKET_CHOICES = ("nfo", "mcx", "cds", "nse", "bse")
+
+
+def _reject_cash(market_id: str, command: str) -> None:
+    from .markets import get_market
+
+    if get_market(market_id).cash_equity:
+        raise SystemExit(
+            f"{command} does not apply to {market_id} (cash equity, day candles only). "
+            "Use: uv run ohlcv fetch --market nse|bse"
+        )
+
+
 def _add_market_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--market",
-        choices=("nfo", "mcx", "cds"),
+        choices=_MARKET_CHOICES,
         default="nfo",
         help="Exchange market root under data/ohlcv/<market>/ (default: nfo).",
     )
@@ -100,12 +113,254 @@ def _run_sync(
     return count, archive_path
 
 
+def _cmd_sync_cash(args: argparse.Namespace) -> None:
+    from instruments.equity import publish_equity
+
+    from .equity_catalog import ensure_schema, open_catalog
+    from .markets import get_market
+    from .paths import paths_for
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    mpaths = paths_for(market_id)
+    try:
+        published = publish_equity()
+    except (auth.NotLoggedIn, TokenException) as exc:
+        _login_exit(exc)
+    try:
+        con = open_catalog(mpaths.catalog_path)
+    except Exception as exc:
+        from .catalog import CatalogLocked
+
+        if isinstance(exc, CatalogLocked):
+            raise SystemExit(str(exc)) from exc
+        raise
+    try:
+        ensure_schema(con)
+    finally:
+        con.close()
+    print(
+        f"Published equity meta: {published.live} live "
+        f"(NSE {published.nse}, BSE {published.bse}) as_of={published.as_of.isoformat()}"
+    )
+    print(f"Exchange filter for this catalog: {profile.exchange}")
+    print(f"DB: {published.db_path}")
+    print(f"CSV: {published.csv_path}")
+    print(f"Catalog: {mpaths.catalog_path}")
+
+
+def _cmd_fetch_cash(args: argparse.Namespace) -> None:
+    from instruments.equity import list_equity, publish_equity
+
+    from . import fetch_lock
+    from . import planner
+    from .client import KiteClient, SessionExpired
+    from .equity_catalog import ensure_schema, get_state, open_catalog
+    from .equity_fetch import fetch_equity, range_start
+    from .markets import get_market
+    from .paths import paths_for
+    from .progress import InterruptController
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    mpaths = paths_for(market_id)
+    dry_run = bool(getattr(args, "dry_run", False))
+    lock_held = False
+    con = None
+    try:
+        if not dry_run:
+            try:
+                fetch_lock.try_acquire(market_id, cmd=f"ohlcv fetch --market {market_id}")
+            except fetch_lock.FetchInProgress as exc:
+                raise SystemExit(fetch_lock.format_in_progress(exc)) from exc
+            lock_held = True
+        try:
+            published = publish_equity()
+        except (auth.NotLoggedIn, TokenException) as exc:
+            _login_exit(exc)
+        rows = list_equity(exchange=profile.exchange, as_of=published.as_of)
+        symbol = (getattr(args, "symbol", None) or "").strip().upper()
+        token = getattr(args, "token", None)
+        if symbol:
+            rows = [row for row in rows if row.tradingsymbol.upper() == symbol]
+        if token is not None:
+            rows = [row for row in rows if row.instrument_token == int(token)]
+        max_symbols = getattr(args, "max_symbols", None)
+        if max_symbols is not None:
+            if max_symbols < 1:
+                raise SystemExit("--max-symbols must be >= 1")
+            rows = rows[: max_symbols]
+        if not rows:
+            print(f"No live {profile.exchange} equity rows match the filter")
+            return
+        try:
+            con = open_catalog(mpaths.catalog_path)
+        except Exception as exc:
+            from .catalog import CatalogLocked
+
+            if isinstance(exc, CatalogLocked):
+                raise SystemExit(str(exc)) from exc
+            raise
+        ensure_schema(con)
+        now = datetime.now(auth.IST)
+        if dry_run:
+            end = planner.day_fetch_end(now, market=profile)
+            requests = 0
+            for row in rows:
+                start = range_start(
+                    get_state(con, row.instrument_token, "day"),
+                    now=now,
+                    market=profile,
+                )
+                requests += planner.chunk_count(
+                    start, end, chunk_days=planner.DAY_CHUNK_DAYS
+                )
+            print(
+                f"Dry run (market={market_id}, day only): "
+                f"{len(rows)} symbols, ~{requests} historical requests"
+            )
+            print(f"Equity meta as_of={published.as_of.isoformat()} CSV={published.csv_path}")
+            return
+        interrupt = InterruptController()
+        interrupt.install()
+        try:
+            client = KiteClient(auth.get_kite())
+            results = fetch_equity(
+                client,
+                con,
+                rows,
+                now=now,
+                market=profile,
+                day_dir=mpaths.day_dir,
+                staging_dir=mpaths.staging_dir,
+                should_stop=lambda: interrupt.reason,
+            )
+        except SessionExpired as exc:
+            _login_exit(exc)
+        finally:
+            interrupt.restore()
+        fetched = sum(1 for item in results if not item.skipped and item.error is None)
+        skipped = sum(1 for item in results if item.skipped)
+        errors = [item for item in results if item.error]
+        requests = sum(item.requests for item in results)
+        print(
+            f"Market: {market_id}  symbols={len(results)} fetched={fetched} "
+            f"skipped={skipped} errors={len(errors)} requests={requests}"
+        )
+        for item in errors:
+            print(f"  {item.tradingsymbol} token={item.token} {item.error}", file=sys.stderr)
+        if errors:
+            raise SystemExit(1)
+    finally:
+        if con is not None:
+            con.close()
+        if lock_held:
+            fetch_lock.release(market_id)
+
+
+def _cmd_status_cash(args: argparse.Namespace) -> None:
+    from instruments.equity import list_equity
+
+    from .equity_catalog import list_states, open_catalog
+    from .markets import get_market
+    from .paths import paths_for
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    mpaths = paths_for(market_id)
+    if not mpaths.catalog_path.is_file():
+        raise SystemExit(
+            f"catalog not found: {mpaths.catalog_path}\n"
+            f"Run: uv run ohlcv sync --market {market_id}"
+        )
+    symbol = (getattr(args, "underlying", None) or "").strip().upper()
+    rows = list_equity(exchange=profile.exchange)
+    if symbol:
+        rows = [row for row in rows if row.tradingsymbol.upper() == symbol]
+    limit = getattr(args, "limit", None)
+    con = open_catalog(mpaths.catalog_path, read_only=True)
+    try:
+        states = {state.token: state for state in list_states(con, "day")}
+    finally:
+        con.close()
+    print(f"Market: {market_id}  interval: day")
+    print(f"{'symbol':<16} {'token':>12} {'status':<8} {'rows':>8} {'fetched_to'}")
+    shown = 0
+    for row in rows:
+        state = states.get(row.instrument_token)
+        status = state.status if state is not None else "-"
+        fetched = ""
+        row_count = 0
+        if state is not None:
+            row_count = state.rows_total
+            if state.fetched_to is not None:
+                fetched = state.fetched_to.strftime("%Y-%m-%d %H:%M")
+        if not getattr(args, "all", False) and status == "done":
+            continue
+        print(
+            f"{row.tradingsymbol:<16} {row.instrument_token:>12} {status:<8} "
+            f"{row_count:>8} {fetched}"
+        )
+        shown += 1
+        if limit is not None and shown >= limit:
+            break
+    if shown == 0:
+        print("(none)")
+    print(f"Catalog: {mpaths.catalog_path}")
+
+
+def _cmd_show_cash(args: argparse.Namespace) -> None:
+    from instruments.equity import EQUITY_DB_PATH, get_equity
+
+    from .equity_fetch import day_path, read_day_bars
+    from .markets import get_market
+    from .paths import paths_for
+
+    market_id = _market_id(args)
+    profile = get_market(market_id)
+    if args.symbol and args.token is not None:
+        raise SystemExit("use either --symbol or --token, not both")
+    symbol = (args.symbol or args.underlying or "").strip() or None
+    token = args.token
+    if symbol is None and token is None:
+        raise SystemExit("pass a tradingsymbol or --token")
+    row = get_equity(
+        EQUITY_DB_PATH,
+        token=token,
+        tradingsymbol=symbol,
+        exchange=profile.exchange,
+    )
+    if row is None:
+        label = symbol if symbol else token
+        raise SystemExit(f"{profile.exchange} equity not found: {label}")
+    path = day_path(paths_for(market_id).day_dir, row.instrument_token)
+    bars = read_day_bars(path, tail=int(args.tail or 5))
+    print(
+        f"{row.exchange} {row.tradingsymbol} token={row.instrument_token} "
+        f"name={row.name}"
+    )
+    print(f"File: {path}")
+    if not bars:
+        print("(no bars)")
+        return
+    for bar in bars:
+        ts = bar["ts"]
+        stamp = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+        print(
+            f"  {stamp} o={bar['open']} h={bar['high']} l={bar['low']} "
+            f"c={bar['close']} v={bar['volume']}"
+        )
+
+
 def cmd_sync(args: argparse.Namespace) -> None:
     from . import catalog
     from .markets import get_market
     from .paths import paths_for
 
     market_id = _market_id(args)
+    if get_market(market_id).cash_equity:
+        _cmd_sync_cash(args)
+        return
     types = _types_arg(args)
     profile = get_market(market_id)
     catalog_path = paths_for(market_id).catalog_path
@@ -193,6 +448,7 @@ def cmd_rank(args: argparse.Namespace) -> None:
     from .paths import paths_for
 
     market_id = _market_id(args)
+    _reject_cash(market_id, "rank")
     profile = get_market(market_id)
     mpaths = paths_for(market_id)
     started = datetime.now(auth.IST)
@@ -311,6 +567,7 @@ def cmd_daily(args: argparse.Namespace) -> None:
     from .progress import InterruptController, ProgressReporter, setup_run_logging
 
     market_id = _market_id(args)
+    _reject_cash(market_id, "daily")
     profile = get_market(market_id)
     mpaths = paths_for(market_id)
 
@@ -566,6 +823,7 @@ def cmd_continuous(args: argparse.Namespace) -> None:
     from .paths import paths_for
 
     market_id = _market_id(args)
+    _reject_cash(market_id, "continuous")
     profile = get_market(market_id)
     mpaths = paths_for(market_id)
     underlying = (args.underlying or "").strip().upper()
@@ -657,6 +915,15 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     from .progress import InterruptController, ProgressReporter, setup_run_logging
 
     market_id = _market_id(args)
+    if get_market(market_id).cash_equity:
+        _cmd_fetch_cash(args)
+        return
+    if (
+        getattr(args, "symbol", None)
+        or getattr(args, "token", None) is not None
+        or getattr(args, "max_symbols", None) is not None
+    ):
+        raise SystemExit("--symbol, --token, and --max-symbols apply to --market nse|bse")
     types = _types_arg(args)
     profile = get_market(market_id)
     mpaths = paths_for(market_id)
@@ -1060,6 +1327,11 @@ def cmd_status(args: argparse.Namespace) -> None:
     from .paths import paths_for, ymd as paths_ymd
 
     market_id = _market_id(args)
+    from .markets import get_market
+
+    if get_market(market_id).cash_equity:
+        _cmd_status_cash(args)
+        return
     types = _types_arg(args)
     mpaths = paths_for(market_id)
     catalog_path = mpaths.catalog_path
@@ -1178,6 +1450,13 @@ def cmd_show(args: argparse.Namespace) -> None:
     from .paths import paths_for, sanitize_underlying, ymd as paths_ymd
 
     market_id = _market_id(args)
+    from .markets import get_market
+
+    if get_market(market_id).cash_equity:
+        _cmd_show_cash(args)
+        return
+    if not args.underlying or not args.expiry:
+        raise SystemExit("underlying and expiry are required")
     mpaths = paths_for(market_id)
     catalog_path = mpaths.catalog_path
     expiry = _parse_ymd(args.expiry)
@@ -1384,6 +1663,7 @@ def cmd_queue(args: argparse.Namespace) -> None:
     from .paths import paths_for
 
     market_id = _market_id(args)
+    _reject_cash(market_id, "queue")
     types = _types_arg(args)
     profile = get_market(market_id)
     catalog_path = paths_for(market_id).catalog_path
@@ -1656,6 +1936,8 @@ def cmd_quality(args: argparse.Namespace) -> None:
     from . import quality as quality_mod
     from .catalog import CatalogLocked
 
+    if getattr(args, "market", None):
+        _reject_cash(args.market, "quality")
     if getattr(args, "quality_cmd", None) == "show":
         _cmd_quality_show(args)
         return
@@ -1776,7 +2058,7 @@ def main() -> None:
         prog="ohlcv",
         description=(
             "OHLCV tools (probe, sync, rank, queue, daily, continuous, fetch, "
-            "eod, status, show, quality). Use --market nfo|mcx|cds (default nfo)."
+            "eod, status, show, quality). Use --market nfo|mcx|cds|nse|bse (default nfo)."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1803,7 +2085,7 @@ def main() -> None:
         help=(
             "Archive instruments master and upsert contracts into "
             "data/ohlcv/<market>/catalog.duckdb "
-            "(NFO: all with expiry; MCX/CDS: FUT+CE+PE by default)."
+            "(NFO: all with expiry; MCX/CDS: FUT+CE+PE; NSE/BSE: equity meta + day catalog)."
         ),
     )
     _add_market_arg(p_sync)
@@ -1930,8 +2212,7 @@ def main() -> None:
     p_fetch = sub.add_parser(
         "fetch",
         help=(
-            "Fetch day (~2000d) then minute candles for queued series "
-            "(expiry-first, incremental). Use --market / --types for MCX/CDS."
+            "Fetch candles. F&O: day then minute. NSE/BSE: day only, one file per token."
         ),
     )
     _add_market_arg(p_fetch)
@@ -1945,6 +2226,23 @@ def main() -> None:
         "--underlying",
         default=None,
         help="Filter to one underlying name (e.g. NIFTY).",
+    )
+    p_fetch.add_argument(
+        "--symbol",
+        default=None,
+        help="NSE/BSE: one tradingsymbol.",
+    )
+    p_fetch.add_argument(
+        "--token",
+        type=int,
+        default=None,
+        help="NSE/BSE: one instrument_token.",
+    )
+    p_fetch.add_argument(
+        "--max-symbols",
+        type=int,
+        default=None,
+        help="NSE/BSE: fetch at most N symbols.",
     )
     p_fetch.add_argument(
         "-d",
@@ -2000,7 +2298,7 @@ def main() -> None:
     p_status.add_argument(
         "--underlying",
         default=None,
-        help="Filter to one underlying name (e.g. NIFTY or M&M).",
+        help="F&O underlying, or an NSE/BSE tradingsymbol.",
     )
     p_status.add_argument(
         "--interval",
@@ -2029,11 +2327,15 @@ def main() -> None:
     _add_market_arg(p_show)
     p_show.add_argument(
         "underlying",
-        help="Underlying name (catalog form, e.g. NIFTY or M&M).",
+        nargs="?",
+        default=None,
+        help="F&O underlying (e.g. NIFTY). NSE/BSE: tradingsymbol.",
     )
     p_show.add_argument(
         "expiry",
-        help="Expiry yyyymmdd or YYYY-MM-DD.",
+        nargs="?",
+        default=None,
+        help="F&O expiry yyyymmdd or YYYY-MM-DD.",
     )
     p_show.add_argument(
         "--interval",
@@ -2150,7 +2452,7 @@ def main() -> None:
     )
     p_quality.add_argument(
         "--market",
-        choices=("nfo", "mcx", "cds"),
+        choices=_MARKET_CHOICES,
         default=None,
         help="Limit the snapshot to one market (default: nfo, mcx, and cds).",
     )
@@ -2173,7 +2475,7 @@ def main() -> None:
     )
     p_qshow.add_argument(
         "--market",
-        choices=("nfo", "mcx", "cds"),
+        choices=_MARKET_CHOICES,
         default=None,
         help="Market to show (default: one row per market).",
     )

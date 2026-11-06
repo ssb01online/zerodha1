@@ -24,7 +24,7 @@ import duckdb
 from kitetools import auth
 
 from . import catalog
-from .markets import MARKETS, get_market
+from .markets import derivative_market_ids, get_market
 from .paths import REPORTS_DIR, ensure_dir, paths_for
 
 SCHEMA_VERSION = 2
@@ -423,7 +423,17 @@ def generate(
     roots: dict[str, MarketInputs] | None = None,
 ) -> QualityReport:
     """Scan series files into a new ``_reports/<id>/`` snapshot. Does not call Kite."""
-    chosen = [get_market(m).id for m in (markets if markets is not None else list(MARKETS))]
+    if markets is None:
+        chosen = derivative_market_ids()
+    else:
+        chosen = []
+        for raw in markets:
+            profile = get_market(raw)
+            if profile.cash_equity:
+                raise ValueError(
+                    f"quality does not apply to {profile.id} (cash equity, day candles only)"
+                )
+            chosen.append(profile.id)
     moment = _now_ist(now)
     root = ensure_dir(reports_root if reports_root is not None else REPORTS_DIR)
     report_dir = ensure_dir(_report_dir(root, moment))

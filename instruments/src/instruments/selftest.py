@@ -132,6 +132,73 @@ def _fixture_rows() -> list[Instrument]:
     ]
 
 
+def test_equity_publish_filter_and_history() -> None:
+    """EQ cash rows only; indices dropped; first_seen, delist, and rename stick."""
+    from .equity import get_equity, is_cash_equity, list_equity, publish_equity
+
+    day1 = date(2026, 10, 27)
+    day2 = date(2026, 10, 28)
+    infy = _inst(1, exchange="NSE", symbol="INFY", name="INFOSYS")
+    reliance = _inst(3, exchange="NSE", symbol="RELIANCE", name="RELIANCE INDUSTRIES")
+    bse = _inst(2, exchange="BSE", symbol="INFY", name="INFOSYS")
+    index = Instrument(
+        instrument_token=256265,
+        exchange_token=1001,
+        tradingsymbol="NIFTY 50",
+        name="NIFTY 50",
+        last_price=0.0,
+        expiry=None,
+        strike=0.0,
+        tick_size=0.0,
+        lot_size=0,
+        instrument_type="EQ",
+        segment="INDICES",
+        exchange="NSE",
+    )
+    be = _inst(9, exchange="NSE", symbol="FOO", name="FOO", itype="BE")
+    _assert(is_cash_equity(infy) and is_cash_equity(bse), "eq included")
+    _assert(not is_cash_equity(index), "index excluded")
+    _assert(not is_cash_equity(be), "BE excluded")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db = root / "equity.duckdb"
+        csv_path = root / "equity.csv"
+        first = publish_equity(
+            [infy, reliance, bse, index, be],
+            as_of=day1,
+            db_path=db,
+            csv_path=csv_path,
+        )
+        _assert(first.live == 3 and first.nse == 2 and first.bse == 1, f"live={first}")
+        stored = {r.instrument_token: r for r in list_equity(db)}
+        _assert(set(stored) == {1, 2, 3}, f"tokens={set(stored)}")
+        _assert(stored[1].first_seen == day1 and stored[1].prev_tradingsymbol is None, "first seen")
+        text = csv_path.read_text(encoding="utf-8")
+        _assert("NIFTY 50" not in text and "FOO" not in text, "csv dropped non-EQ")
+        _assert(text.count("INFY") == 2, "csv has both INFY rows")
+
+        renamed = _inst(1, exchange="NSE", symbol="INFYNEW", name="INFOSYS")
+        second = publish_equity(
+            [renamed, bse],
+            as_of=day2,
+            db_path=db,
+            csv_path=csv_path,
+        )
+        _assert(second.live == 2, f"day2 live={second.live}")
+        kept = get_equity(db, token=3)
+        _assert(kept is not None and kept.last_seen == day1, f"vanished={kept}")
+        again = get_equity(db, token=1)
+        _assert(again is not None, "renamed missing")
+        _assert(again.first_seen == day1 and again.last_seen == day2, f"dates={again}")
+        _assert(again.tradingsymbol == "INFYNEW", "new symbol")
+        _assert(again.prev_tradingsymbol == "INFY", f"prev={again.prev_tradingsymbol}")
+        live_csv = csv_path.read_text(encoding="utf-8")
+        _assert("RELIANCE" not in live_csv, "csv is live universe only")
+        _assert("INFYNEW" in live_csv and "INFY," in live_csv, "csv has rename and BSE")
+    print("  ok equity_publish_filter_and_history")
+
+
 def test_scope_includes_mcx_cds() -> None:
     _assert(IN_SCOPE_EXCHANGES == frozenset({"NSE", "BSE", "NFO", "MCX", "CDS"}), "scope set")
     _assert(in_scope("MCX") and in_scope("mcx"), "mcx in scope")
@@ -275,6 +342,7 @@ def test_mounted_on_portfolio_app() -> None:
 def main() -> int:
     print("instruments.selftest")
     tests = [
+        test_equity_publish_filter_and_history,
         test_scope_includes_mcx_cds,
         test_search_pagination_and_filters,
         test_by_token_and_chain,

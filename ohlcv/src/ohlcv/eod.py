@@ -247,8 +247,15 @@ def parse_markets_arg(text: str | Sequence[str] | None) -> list[str]:
         return list(DEFAULT_MARKET_ORDER)
     unknown = [p for p in parts if p not in MARKETS]
     if unknown:
-        known = ", ".join(sorted(MARKETS))
+        known = ", ".join(sorted(m for m, profile in MARKETS.items() if not profile.cash_equity))
         raise ValueError(f"unknown market(s) {unknown}; expected one of: {known}")
+    cash = [p for p in parts if MARKETS[p].cash_equity]
+    if cash:
+        names = ", ".join(cash)
+        raise ValueError(
+            f"cash equity market(s) {names} are not part of eod; "
+            "run: uv run ohlcv fetch --market nse|bse"
+        )
     selected = set(parts)
     return [m for m in DEFAULT_MARKET_ORDER if m in selected]
 

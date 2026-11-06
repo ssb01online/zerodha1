@@ -18,13 +18,15 @@ OPT_TYPES: frozenset[str] = frozenset({"CE", "PE"})
 
 @dataclass(frozen=True)
 class MarketProfile:
-    id: str  # "nfo" | "mcx" | "cds"
-    exchange: str  # "NFO" | "MCX" | "CDS"
+    id: str  # "nfo" | "mcx" | "cds" | "nse" | "bse"
+    exchange: str  # "NFO" | "MCX" | "CDS" | "NSE" | "BSE"
     session_start: time
     session_end: time  # inclusive cushion after last observed minute
     continuous_day: bool
     # None → upsert every in-exchange row that has an expiry (NFO FUT+OPT).
     sync_instrument_types: frozenset[str] | None = None
+    # Cash equity: day candles only, no expiry. Separate catalog schema.
+    cash_equity: bool = False
 
 
 NFO = MarketProfile(
@@ -51,18 +53,43 @@ CDS = MarketProfile(
     continuous_day=True,
     sync_instrument_types=DERIVATIVE_TYPES,
 )
+NSE = MarketProfile(
+    id="nse",
+    exchange="NSE",
+    session_start=time(9, 15),
+    session_end=time(15, 30),
+    continuous_day=False,
+    cash_equity=True,
+)
+BSE = MarketProfile(
+    id="bse",
+    exchange="BSE",
+    session_start=time(9, 15),
+    session_end=time(15, 30),
+    continuous_day=False,
+    cash_equity=True,
+)
 
 MARKETS: dict[str, MarketProfile] = {
     NFO.id: NFO,
     MCX.id: MCX,
     CDS.id: CDS,
+    NSE.id: NSE,
+    BSE.id: BSE,
 }
 
 _BY_EXCHANGE: dict[str, MarketProfile] = {
     NFO.exchange: NFO,
     MCX.exchange: MCX,
     CDS.exchange: CDS,
+    NSE.exchange: NSE,
+    BSE.exchange: BSE,
 }
+
+
+def derivative_market_ids() -> list[str]:
+    """F&O market ids (excludes cash equity)."""
+    return [mid for mid, profile in MARKETS.items() if not profile.cash_equity]
 
 
 def get_market(market_id: str) -> MarketProfile:

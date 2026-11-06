@@ -168,6 +168,24 @@ def test_markets_and_paths_for() -> None:
     _assert(mcx_paths.root.name == "mcx" and mcx_paths.catalog_path.name == "catalog.duckdb", "mcx paths")
     _assert(cds_paths.probe_dir.name == "_probe" and "cds" in cds_paths.probe_dir.parts, "cds probe")
     _assert(mcx_paths.continuous_dir.name == "continuous", "mcx continuous_dir")
+    nse = markets_mod.get_market("nse")
+    bse = markets_mod.get_market("bse")
+    _assert(nse.cash_equity and not nse.continuous_day, "nse cash")
+    _assert(
+        nse.session_start.hour == 9 and nse.session_start.minute == 15
+        and nse.session_end.hour == 15 and nse.session_end.minute == 30,
+        f"nse session={nse.session_start}-{nse.session_end}",
+    )
+    _assert(bse.cash_equity and bse.exchange == "BSE", "bse cash")
+    _assert(paths_for("nse").root.name == "nse", "nse root")
+    _assert(paths_for("bse").day_dir.parent.name == "bse", "bse day root")
+    raised_quality = False
+    try:
+        quality_mod.generate(["nse"])
+    except ValueError:
+        raised_quality = True
+    _assert(raised_quality, "quality rejects nse")
+
     _assert(OHLCV_DIR == nfo_paths.root, "OHLCV_DIR is nfo alias")
     _assert(CATALOG_PATH == nfo_paths.catalog_path, "CATALOG_PATH is nfo alias")
     _assert(universe_mod.SESSION_END == nfo.session_end, "universe SESSION_END from NFO")
@@ -270,6 +288,85 @@ def test_fetch_mcx_day_uses_market_session() -> None:
             end = fetch_mod.contract_end(now, expiry, interval="day", market="mcx")
             _assert(end.hour == 23 and end.minute == 30, f"contract_end={end}")
             _assert(kite.calls == 1, f"calls={kite.calls}")
+        finally:
+            con.close()
+
+
+def test_equity_day_fetch() -> None:
+    """Empty day chunk still watermarks; a bar file has no oi; a rerun does not call Kite."""
+    from instruments.equity import EquityRow
+
+    from . import equity_catalog
+    from . import equity_fetch as eq_fetch
+
+    now = datetime(2026, 10, 27, 18, 0, 0, tzinfo=auth.IST)
+    floor = date(2026, 10, 1)
+    seen = date(2026, 10, 27)
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        _assert(interval == "day", f"interval={interval}")
+        _assert(kwargs.get("oi") is False, f"oi={kwargs.get('oi')}")
+        if token == 1:
+            return []
+        return _synth_day_candles(token, from_date, to_date, n=3, price=50.0)
+
+    client, kite, _clock = _make_client(handler)
+    rows = [
+        EquityRow(1, 10, "NSE", "QUIET", None, "QUIET", "NSE", 0.05, 1, seen, seen),
+        EquityRow(2, 20, "NSE", "INFY", None, "INFOSYS", "NSE", 0.05, 1, seen, seen),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        con = equity_catalog.open_catalog(root / "catalog.duckdb")
+        try:
+            first = eq_fetch.fetch_equity(
+                client,
+                con,
+                rows,
+                now=now,
+                market="nse",
+                day_dir=root / "day",
+                staging_dir=root / "staging",
+                floor=floor,
+            )
+            _assert(len(first) == 2 and all(item.error is None for item in first), f"first={first}")
+            _assert(kite.calls == 2, f"calls={kite.calls}")
+            _assert(not eq_fetch.day_path(root / "day", 1).is_file(), "empty chunk writes no parquet")
+            filled = eq_fetch.day_path(root / "day", 2)
+            _assert(filled.is_file(), "token parquet")
+            quiet = equity_catalog.get_state(con, 1, "day")
+            _assert(quiet is not None and quiet.status == "done", f"quiet={quiet}")
+            _assert(
+                quiet.fetched_to is not None
+                and quiet.fetched_to.hour == 15
+                and quiet.fetched_to.minute == 30,
+                f"wm={quiet.fetched_to}",
+            )
+            probe = duckdb.connect()
+            try:
+                described = probe.execute(
+                    "DESCRIBE SELECT * FROM read_parquet(?)",
+                    [str(filled)],
+                ).fetchall()
+            finally:
+                probe.close()
+            names = [col[0] for col in described]
+            _assert("oi" not in names and "volume" in names, f"columns={names}")
+            bars = eq_fetch.read_day_bars(filled)
+            _assert(bars and bars[0]["tradingsymbol"] == "INFY", f"bars={bars[:1]}")
+            calls = kite.calls
+            second = eq_fetch.fetch_equity(
+                client,
+                con,
+                rows,
+                now=now,
+                market="nse",
+                day_dir=root / "day",
+                staging_dir=root / "staging",
+                floor=floor,
+            )
+            _assert(kite.calls == calls, f"rerun calls={kite.calls}")
+            _assert(all(item.skipped and item.requests == 0 for item in second), "rerun skipped")
         finally:
             con.close()
 
@@ -1038,6 +1135,13 @@ def test_eod_timing_and_plan() -> None:
     _assert(eod_mod.resolve_trade_date(after_reset) == date(2026, 10, 28), "06:00 trade_date=today")
 
     _assert(eod_mod.parse_markets_arg("mcx,nfo") == ["nfo", "mcx"], "order preserved")
+    _assert(eod_mod.parse_markets_arg(None) == ["nfo", "cds", "mcx"], "eod default markets")
+    cash_rejected = False
+    try:
+        eod_mod.parse_markets_arg("nse")
+    except ValueError as exc:
+        cash_rejected = "ohlcv fetch --market nse|bse" in str(exc)
+    _assert(cash_rejected, "eod rejects nse")
     _assert(eod_mod.parse_buffer_arg("30m") == buf, "buffer 30m")
     _assert(eod_mod.parse_buffer_arg("1h") == timedelta(hours=1), "buffer 1h")
 
@@ -3992,6 +4096,7 @@ def main() -> None:
     tests = [
         test_paths,
         test_markets_and_paths_for,
+        test_equity_day_fetch,
         test_planner_fetch_end_per_market,
         test_fetch_chunk_windows_mcx_session,
         test_fetch_mcx_day_uses_market_session,

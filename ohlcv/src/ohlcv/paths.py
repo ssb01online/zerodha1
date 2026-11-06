@@ -29,7 +29,7 @@ class MarketPaths:
 
 
 def paths_for(market_id: str) -> MarketPaths:
-    """Resolve on-disk layout for a market id (nfo / mcx / cds)."""
+    """Resolve on-disk layout for a market id (nfo / mcx / cds / nse / bse)."""
     profile = get_market(market_id)
     root = DATA_DIR / "ohlcv" / profile.id
     return MarketPaths(
