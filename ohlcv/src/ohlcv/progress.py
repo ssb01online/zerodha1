@@ -193,6 +193,43 @@ class ProgressReporter:
         self.logger.info(msg)
         print(msg, file=self.stream)
 
+    def symbol_progress(
+        self,
+        *,
+        index: int,
+        total: int,
+        tradingsymbol: str,
+        rows: int,
+        requests: int,
+        status: str,
+        finished: bool,
+    ) -> None:
+        """Heartbeat for one NSE/BSE symbol. ETA uses symbols already finished."""
+        done = index if finished else max(0, index - 1)
+        self._contracts_done = done
+        self._contracts_total = max(0, total)
+        elapsed = time.monotonic() - self._run_started
+        line = (
+            f"[{index}/{total}] {tradingsymbol:<12} "
+            f"rows={rows} req={requests} {status}  "
+            f"elapsed={_fmt_dur(elapsed)}"
+            f"{_eta_suffix(self._run_started, done, total)}"
+        )
+        self.logger.debug("equity %s", line)
+        now = time.monotonic()
+        if self.stream.isatty():
+            if (
+                finished
+                or now - self._last_heartbeat >= self.heartbeat_interval_s
+            ):
+                self.stream.write("\r" + line[:118].ljust(118))
+                self.stream.flush()
+                self._last_heartbeat = now
+                self._heartbeat_active = True
+        elif finished or now - self._last_heartbeat >= 5.0:
+            print(line, file=self.stream)
+            self._last_heartbeat = now
+
     def batch(
         self,
         *,

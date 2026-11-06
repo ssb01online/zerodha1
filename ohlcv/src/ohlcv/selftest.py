@@ -178,7 +178,9 @@ def test_markets_and_paths_for() -> None:
     )
     _assert(bse.cash_equity and bse.exchange == "BSE", "bse cash")
     _assert(paths_for("nse").root.name == "nse", "nse root")
+    _assert(paths_for("nse").equity_db_path.name == "nse_eq.duckdb", "nse equity db")
     _assert(paths_for("bse").day_dir.parent.name == "bse", "bse day root")
+    _assert(paths_for("bse").equity_db_path.name == "bse_eq.duckdb", "bse equity db")
     raised_quality = False
     try:
         quality_mod.generate(["nse"])
@@ -293,7 +295,7 @@ def test_fetch_mcx_day_uses_market_session() -> None:
 
 
 def test_equity_day_fetch() -> None:
-    """Empty day chunk still watermarks; a bar file has no oi; a rerun does not call Kite."""
+    """Empty day chunk still watermarks; bars live in DuckDB; a rerun does not call Kite."""
     from instruments.equity import EquityRow
 
     from . import equity_catalog
@@ -317,7 +319,8 @@ def test_equity_day_fetch() -> None:
     ]
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        con = equity_catalog.open_catalog(root / "catalog.duckdb")
+        db_path = root / "nse_eq.duckdb"
+        con = equity_catalog.open_catalog(db_path)
         try:
             first = eq_fetch.fetch_equity(
                 client,
@@ -325,35 +328,33 @@ def test_equity_day_fetch() -> None:
                 rows,
                 now=now,
                 market="nse",
-                day_dir=root / "day",
                 staging_dir=root / "staging",
+                db_path=db_path,
                 floor=floor,
             )
             _assert(len(first) == 2 and all(item.error is None for item in first), f"first={first}")
             _assert(kite.calls == 2, f"calls={kite.calls}")
-            _assert(not eq_fetch.day_path(root / "day", 1).is_file(), "empty chunk writes no parquet")
-            filled = eq_fetch.day_path(root / "day", 2)
-            _assert(filled.is_file(), "token parquet")
+            _assert(not (root / "day").exists(), "no per-token parquet directory")
+            _assert(not list((root / "staging").glob("*.csv")), "staging csv removed")
             quiet = equity_catalog.get_state(con, 1, "day")
             _assert(quiet is not None and quiet.status == "done", f"quiet={quiet}")
+            _assert(quiet.rows_total == 0, f"quiet rows={quiet.rows_total}")
             _assert(
                 quiet.fetched_to is not None
                 and quiet.fetched_to.hour == 15
                 and quiet.fetched_to.minute == 30,
                 f"wm={quiet.fetched_to}",
             )
-            probe = duckdb.connect()
-            try:
-                described = probe.execute(
-                    "DESCRIBE SELECT * FROM read_parquet(?)",
-                    [str(filled)],
-                ).fetchall()
-            finally:
-                probe.close()
+            described = con.execute("DESCRIBE bars").fetchall()
             names = [col[0] for col in described]
             _assert("oi" not in names and "volume" in names, f"columns={names}")
-            bars = eq_fetch.read_day_bars(filled)
+            _assert("tradingsymbol" not in names, f"symbol not on bars: {names}")
+            bars = equity_catalog.read_day_bars(con, 2)
             _assert(bars and bars[0]["tradingsymbol"] == "INFY", f"bars={bars[:1]}")
+            symbol = con.execute(
+                "SELECT tradingsymbol FROM symbols WHERE token = 2"
+            ).fetchone()
+            _assert(symbol is not None and symbol[0] == "INFY", f"symbol={symbol}")
             calls = kite.calls
             second = eq_fetch.fetch_equity(
                 client,
@@ -361,12 +362,79 @@ def test_equity_day_fetch() -> None:
                 rows,
                 now=now,
                 market="nse",
-                day_dir=root / "day",
                 staging_dir=root / "staging",
+                db_path=db_path,
                 floor=floor,
             )
             _assert(kite.calls == calls, f"rerun calls={kite.calls}")
             _assert(all(item.skipped and item.requests == 0 for item in second), "rerun skipped")
+        finally:
+            con.close()
+
+
+def test_equity_day_fetch_resumes_after_chunk() -> None:
+    """A stop after the first chunk commits it; the next run does not repeat that request."""
+    from instruments.equity import EquityRow
+
+    from . import equity_catalog
+    from . import equity_fetch as eq_fetch
+
+    now = datetime(2026, 10, 27, 18, 0, 0, tzinfo=auth.IST)
+    seen = date(2026, 10, 27)
+    windows: list[tuple[Any, Any]] = []
+
+    def handler(token: int, from_date: Any, to_date: Any, interval: str, **kwargs: Any) -> list:
+        _assert(interval == "day" and kwargs.get("oi") is False, f"{interval} {kwargs}")
+        windows.append((from_date, to_date))
+        return _synth_day_candles(token, from_date, to_date, n=3, price=10.0)
+
+    client, kite, _clock = _make_client(handler)
+    rows = [EquityRow(2, 20, "NSE", "INFY", None, "INFOSYS", "NSE", 0.05, 1, seen, seen)]
+    stop_after = {"calls": 1}
+
+    def should_stop() -> str | None:
+        if kite.calls >= stop_after["calls"]:
+            return "keyboard interrupt"
+        return None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db_path = root / "nse_eq.duckdb"
+        con = equity_catalog.open_catalog(db_path)
+        try:
+            first = eq_fetch.fetch_equity(
+                client,
+                con,
+                rows,
+                now=now,
+                market="nse",
+                staging_dir=root / "staging",
+                db_path=db_path,
+                should_stop=should_stop,
+            )
+            _assert(kite.calls == 1, f"stopped calls={kite.calls}")
+            _assert(len(first) == 1 and first[0].error is None, f"first={first}")
+            _assert(first[0].requests == 1, f"requests={first[0].requests}")
+            state = equity_catalog.get_state(con, 2, "day")
+            _assert(state is not None and state.rows_total == 3, f"state={state}")
+            _assert(not list((root / "staging").glob("*.csv")), "csv removed after commit")
+            stop_after["calls"] = 2
+            second = eq_fetch.fetch_equity(
+                client,
+                con,
+                rows,
+                now=now,
+                market="nse",
+                staging_dir=root / "staging",
+                db_path=db_path,
+                should_stop=should_stop,
+            )
+            _assert(kite.calls == 2, f"resume calls={kite.calls}")
+            _assert(len(second) == 1 and second[0].requests == 1, f"second={second}")
+            _assert(len(windows) == 2, f"windows={windows}")
+            _assert(windows[1][0] > windows[0][1], f"repeated window {windows}")
+            resumed = equity_catalog.get_state(con, 2, "day")
+            _assert(resumed is not None and resumed.rows_total == 6, f"rows={resumed}")
         finally:
             con.close()
 
@@ -1255,6 +1323,7 @@ def test_eod_non_session_continues_historical_fetch() -> None:
             staging_dir=root / "_staging",
             logs_dir=root / "logs",
             catalog_path=root / "catalog.duckdb",
+            equity_db_path=root / "nfo_eq.duckdb",
         )
         for p in (
             stub.daily_dir,
@@ -1736,6 +1805,7 @@ def test_can_skip_untraded_uses_market_daily_dir() -> None:
             staging_dir=root / "ohlcv" / "mcx" / "_staging",
             logs_dir=root / "ohlcv" / "mcx" / "logs",
             catalog_path=root / "ohlcv" / "mcx" / "catalog.duckdb",
+            equity_db_path=root / "ohlcv" / "mcx" / "mcx_eq.duckdb",
         )
         con = catalog.connect(root / "c.duckdb")
         try:
@@ -4097,6 +4167,7 @@ def main() -> None:
         test_paths,
         test_markets_and_paths_for,
         test_equity_day_fetch,
+        test_equity_day_fetch_resumes_after_chunk,
         test_planner_fetch_end_per_market,
         test_fetch_chunk_windows_mcx_session,
         test_fetch_mcx_day_uses_market_session,

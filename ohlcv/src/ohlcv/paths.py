@@ -26,6 +26,7 @@ class MarketPaths:
     staging_dir: Path
     logs_dir: Path
     catalog_path: Path
+    equity_db_path: Path
 
 
 def paths_for(market_id: str) -> MarketPaths:
@@ -42,6 +43,7 @@ def paths_for(market_id: str) -> MarketPaths:
         staging_dir=root / "_staging",
         logs_dir=root / "logs",
         catalog_path=root / "catalog.duckdb",
+        equity_db_path=root / f"{profile.id}_eq.duckdb",
     )
 
 

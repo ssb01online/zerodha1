@@ -128,7 +128,7 @@ def _cmd_sync_cash(args: argparse.Namespace) -> None:
     except (auth.NotLoggedIn, TokenException) as exc:
         _login_exit(exc)
     try:
-        con = open_catalog(mpaths.catalog_path)
+        con = open_catalog(mpaths.equity_db_path)
     except Exception as exc:
         from .catalog import CatalogLocked
 
@@ -144,9 +144,9 @@ def _cmd_sync_cash(args: argparse.Namespace) -> None:
         f"(NSE {published.nse}, BSE {published.bse}) as_of={published.as_of.isoformat()}"
     )
     print(f"Exchange filter for this catalog: {profile.exchange}")
-    print(f"DB: {published.db_path}")
+    print(f"Instruments DB: {published.db_path}")
     print(f"CSV: {published.csv_path}")
-    print(f"Catalog: {mpaths.catalog_path}")
+    print(f"DB: {mpaths.equity_db_path}")
 
 
 def _cmd_fetch_cash(args: argparse.Namespace) -> None:
@@ -159,7 +159,7 @@ def _cmd_fetch_cash(args: argparse.Namespace) -> None:
     from .equity_fetch import fetch_equity, range_start
     from .markets import get_market
     from .paths import paths_for
-    from .progress import InterruptController
+    from .progress import InterruptController, ProgressReporter, setup_run_logging
 
     market_id = _market_id(args)
     profile = get_market(market_id)
@@ -167,6 +167,12 @@ def _cmd_fetch_cash(args: argparse.Namespace) -> None:
     dry_run = bool(getattr(args, "dry_run", False))
     lock_held = False
     con = None
+    log_path = setup_run_logging(
+        "fetch",
+        log_file=_optional_log_path(args),
+        logs_dir=mpaths.logs_dir,
+    )
+    reporter = ProgressReporter(logger=logging.getLogger("ohlcv"))
     try:
         if not dry_run:
             try:
@@ -194,7 +200,7 @@ def _cmd_fetch_cash(args: argparse.Namespace) -> None:
             print(f"No live {profile.exchange} equity rows match the filter")
             return
         try:
-            con = open_catalog(mpaths.catalog_path)
+            con = open_catalog(mpaths.equity_db_path)
         except Exception as exc:
             from .catalog import CatalogLocked
 
@@ -220,9 +226,34 @@ def _cmd_fetch_cash(args: argparse.Namespace) -> None:
                 f"{len(rows)} symbols, ~{requests} historical requests"
             )
             print(f"Equity meta as_of={published.as_of.isoformat()} CSV={published.csv_path}")
+            print(f"DB: {mpaths.equity_db_path}")
+            print(f"Log: {log_path}")
             return
         interrupt = InterruptController()
-        interrupt.install()
+        interrupt.install(on_soft_stop=reporter.soft_stop_announced)
+        reporter.set_totals(contracts_total=len(rows))
+        reporter.note(f"DB: {mpaths.equity_db_path}")
+
+        def _on_progress(
+            *,
+            index: int,
+            total: int,
+            tradingsymbol: str,
+            rows: int,
+            requests: int,
+            status: str,
+            finished: bool,
+        ) -> None:
+            reporter.symbol_progress(
+                index=index,
+                total=total,
+                tradingsymbol=tradingsymbol,
+                rows=rows,
+                requests=requests,
+                status=status,
+                finished=finished,
+            )
+
         try:
             client = KiteClient(auth.get_kite())
             results = fetch_equity(
@@ -231,14 +262,16 @@ def _cmd_fetch_cash(args: argparse.Namespace) -> None:
                 rows,
                 now=now,
                 market=profile,
-                day_dir=mpaths.day_dir,
                 staging_dir=mpaths.staging_dir,
+                db_path=mpaths.equity_db_path,
                 should_stop=lambda: interrupt.reason,
+                on_progress=_on_progress,
             )
         except SessionExpired as exc:
             _login_exit(exc)
         finally:
             interrupt.restore()
+        reporter.clear_heartbeat()
         fetched = sum(1 for item in results if not item.skipped and item.error is None)
         skipped = sum(1 for item in results if item.skipped)
         errors = [item for item in results if item.error]
@@ -247,6 +280,10 @@ def _cmd_fetch_cash(args: argparse.Namespace) -> None:
             f"Market: {market_id}  symbols={len(results)} fetched={fetched} "
             f"skipped={skipped} errors={len(errors)} requests={requests}"
         )
+        if interrupt.reason:
+            print(f"Stopped: {interrupt.reason}")
+        print(f"DB: {mpaths.equity_db_path}")
+        print(f"Log: {log_path}")
         for item in errors:
             print(f"  {item.tradingsymbol} token={item.token} {item.error}", file=sys.stderr)
         if errors:
@@ -268,9 +305,9 @@ def _cmd_status_cash(args: argparse.Namespace) -> None:
     market_id = _market_id(args)
     profile = get_market(market_id)
     mpaths = paths_for(market_id)
-    if not mpaths.catalog_path.is_file():
+    if not mpaths.equity_db_path.is_file():
         raise SystemExit(
-            f"catalog not found: {mpaths.catalog_path}\n"
+            f"equity db not found: {mpaths.equity_db_path}\n"
             f"Run: uv run ohlcv sync --market {market_id}"
         )
     symbol = (getattr(args, "underlying", None) or "").strip().upper()
@@ -278,7 +315,14 @@ def _cmd_status_cash(args: argparse.Namespace) -> None:
     if symbol:
         rows = [row for row in rows if row.tradingsymbol.upper() == symbol]
     limit = getattr(args, "limit", None)
-    con = open_catalog(mpaths.catalog_path, read_only=True)
+    try:
+        con = open_catalog(mpaths.equity_db_path, read_only=True)
+    except Exception as exc:
+        from .catalog import CatalogLocked
+
+        if isinstance(exc, CatalogLocked):
+            raise SystemExit(str(exc)) from exc
+        raise
     try:
         states = {state.token: state for state in list_states(con, "day")}
     finally:
@@ -306,18 +350,19 @@ def _cmd_status_cash(args: argparse.Namespace) -> None:
             break
     if shown == 0:
         print("(none)")
-    print(f"Catalog: {mpaths.catalog_path}")
+    print(f"DB: {mpaths.equity_db_path}")
 
 
 def _cmd_show_cash(args: argparse.Namespace) -> None:
     from instruments.equity import EQUITY_DB_PATH, get_equity
 
-    from .equity_fetch import day_path, read_day_bars
+    from .equity_catalog import open_catalog, read_day_bars
     from .markets import get_market
     from .paths import paths_for
 
     market_id = _market_id(args)
     profile = get_market(market_id)
+    db_path = paths_for(market_id).equity_db_path
     if args.symbol and args.token is not None:
         raise SystemExit("use either --symbol or --token, not both")
     symbol = (args.symbol or args.underlying or "").strip() or None
@@ -333,13 +378,28 @@ def _cmd_show_cash(args: argparse.Namespace) -> None:
     if row is None:
         label = symbol if symbol else token
         raise SystemExit(f"{profile.exchange} equity not found: {label}")
-    path = day_path(paths_for(market_id).day_dir, row.instrument_token)
-    bars = read_day_bars(path, tail=int(args.tail or 5))
+    if not db_path.is_file():
+        raise SystemExit(
+            f"equity db not found: {db_path}\n"
+            f"Run: uv run ohlcv fetch --market {market_id}"
+        )
+    try:
+        con = open_catalog(db_path, read_only=True)
+    except Exception as exc:
+        from .catalog import CatalogLocked
+
+        if isinstance(exc, CatalogLocked):
+            raise SystemExit(str(exc)) from exc
+        raise
+    try:
+        bars = read_day_bars(con, row.instrument_token, tail=int(args.tail or 5))
+    finally:
+        con.close()
     print(
         f"{row.exchange} {row.tradingsymbol} token={row.instrument_token} "
         f"name={row.name}"
     )
-    print(f"File: {path}")
+    print(f"DB: {db_path}")
     if not bars:
         print("(no bars)")
         return
@@ -2212,7 +2272,7 @@ def main() -> None:
     p_fetch = sub.add_parser(
         "fetch",
         help=(
-            "Fetch candles. F&O: day then minute. NSE/BSE: day only, one file per token."
+            "Fetch candles. F&O: day then minute. NSE/BSE: day bars in <market>_eq.duckdb."
         ),
     )
     _add_market_arg(p_fetch)
